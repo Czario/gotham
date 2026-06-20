@@ -1783,15 +1783,15 @@ if __name__ == "__main__":
     parser.add_argument('--year', type=int, default=2010, help='Start year for filings (default: 2010)')
     parser.add_argument('--fiscal-year', type=int, help='Process specific fiscal year (e.g., 2024)')
     parser.add_argument('--fiscal-quarter', choices=['Q1', 'Q2', 'Q3', 'Q4'], help='Process specific fiscal quarter (Q1, Q2, Q3, Q4). Requires --fiscal-year')
-    parser.add_argument('--dimensions', action='store_true', help='Enable dimensional data processing (segments, products, geography)')
+    parser.add_argument('--no-dimensions', action='store_true', help='Disable dimensional data processing (segments, products, geography). Dimensions are ON by default.')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--verbose', action='store_true', help='Enable detailed output and debugging information')
     parser.add_argument('--extra-data', action='store_true', help='Enable comprehensive missing facts detection to find additional financial data')
     parser.add_argument('--local', action='store_true', help='Process local XBRL zip files instead of downloading from SEC API')
     parser.add_argument('--reload', action='store_true', help='Force reload of existing data for specified fiscal year/quarter or all filings')
     parser.add_argument('--incremental', action='store_true', help='Process only new filings since the last filing date in database for each company')
-    parser.add_argument('--download-html-filings', action='store_true', 
-                       help='Download HTML filings to directory specified by SEC_HTML_DOWNLOAD_PATH environment variable. Files will be compressed and named by accession number.')
+    parser.add_argument('--no-download-html-filings', action='store_true',
+                       help='Disable HTML filing downloads. By default filings are downloaded to SEC_HTML_DOWNLOAD_PATH (if set). Pass this flag to skip HTML downloads entirely.')
     parser.add_argument('--only-download-files', action='store_true',
                        help='Only download HTML files for existing company data in database. Requires existing XBRL data and accession numbers. Use with --download-html-filings to specify download path.')
     parser.add_argument('--fix-lab', action='store_true',
@@ -1851,24 +1851,23 @@ if __name__ == "__main__":
             print("❌ --url cannot be used with --only-download-files")
             sys.exit(1)
     
-    # Validate HTML download path if flag is set
+    # HTML download: enabled by default; disabled only with --no-download-html-filings.
+    # Silently skip (no hard exit) if SEC_HTML_DOWNLOAD_PATH is not configured.
     html_download_path = None
-    if args.download_html_filings:
+    if not args.no_download_html_filings:
         html_download_path = os.getenv('SEC_HTML_DOWNLOAD_PATH')
-        if not html_download_path:
-            print("❌ --download-html-filings requires SEC_HTML_DOWNLOAD_PATH environment variable to be set")
-            sys.exit(1)
-        
-        html_path = Path(html_download_path)
-        try:
-            html_path.mkdir(parents=True, exist_ok=True)
-            if not html_path.is_dir():
-                print(f"❌ SEC_HTML_DOWNLOAD_PATH is not a directory: {html_download_path}")
-                sys.exit(1)
-            print(f"📁 HTML filings will be saved to: {html_path.absolute()}")
-        except Exception as e:
-            print(f"❌ Invalid SEC_HTML_DOWNLOAD_PATH: {e}")
-            sys.exit(1)
+        if html_download_path:
+            html_path = Path(html_download_path)
+            try:
+                html_path.mkdir(parents=True, exist_ok=True)
+                if not html_path.is_dir():
+                    print(f"⚠️  SEC_HTML_DOWNLOAD_PATH is not a directory: {html_download_path} — HTML downloads disabled")
+                    html_download_path = None
+                else:
+                    print(f"📁 HTML filings will be saved to: {html_path.absolute()}")
+            except Exception as e:
+                print(f"⚠️  Invalid SEC_HTML_DOWNLOAD_PATH: {e} — HTML downloads disabled")
+                html_download_path = None
     
     try:
         # Handle --url option for single filing processing
@@ -1898,7 +1897,7 @@ if __name__ == "__main__":
             # Initialize scraper app
             app = SECDataScraperApp(
                 start_year=args.year,
-                enable_dimensions=args.dimensions,
+                enable_dimensions=not args.no_dimensions,
                 enable_extra_data=args.extra_data,
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
@@ -2031,17 +2030,19 @@ if __name__ == "__main__":
             print("LOCAL PROCESSING MODE - Using offline XBRL zip files")
         else:
             print("ONLINE PROCESSING MODE - Downloading from SEC API")
-        if args.dimensions:
-            print("Dimensions processing ENABLED - will capture segment, product, and geographic data")
+        if args.no_dimensions:
+            print("Dimensions processing DISABLED")
         else:
-            print("Standard processing - no dimensional data")
-        if args.download_html_filings:
+            print("Dimensions processing ENABLED - will capture segment, product, and geographic data")
+        if html_download_path:
             print(f"HTML downloading ENABLED - saving to {html_download_path}")
+        elif args.no_download_html_filings:
+            print("HTML downloading DISABLED (--no-download-html-filings)")
         if args.only_download_files:
             print("📁 HTML-DOWNLOAD-ONLY MODE - Will only download HTML files for existing data")
-            if not args.download_html_filings:
-                print("⚠️  --only-download-files requires --download-html-filings to be enabled")
-                print("💡 Try: --only-download-files --download-html-filings")
+            if not html_download_path:
+                print("⚠️  --only-download-files requires SEC_HTML_DOWNLOAD_PATH to be set (and not --no-download-html-filings)")
+                print("💡 Set SEC_HTML_DOWNLOAD_PATH in your .env file")
                 sys.exit(1)
         if args.reload:
             reload_msg = "🔄 RELOAD MODE ENABLED"
@@ -2082,7 +2083,7 @@ if __name__ == "__main__":
             scraper_app = SECDataScraperApp(
                 database_config=database_config,
                 start_year=args.year or 2010,
-                enable_dimensions=args.dimensions,
+                enable_dimensions=not args.no_dimensions,
                 enable_extra_data=False,
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
@@ -2167,7 +2168,7 @@ if __name__ == "__main__":
             # Use standard online processing
             app = SECDataScraperApp(
                 start_year=args.year, 
-                enable_dimensions=args.dimensions, 
+                enable_dimensions=not args.no_dimensions, 
                 enable_extra_data=args.extra_data,
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
