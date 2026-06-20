@@ -1,42 +1,39 @@
-# Python
+# ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
+.eggs/
+dist/
+build/
+wheels/
 *.egg
+MANIFEST
 
-# Virtual environments
-.env
-.venv
-env/
+# ─── Virtual environments ─────────────────────────────────────────────────────
+.venv/
 venv/
+env/
 ENV/
 env.bak/
 venv.bak/
 
-# IDE
+# ─── Environment / secrets ────────────────────────────────────────────────────
+# Keep env.example (template) but ignore the real .env file
+.env
+.env.*
+!.env.example
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# OS
+# ─── OS ───────────────────────────────────────────────────────────────────────
 .DS_Store
 .DS_Store?
 ._*
@@ -45,29 +42,46 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
-# Project specific
-*.backup.json
-*_backup_*.json
+# ─── Testing / coverage ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
-# Logs
+# ─── Logs ─────────────────────────────────────────────────────────────────────
 *.log
 logs/
+# Extraction run logs at repo root (e.g. _extract_jnj.log, _extract_3.log)
+_extract*.log
 
-# Database
+# ─── Database ─────────────────────────────────────────────────────────────────
 *.db
 *.sqlite3
 
-# Temporary files
+# ─── Temporary / scratch files ────────────────────────────────────────────────
 *.tmp
 *.temp
 
-# Analysis and output files
+# ─── Ad-hoc debug / one-off scripts (not part of the codebase) ───────────────
+# Matches files like _debug_db.py, _debug_something.py
+_debug_*.py
+# Root-level one-off analysis / patch scripts
+/analyze_*.py
+/create_*.py
+/*_patch.py
+/*_improvements.py
+/*_instructions.py
+
+# ─── Runtime user input files ─────────────────────────────────────────────────
+# stocks_download.txt is a per-user runtime input; use stocks_download.txt.example
+# as the committed template (if desired)
+stocks_download.txt
+
+# ─── Output / generated data files ───────────────────────────────────────────
 output.json
 *_income.json
 dimensional_*.json
-analyze_*.py
-test_*.py
-create_*.py
-*_patch.py
-*_improvements.py
-*_instructions.py
+*.backup.json
+*_backup_*.json
+
