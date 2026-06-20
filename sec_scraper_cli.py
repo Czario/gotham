@@ -21,11 +21,12 @@ load_dotenv()
 from utilities.helpers.logger_config import LoggerConfig, get_module_logger
 
 # Initialize loggers - only main logger, no separate error/performance logs
+# Change module-level logger to WARNING/no-console — main() reconfigures per --verbose/--debug
 logger = LoggerConfig.setup_logging(
-    level='INFO',
+    level='WARNING',
     log_dir='logs',
     detailed=False,
-    console_output=True
+    console_output=False
 )
 
 from database.config.mongodb_config import DatabaseConfig
@@ -2098,45 +2099,46 @@ def main():
             sys.exit(1)
         
         # Initialize and run scraper
-        print(f"\nStarting SEC data scraper...")
-        print(f"Companies to process: {len(companies)}")
-        if args.fiscal_year:
-            if args.fiscal_quarter:
-                print(f"Target: Fiscal Year {args.fiscal_year} {args.fiscal_quarter}")
-            else:
-                print(f"Target: Complete Fiscal Year {args.fiscal_year}")
-        else:
-            print(f"Start year: {args.year}")
-        print(f"{'='*50}")
-        if args.local:
-            print("LOCAL PROCESSING MODE - Using offline XBRL zip files")
-        else:
-            print("ONLINE PROCESSING MODE - Downloading from SEC API")
-        if args.no_dimensions:
-            print("Dimensions processing DISABLED")
-        else:
-            print("Dimensions processing ENABLED - will capture segment, product, and geographic data")
-        if html_download_path:
-            print(f"HTML downloading ENABLED - saving to {html_download_path}")
-        elif args.no_download_html_filings:
-            print("HTML downloading DISABLED (--no-download-html-filings)")
-        if args.only_download_files:
-            print("📁 HTML-DOWNLOAD-ONLY MODE - Will only download HTML files for existing data")
-            if not html_download_path:
-                print("⚠️  --only-download-files requires SEC_HTML_DOWNLOAD_PATH to be set (and not --no-download-html-filings)")
-                print("💡 Set SEC_HTML_DOWNLOAD_PATH in your .env file")
-                sys.exit(1)
-        if args.reload:
-            reload_msg = "🔄 RELOAD MODE ENABLED"
+        if progress.verbose:
+            print(f"\nStarting SEC data scraper...")
+            print(f"Companies to process: {len(companies)}")
             if args.fiscal_year:
                 if args.fiscal_quarter:
-                    reload_msg += f" - Will refresh FY{args.fiscal_year} {args.fiscal_quarter} data"
+                    print(f"Target: Fiscal Year {args.fiscal_year} {args.fiscal_quarter}")
                 else:
-                    reload_msg += f" - Will refresh complete FY{args.fiscal_year} data"
+                    print(f"Target: Complete Fiscal Year {args.fiscal_year}")
             else:
-                reload_msg += f" - Will refresh all filings from {args.year} onwards"
-            print(reload_msg)
-        print(f"{'='*50}")
+                print(f"Start year: {args.year}")
+            print(f"{'='*50}")
+            if args.local:
+                print("LOCAL PROCESSING MODE - Using offline XBRL zip files")
+            else:
+                print("ONLINE PROCESSING MODE - Downloading from SEC API")
+            if args.no_dimensions:
+                print("Dimensions processing DISABLED")
+            else:
+                print("Dimensions processing ENABLED - will capture segment, product, and geographic data")
+            if html_download_path:
+                print(f"HTML downloading ENABLED - saving to {html_download_path}")
+            elif args.no_download_html_filings:
+                print("HTML downloading DISABLED (--no-download-html-filings)")
+            if args.only_download_files:
+                print("📁 HTML-DOWNLOAD-ONLY MODE - Will only download HTML files for existing data")
+                if not html_download_path:
+                    print("⚠️  --only-download-files requires SEC_HTML_DOWNLOAD_PATH to be set (and not --no-download-html-filings)")
+                    print("💡 Set SEC_HTML_DOWNLOAD_PATH in your .env file")
+                    sys.exit(1)
+            if args.reload:
+                reload_msg = "🔄 RELOAD MODE ENABLED"
+                if args.fiscal_year:
+                    if args.fiscal_quarter:
+                        reload_msg += f" - Will refresh FY{args.fiscal_year} {args.fiscal_quarter} data"
+                    else:
+                        reload_msg += f" - Will refresh complete FY{args.fiscal_year} data"
+                else:
+                    reload_msg += f" - Will refresh all filings from {args.year} onwards"
+                print(reload_msg)
+            print(f"{'='*50}")
         
         # Handle download-only mode
         if args.only_download_files:

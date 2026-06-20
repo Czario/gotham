@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SEC API client for fetching company filings and data"""
 
+import logging
 import requests
 import json
 import time
@@ -12,6 +13,8 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from utilities.helpers.period_utils import FiscalYearCalculator
 from utilities.sec_url_detector import SECURLDetector
+
+logger = logging.getLogger(__name__)
 
 class SECAPIClient:
     """Client for interacting with SEC EDGA            # Construct SEC directory URL using the same pattern as XBRL
@@ -58,7 +61,7 @@ class SECAPIClient:
             else:
                 self.cik_to_ticker = {}
         except Exception as e:
-            print(f"Warning: Failed to load ticker mappings: {e}")
+            logger.warning(f"Failed to load ticker mappings: {e}")
             self.cik_to_ticker = {}
     
     def get_ticker_from_cik(self, cik: str) -> Optional[str]:
@@ -84,7 +87,7 @@ class SECAPIClient:
                 return fiscal_year_end
             
         except Exception as e:
-            print(f"Warning: Failed to get fiscal year end from database: {e}")
+            logger.warning(f"Failed to get fiscal year end from database: {e}")
         
         return None
     
@@ -99,16 +102,16 @@ class SECAPIClient:
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 wait = backoff_base ** attempt
                 if attempt < max_retries - 1:
-                    print(f"API request failed for {url}: {e} — retrying in {wait:.0f}s (attempt {attempt + 1}/{max_retries})")
+                    logger.warning(f"API request failed for {url}: {e} — retrying in {wait:.0f}s (attempt {attempt + 1}/{max_retries})")
                     time.sleep(wait)
                 else:
-                    print(f"API request failed for {url}: {e}")
+                    logger.warning(f"API request failed for {url}: {e}")
                     return None
             except requests.exceptions.RequestException as e:
-                print(f"API request failed for {url}: {e}")
+                logger.warning(f"API request failed for {url}: {e}")
                 return None
             except json.JSONDecodeError as e:
-                print(f"JSON parsing failed for {url}: {e}")
+                logger.warning(f"JSON parsing failed for {url}: {e}")
                 return None
     
     def get_company_submissions(self, cik: str, start_year: int = 2010) -> Tuple[Optional[Dict], List[Dict]]:
@@ -258,10 +261,10 @@ class SECAPIClient:
         files_info = main_data.get('filings', {}).get('files', [])
         
         if not files_info:
-            print("No historical filing files found")
+            logger.debug("No historical filing files found")
             return historical_filings
         
-        print(f"Found {len(files_info)} historical filing files to process")
+        logger.debug(f"Found {len(files_info)} historical filing files to process")
         
         for file_info in files_info:
             file_name = file_info.get('name', '')
@@ -269,12 +272,12 @@ class SECAPIClient:
             # Construct URL for historical file
             file_url = f"{self.BASE_URL}/submissions/{file_name}"
             
-            print(f"Fetching historical data from: {file_name}")
+            logger.debug(f"Fetching historical data from: {file_name}")
             
             # Fetch the historical filing data
             historical_data = self._make_request(file_url)
             if not historical_data:
-                print(f"⚠️  Failed to fetch historical data from {file_name} — some filings may be missing for CIK {cik_formatted}")
+                logger.warning(f"Failed to fetch historical data from {file_name} — some filings may be missing for CIK {cik_formatted}")
                 continue
             
             # Extract filings from historical data
@@ -286,11 +289,11 @@ class SECAPIClient:
                 if dates:
                     earliest = min(dates)
                     latest = max(dates)
-                    print(f"Added {len(historical_batch)} filings from {file_name} (date range: {earliest} to {latest})")
+                    logger.debug(f"Added {len(historical_batch)} filings from {file_name} (date range: {earliest} to {latest})")
                 else:
-                    print(f"Added {len(historical_batch)} filings from {file_name}")
+                    logger.debug(f"Added {len(historical_batch)} filings from {file_name}")
             else:
-                print(f"No relevant filings found in {file_name} for year {start_year}+")
+                logger.debug(f"No relevant filings found in {file_name} for year {start_year}+")
             
             historical_filings.extend(historical_batch)
         
@@ -300,11 +303,11 @@ class SECAPIClient:
             if all_dates:
                 earliest = min(all_dates)
                 latest = max(all_dates)
-                print(f"Total historical filings found: {len(historical_filings)} (date range: {earliest} to {latest})")
+                logger.debug(f"Total historical filings found: {len(historical_filings)} (date range: {earliest} to {latest})")
             else:
-                print(f"Total historical filings found: {len(historical_filings)}")
+                logger.debug(f"Total historical filings found: {len(historical_filings)}")
         else:
-            print("No historical filings found matching the criteria")
+            logger.debug("No historical filings found matching the criteria")
         
         return historical_filings
     
@@ -330,7 +333,7 @@ class SECAPIClient:
         """
         # This would require a different approach, possibly using company tickers endpoint
         # or maintaining a local search index
-        print(f"Company search not directly available via SEC API for query: {query}")
+        logger.debug(f"Company search not directly available via SEC API for query: {query}")
         return []
     
     def validate_cik(self, cik: str) -> bool:
@@ -380,7 +383,7 @@ class SECAPIClient:
             
             # Require ticker for folder organization
             if not ticker:
-                print(f"⚠️  No ticker found for CIK {cik}, skipping HTML download")
+                logger.info(f"No ticker found for CIK {cik}, skipping HTML download")
                 return False
             
             # Create ticker-based folder
@@ -393,7 +396,7 @@ class SECAPIClient:
             
             # Validate accession number format
             if not re.match(r'^\d{10}-\d{2}-\d{6}$', clean_accession_number):
-                print(f"⚠️  Invalid accession number format: {accession_number} (cleaned: {clean_accession_number})")
+                logger.warning(f"Invalid accession number format: {accession_number} (cleaned: {clean_accession_number})")
                 print(f"    Expected format: ##########-##-######")
                 return False
             
@@ -401,41 +404,41 @@ class SECAPIClient:
             filename = f"{clean_accession_number}.html.gz"
             filepath = ticker_folder / filename
             if filepath.exists():
-                print(f"⏭️  HTML filing already exists, skipping: /{ticker.upper()}/{filename}")
+                logger.debug(f"HTML filing already exists, skipping: /{ticker.upper()}/{filename}")
                 return True
             
             # Use unified URL detector to find HTML filing
-            print(f"🔍 Detecting URLs for filing: {clean_accession_number} (date: {filing_date})")
+            logger.info(f"Detecting URLs for filing: {clean_accession_number} (date: {filing_date})")
             urls = self.url_detector.detect_filing_urls(cik, clean_accession_number, filing_date)
             
             html_url = urls.get('html_url')
             if not html_url or not isinstance(html_url, str):
-                print(f"❌ Failed to discover HTML filing URL for {clean_accession_number}")
+                logger.warning(f"Failed to discover HTML filing URL for {clean_accession_number}")
                 if urls.get('is_legacy'):
-                    print(f"   Note: This is a legacy filing (pre-2019) - HTML may not be available")
-                print(f"   Directory checked: {urls.get('directory_url')}")
+                    logger.debug("Note: This is a legacy filing (pre-2019) - HTML may not be available")
+                logger.debug(f"Directory checked: {urls.get('directory_url')}")
                 return False
             
             # Download the HTML file
             try:
-                print(f"📥 Downloading from: {html_url}")
+                logger.info(f"Downloading from: {html_url}")
                 success, html_content, error = self.url_detector.download_file(html_url)
                 
                 if not success or not html_content:
-                    print(f"❌ Failed to download HTML: {error or 'No content received'}")
+                    logger.warning(f"Failed to download HTML: {error or 'No content received'}")
                     return False
                 
                 # Create compressed filename (already computed above)
                 with gzip.open(filepath, 'wt', encoding='utf-8') as f:
                     f.write(html_content)
                 
-                print(f"✅ Downloaded HTML filing: /{ticker.upper()}/{filename} ({len(html_content):,} chars)")
+                logger.info(f"Downloaded HTML filing: /{ticker.upper()}/{filename} ({len(html_content):,} chars)")
                 return True
                 
             except Exception as e:
-                print(f"❌ Error saving HTML file: {e}")
+                logger.error(f"Error saving HTML file: {e}")
                 return False
             
         except Exception as e:
-            print(f"❌ Error processing HTML filing {accession_number}: {e}")
+            logger.error(f"Error processing HTML filing {accession_number}: {e}")
             return False
