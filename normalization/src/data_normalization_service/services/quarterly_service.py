@@ -817,12 +817,23 @@ class PeriodBasedFinancialCalculationService:
                             raise
 
             logger.info(f"Saved {saved_count} values for period {period_data.period_date} (skipped {skipped_no_concept} no concept, {skipped_exists} existing)")
-            
-            # If no values were saved, log some sample concepts for debugging
-            if saved_count == 0 and len(period_data.values) > 0:
+
+            # Only warn when values were genuinely lost (concept lookup failed).
+            # saved_count == 0 with everything in skipped_exists is normal on reruns/reload
+            # (dedup correctly skips already-present values) and is NOT data loss.
+            if saved_count == 0 and skipped_no_concept > 0:
                 sample_concepts = list(period_data.values.keys())[:5]
                 extracted_concepts = [self._extract_concept_from_value_key(k) for k in sample_concepts]
-                logger.warning(f"No values saved! Sample concepts: {extracted_concepts}")
+                logger.warning(
+                    f"No values saved for period {period_data.period_date}: "
+                    f"{skipped_no_concept} concept(s) not found in DB (potential data loss). "
+                    f"Sample: {extracted_concepts}"
+                )
+            elif saved_count == 0 and len(period_data.values) > 0:
+                logger.debug(
+                    f"No new values for period {period_data.period_date} "
+                    f"({skipped_exists} already existed) - expected on rerun/reload."
+                )
                 
         except Exception as e:
             logger.error(f"Error saving period data: {e}", exc_info=True)

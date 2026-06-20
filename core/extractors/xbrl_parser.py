@@ -169,6 +169,11 @@ class FlexibleXBRLExtractor:
         
         logger.debug(f"Resolving optimal XBRL URL for: {filing_url}")
         
+        # Reset the "no XBRL anywhere" signal for this filing. It is set to True only
+        # when the filing has no real XBRL instance and no companion amendment supplies
+        # one (i.e. a genuine pre-XBRL-era filing), so the caller can skip it cleanly.
+        self._no_xbrl_available = False
+        
         try:
             # Extract CIK and accession number from URL
             url_parts = filing_url.split('/')
@@ -207,12 +212,38 @@ class FlexibleXBRLExtractor:
             
             if detected_urls and isinstance(detected_urls, dict):
                 xbrl_url = detected_urls.get('xbrl_url')
-                if xbrl_url and isinstance(xbrl_url, str):
+
+                # If the detector resolved a real XBRL instance, use it directly.
+                if xbrl_url and isinstance(xbrl_url, str) and not self.url_detector.is_txt_fallback(detected_urls):
                     logger.info(f"✅ SECURLDetector found optimal XBRL file: {xbrl_url}")
                     return xbrl_url
-                else:
-                    logger.warning(f"SECURLDetector returned no xbrl_url, using original URL: {filing_url}")
-                    return filing_url
+
+                # No real XBRL instance in this accession (only the .txt fallback).
+                # This is the 2009-2012 grace-period pattern: the readable 10-Q/10-K was
+                # filed first and the XBRL exhibits arrived in a separate /A amendment.
+                # Try to recover the XBRL from the companion amendment.
+                logger.info(
+                    f"No XBRL instance in accession {accession_number}; "
+                    f"checking for a companion amendment (10-Q/A, 10-K/A) with XBRL..."
+                )
+                amendment_xbrl_url = self.url_detector.find_amendment_xbrl_url(cik, accession_number)
+                if amendment_xbrl_url:
+                    return amendment_xbrl_url
+
+                # No real XBRL instance and no companion amendment with XBRL: this filing
+                # genuinely has no XBRL (e.g. pre-2012 filings that predate the XBRL mandate).
+                # Signal the caller so it can skip cleanly instead of attempting a doomed parse.
+                self._no_xbrl_available = True
+
+                if xbrl_url and isinstance(xbrl_url, str):
+                    logger.warning(
+                        f"No XBRL found for {accession_number} (and no companion amendment); "
+                        f"this filing appears to predate XBRL"
+                    )
+                    return xbrl_url
+
+                logger.warning(f"SECURLDetector returned no xbrl_url, using original URL: {filing_url}")
+                return filing_url
             else:
                 logger.warning(f"SECURLDetector returned unexpected result, using original URL: {filing_url}")
                 return filing_url
@@ -230,6 +261,22 @@ class FlexibleXBRLExtractor:
         try:
             # Intelligently resolve the optimal XBRL URL
             optimal_url = self._resolve_optimal_xbrl_url(filing_url)
+            
+            # If resolution determined this filing genuinely has no XBRL (pre-XBRL era,
+            # no instance in the accession and no companion amendment), skip the doomed
+            # Arelle load and return a clear signal for the caller.
+            if getattr(self, '_no_xbrl_available', False):
+                logger.warning(
+                    f"⏭️  No XBRL data available for filing at {filing_url} "
+                    f"(predates XBRL or no XBRL exhibits filed); skipping extraction"
+                )
+                return {
+                    'filing_info': {'original_url': filing_url},
+                    'statements': {},
+                    'no_xbrl_available': True,
+                    'discovered_taxonomies': [],
+                    'processing_time': time.time() - start_time
+                }
             
             # Load XBRL document directly
             logger.debug(f"Loading XBRL document from: {optimal_url}")

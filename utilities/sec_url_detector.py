@@ -102,7 +102,129 @@ class SECURLDetector:
             return self._detect_modern_filing_urls(unpadded_cik, accession_number, clean_accession)
         else:
             return self._detect_legacy_filing_urls(unpadded_cik, accession_number, clean_accession)
-    
+
+    @staticmethod
+    def is_txt_fallback(detected_urls: Dict[str, Union[str, bool, None]]) -> bool:
+        """
+        Determine whether detect_filing_urls resolved a real XBRL instance or merely
+        fell back to the raw .txt submission file (i.e. the accession has no XBRL).
+        """
+        xbrl_url = detected_urls.get('xbrl_url')
+        txt_url = detected_urls.get('txt_url')
+        if not xbrl_url or not isinstance(xbrl_url, str):
+            return True
+        if xbrl_url.lower().endswith('.txt'):
+            return True
+        if txt_url and xbrl_url == txt_url:
+            return True
+        return False
+
+    def _get_json(self, url: str) -> Optional[Dict]:
+        """Fetch and parse a JSON document from SEC, returning None on failure."""
+        try:
+            time.sleep(self.rate_limit_delay)
+            response = self.session.get(url, timeout=15)
+            if response.status_code == 200:
+                return response.json()
+            logger.debug(f"JSON fetch {url} -> HTTP {response.status_code}")
+        except Exception as e:
+            logger.debug(f"JSON fetch error for {url}: {e}")
+        return None
+
+    def _get_submission_index(self, cik: str) -> List[Dict[str, Optional[str]]]:
+        """
+        Fetch the company's full submission index (recent + historical files) from
+        data.sec.gov and return a flat list of dicts with keys:
+        accession, form, reportDate, filingDate.
+        """
+        cik_padded = str(cik).lstrip('0').zfill(10)
+        entries: List[Dict[str, Optional[str]]] = []
+
+        def _add_block(block: Dict) -> None:
+            forms = block.get('form', []) or []
+            accs = block.get('accessionNumber', []) or []
+            report_dates = block.get('reportDate', []) or []
+            filing_dates = block.get('filingDate', []) or []
+            for i, form in enumerate(forms):
+                entries.append({
+                    'form': form,
+                    'accession': accs[i] if i < len(accs) else None,
+                    'reportDate': report_dates[i] if i < len(report_dates) else None,
+                    'filingDate': filing_dates[i] if i < len(filing_dates) else None,
+                })
+
+        main = self._get_json(f"https://data.sec.gov/submissions/CIK{cik_padded}.json")
+        if not main:
+            return entries
+
+        _add_block(main.get('filings', {}).get('recent', {}))
+
+        for file_obj in main.get('filings', {}).get('files', []):
+            name = file_obj.get('name')
+            if name:
+                historical = self._get_json(f"https://data.sec.gov/submissions/{name}")
+                if historical:
+                    _add_block(historical)
+
+        return entries
+
+    def find_amendment_xbrl_url(self, cik: str, original_accession: str) -> Optional[str]:
+        """
+        Recover XBRL for filings that lack it in their own accession (the 2009-2012
+        SEC grace-period pattern, where the readable 10-Q/10-K was filed first and the
+        XBRL exhibits arrived later in a separate 10-Q/A or 10-K/A amendment).
+
+        Locates a companion amendment for the SAME reporting period whose directory
+        contains a real XBRL instance, and returns that instance URL. Returns None if
+        no such amendment exists.
+        """
+        try:
+            index = self._get_submission_index(cik)
+            if not index:
+                return None
+
+            original = next((f for f in index if f.get('accession') == original_accession), None)
+            if not original:
+                logger.debug(f"Original accession {original_accession} not found in submission index")
+                return None
+
+            base_form = original.get('form') or ''
+            report_date = original.get('reportDate')
+            if not base_form or not report_date:
+                return None
+
+            amend_form = base_form if base_form.endswith('/A') else f"{base_form}/A"
+
+            candidates = [
+                f for f in index
+                if f.get('form') == amend_form
+                and f.get('reportDate') == report_date
+                and f.get('accession') != original_accession
+            ]
+            # Prefer the amendment filed soonest after the original (most likely the XBRL exhibit filing)
+            candidates.sort(key=lambda f: f.get('filingDate') or '')
+
+            unpadded_cik = str(cik).lstrip('0')
+            for cand in candidates:
+                accession = cand.get('accession')
+                if not accession:
+                    continue
+                clean_accession = accession.replace('-', '')
+                directory_url = f"https://www.sec.gov/Archives/edgar/data/{unpadded_cik}/{clean_accession}/"
+                xbrl_url = self._discover_xbrl_from_directory(directory_url, accession)
+                if xbrl_url and not xbrl_url.lower().endswith('.txt'):
+                    logger.info(
+                        f"✅ Recovered XBRL from companion amendment {accession} "
+                        f"(period {report_date}) for original {original_accession}"
+                    )
+                    return xbrl_url
+
+            logger.debug(f"No companion amendment with XBRL found for {original_accession}")
+            return None
+        except Exception as e:
+            logger.debug(f"Amendment XBRL lookup failed for {original_accession}: {e}")
+            return None
+
     def _detect_modern_filing_urls(self, cik: str, accession_number: str, clean_accession: str) -> Dict[str, Union[str, bool, None]]:
         """
         Detect URLs for modern filings (2019+)

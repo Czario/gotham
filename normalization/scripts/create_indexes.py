@@ -121,6 +121,14 @@ def create_target_indexes(db_connection: DatabaseConnection):
             ),
             IndexModel([("company_cik", ASCENDING)], name="idx_company_cik"),
             IndexModel([("concept", ASCENDING)], name="idx_concept"),
+            IndexModel(
+                [
+                    ("company_cik", ASCENDING),
+                    ("statement_type", ASCENDING),
+                    ("canonical_concept", ASCENDING),
+                ],
+                name="idx_company_statement_canonical"
+            ),
         ]
         
         result = collection.create_indexes(indexes_concepts)

@@ -153,6 +153,14 @@ class EnhancedFinancialStatementProcessor:
                     return None
                 
                 if not financial_data.get('statements'):
+                    if financial_data.get('no_xbrl_available'):
+                        logger.warning(
+                            f"⏭️  No XBRL for filing {accession_number}: this filing predates "
+                            f"the XBRL era or has no XBRL exhibits (and no companion amendment "
+                            f"supplies them). Skipping."
+                        )
+                        print(f"Skipping filing {accession_number}: no XBRL data available (pre-XBRL era)")
+                        return None
                     logger.error(f"❌ No Statements Found in XBRL for filing {accession_number}: XBRL parsed but no financial statements identified")
                     print(f"Failed to extract XBRL data for filing {accession_number}: No statements in parsed data")
                     return None
@@ -784,25 +792,8 @@ class EnhancedFinancialStatementProcessor:
             
         # Continue with period filtering using meaningful facts
         dimensional_facts = meaningful_dimensional_facts
-            
-        # Check if this is the first time filtering for this filing type
-        state_key = filing_form_type or 'unknown'
-        is_first_time = state_key not in self._period_filtering_state
-        
-        if is_first_time:
-            self._period_filtering_state[state_key] = True
-        
-        # Get target duration and tolerance using centralized utilities
-        target_duration_months = PeriodMatcher.get_target_duration_for_form(filing_form_type)
-        duration_tolerance = PeriodMatcher.get_duration_tolerance_for_form(filing_form_type)
-        
-        # Only show initial message on first run for this filing type
-        if is_first_time:
-            logger.debug(f"📋 Filtering dimensional facts for {filing_form_type or 'unknown'} filing (target: {target_duration_months} months)")
-        
-        # For unknown filing types, be conservative and include more data
-        if not filing_form_type:
-            return dimensional_facts        # Group facts by period type
+
+        # Group facts by period type
         instant_facts = []
         duration_facts = []
         
@@ -1033,8 +1024,6 @@ class EnhancedFinancialStatementProcessor:
                     # This prevents picking 6-month or 9-month cumulative periods for quarterly reports
                     if verbose:
                         logger.debug(f"STRICT MODE: Completely rejected all periods for {end_date_key} (filing type: {filing_form_type or 'unknown'})")
-        
-        return filtered_facts
         
         return filtered_facts
 

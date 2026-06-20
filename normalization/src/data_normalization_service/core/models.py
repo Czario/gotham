@@ -29,6 +29,7 @@ class ConceptDocument:
     concept: str
     form_type: Optional[str] = None  # 10-K, 10-Q, etc.
     label: Optional[str] = None
+    canonical_concept: Optional[str] = None  # Cross-era canonical concept name
     path: Optional[str] = None  # Materialized path: "001.002.003"
     order_key: Optional[str] = None  # Lexicographic order: "a", "m", "z"
     abstract: bool = False
@@ -56,6 +57,7 @@ class ConceptDocument:
             "concept": self.concept,
             "form_type": self.form_type,
             "label": self.label,
+            "canonical_concept": self.canonical_concept or self.concept,
             "path": self.path,
             "order_key": self.order_key,
             "abstract": self.abstract,
@@ -115,6 +117,10 @@ class ValueDocument:
     # Critical metadata fields to prevent data loss
     fact_id: Optional[str] = None           # CRITICAL for auditing and traceability
     decimals: Optional[str] = None          # CRITICAL for precision
+    # Provenance: where this value came from. Defaults to primary XBRL statement
+    # extraction; set to 'sec_companyfacts' for values recovered via the SEC
+    # companyfacts API reconciliation pass.
+    source: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for MongoDB insertion."""
@@ -142,6 +148,8 @@ class ValueDocument:
             result["fact_id"] = self.fact_id
         if self.decimals is not None:
             result["decimals"] = self.decimals
+        if self.source is not None:
+            result["source"] = self.source
         
         return result
 

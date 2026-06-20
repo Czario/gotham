@@ -16,6 +16,7 @@ from ..database import (
     DatabaseTracker
 )
 from ..core.config import AppConfig
+from ..core.concept_canonicalization import canonical_concept
 from ..core.logging_config import get_status_logger
 from ..utils.hierarchy import HierarchyManager
 from ..utils.progress import progress_wrapper, create_progress_bar
@@ -599,6 +600,11 @@ class FinancialNormalizationService:
         # Preserve the abstract flag from the source data for hierarchy structure
         is_abstract = item.get('abstract', False)
         
+        # Compute the cross-era canonical concept name so equivalent concepts
+        # (e.g. ASC 606 revenue, continuing-operations cash-flow variants) form a
+        # single continuous time series for downstream consumers.
+        canonical = canonical_concept(item['concept'])
+        
         # Ensure proper hierarchy placement by preserving path and order_key
         concept_doc = ConceptDocument(
             company_cik=cik,
@@ -606,6 +612,7 @@ class FinancialNormalizationService:
             concept=item['concept'],
             form_type=form_type,  # Add form_type to the document
             label=taxonomy_label,  # Use taxonomy-based label or fallback
+            canonical_concept=canonical,  # Cross-era canonical name
             path=item.get('path'),  # Preserve hierarchy path for correct placement
             order_key=item.get('order_key'),  # Preserve order for correct hierarchy position
             abstract=is_abstract,  # Preserve abstract flag from source data

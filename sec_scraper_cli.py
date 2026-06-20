@@ -234,7 +234,7 @@ def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optio
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, enable_dimensions: bool = False, enable_extra_data: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_taxonomy: bool = False):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, enable_dimensions: bool = False, enable_extra_data: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_taxonomy: bool = False, enable_reconciliation: bool = True):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -243,6 +243,7 @@ class SECDataScraperApp:
         self.start_year = start_year
         self.enable_dimensions = enable_dimensions
         self.enable_extra_data = enable_extra_data
+        self.enable_reconciliation = enable_reconciliation
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = target_fiscal_quarter
         self.reload = reload
@@ -282,6 +283,12 @@ class SECDataScraperApp:
         )
         self._norm_service = _NormService(_norm_config, enable_taxonomy=enable_taxonomy)
         self._quarterly_service = _QuarterlyService(_norm_config)
+        # companyfacts reconciliation: fills genuine extraction gaps (incl. the
+        # latest filing's edge) from the SEC companyfacts API after each company.
+        # Built lazily in _run_companyfacts_reconciliation (needs sec_client).
+        self._reconciliation_service = None
+        self._reconciliation_db_uri = _mongo_uri
+        self._reconciliation_db_name = _database_name
         # Per-company accumulator: company_cik -> list of raw statement dicts
         # (only cash_flow + income statements; used for deaccumulation)
         self._quarterly_accumulator: Dict[str, List[Dict]] = {}
@@ -374,6 +381,32 @@ class SECDataScraperApp:
             self._quarterly_service.process_company_from_statements(cik, statements)
         except Exception as e:
             logger.error(f"Quarterly deaccumulation failed for {cik}: {e}", exc_info=True)
+
+    def _run_companyfacts_reconciliation(self, cik: str) -> None:
+        """Fill genuine extraction gaps for a company from the SEC companyfacts
+        API after its filings are processed. Edge mode is on, so the latest
+        filing's gaps are recovered immediately. INSERT-ONLY and provenance
+        tagged; never overwrites primary-extracted values."""
+        if not self.enable_reconciliation:
+            return
+        try:
+            if self._reconciliation_service is None:
+                from pymongo import MongoClient as _MongoClient
+                from data_normalization_service.services.companyfacts_reconciliation import (
+                    CompanyFactsReconciliationService as _ReconService,
+                )
+                recon_db = _MongoClient(self._reconciliation_db_uri)[self._reconciliation_db_name]
+                self._reconciliation_service = _ReconService(recon_db, self.sec_client)
+            cik_padded = str(cik).zfill(10)
+            total = 0
+            for freq in ("annual", "quarterly"):
+                stats = self._reconciliation_service.reconcile_company(
+                    cik_padded, frequency=freq, include_edge=True)
+                total += stats.get("filled", 0)
+            if total:
+                logger.info(f"✅ companyfacts reconciliation filled {total} gap value(s) for CIK {cik}")
+        except Exception as e:
+            logger.warning(f"companyfacts reconciliation failed for CIK {cik}: {e}", exc_info=True)
 
     def _build_sec_url(self, company_cik: str, accession_number: str) -> str:
         accession_clean = accession_number.replace('-', '')
@@ -614,6 +647,9 @@ class SECDataScraperApp:
             
             # Step 4: Run quarterly deaccumulation for this company (uses in-memory accumulator)
             self._flush_quarterly_accumulator(cik)
+
+            # Step 4b: Fill genuine extraction gaps from SEC companyfacts (edge mode)
+            self._run_companyfacts_reconciliation(cik)
 
             # Step 5: Log processing results
             logger.info(f"Processed {filings_processed} filings, skipped {filings_skipped} existing filings for company CIK: {cik}")
@@ -965,6 +1001,9 @@ class SECDataScraperApp:
             # Calculate processing stats
             # Run quarterly deaccumulation for this company (uses in-memory accumulator)
             self._flush_quarterly_accumulator(cik)
+
+            # Fill genuine extraction gaps from SEC companyfacts (edge mode)
+            self._run_companyfacts_reconciliation(cik)
 
             processing_time = time.time() - company_start_time
             
@@ -1757,6 +1796,8 @@ if __name__ == "__main__":
                        help='Only download HTML files for existing company data in database. Requires existing XBRL data and accession numbers. Use with --download-html-filings to specify download path.')
     parser.add_argument('--fix-lab', action='store_true',
                        help='Enable XBRL taxonomy label fixing when normalizing (looks up official US-GAAP labels).')
+    parser.add_argument('--no-reconciliation', action='store_true',
+                       help='Disable the post-processing SEC companyfacts gap-fill reconciliation (enabled by default).')
     
     args = parser.parse_args()
     
@@ -1866,6 +1907,7 @@ if __name__ == "__main__":
                 html_download_path=html_download_path,
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_taxonomy=args.fix_lab,
+                enable_reconciliation=not args.no_reconciliation,
             )
             
             if not app.setup_database():
@@ -2048,6 +2090,7 @@ if __name__ == "__main__":
                 html_download_path=html_download_path,
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_taxonomy=args.fix_lab,
+                enable_reconciliation=not args.no_reconciliation,
             )
             
             # Convert CIKs to tickers for local processing
@@ -2133,6 +2176,7 @@ if __name__ == "__main__":
                 html_download_path=html_download_path,
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_taxonomy=args.fix_lab,
+                enable_reconciliation=not args.no_reconciliation,
             )
             
             if not app.setup_database():

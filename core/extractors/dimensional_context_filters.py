@@ -49,12 +49,42 @@ class DimensionalContextFilter:
         'us-gaap:RestatementAxis',  # Restatements
     }
     
-    # Keywords in member names that indicate unwanted contexts
+    # Keywords in member names that indicate unwanted contexts.
+    # These are matched against whole camelCase/qname tokens (see _matches_excluded_keyword),
+    # NOT as raw substrings. Substring matching previously caused false positives such as
+    # 'change' matching 'ForeignExchangeContractMember' and 'life' matching
+    # 'LifeInsuranceSegmentMember', silently dropping legitimate dimensional facts.
     EXCLUDED_KEYWORDS = {
-        'forecast', 'scenario', 'estimate', 'adjustment', 'restatement', 
-        'error', 'correction', 'proforma', 'pro-forma', 'budget', 'planned',
-        'projected', 'unspecified', 'change', 'useful', 'life'
+        'forecast', 'scenario', 'estimate', 'adjustment', 'restatement',
+        'error', 'correction', 'proforma', 'forma', 'budget', 'planned',
+        'projected', 'unspecified', 'change', 'useful'
     }
+
+    @staticmethod
+    def _tokenize_qname(name: str) -> Set[str]:
+        """
+        Split an XBRL qname / member / axis name into lowercase word tokens.
+
+        Handles camelCase boundaries and the separators ':', '_', '-', '.', and digits,
+        so 'us-gaap:ForeignExchangeContractMember' -> {'us','gaap','foreign','exchange',
+        'contract','member'}. This lets EXCLUDED_KEYWORDS match whole words instead of
+        accidental substrings.
+        """
+        if not name:
+            return set()
+        # Insert spaces at camelCase boundaries: 'ForeignExchange' -> 'Foreign Exchange'
+        spaced = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', name)
+        # Split on any non-alphabetic character (handles ':', '_', '-', '.', digits)
+        tokens = re.split(r'[^a-zA-Z]+', spaced)
+        return {t.lower() for t in tokens if t}
+
+    @classmethod
+    def _matches_excluded_keyword(cls, name: str) -> bool:
+        """Return True if any excluded keyword appears as a whole token in name."""
+        if not name:
+            return False
+        return bool(cls._tokenize_qname(name) & cls.EXCLUDED_KEYWORDS)
+
     
     @classmethod
     def should_exclude_dimensional_fact(cls, dimensional_fact: Dict[str, Any]) -> bool:
@@ -98,9 +128,9 @@ class DimensionalContextFilter:
                     if member_qname in cls.EXCLUDED_MEMBERS:
                         return True
                     
-                    # Check for excluded keywords in member labels
-                    member_label = dim_info.get('member_label', '').lower()
-                    if any(keyword in member_label for keyword in cls.EXCLUDED_KEYWORDS):
+                    # Check for excluded keywords in member labels (whole-token match)
+                    member_label = dim_info.get('member_label', '')
+                    if cls._matches_excluded_keyword(member_label):
                         return True
         
         return False
@@ -127,10 +157,10 @@ class DimensionalContextFilter:
                     if member in cls.EXCLUDED_MEMBERS or axis in cls.EXCLUDED_AXES:
                         return True
                     
-                    # Check for excluded keywords in member or axis
-                    if any(keyword in member.lower() for keyword in cls.EXCLUDED_KEYWORDS):
+                    # Check for excluded keywords in member or axis (whole-token match)
+                    if cls._matches_excluded_keyword(member):
                         return True
-                    if any(keyword in axis.lower() for keyword in cls.EXCLUDED_KEYWORDS):
+                    if cls._matches_excluded_keyword(axis):
                         return True
         
         return False
