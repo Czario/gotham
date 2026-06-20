@@ -1,0 +1,31 @@
+[project]
+name = "sec-data-scraper-v9"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "pymongo>=4.6.0",
+    "pandas>=2.0.0",
+    "streamlit>=1.46.1",
+    "openpyxl>=3.1.5",
+    # Arelle XBRL processing library with all optional dependencies
+    "arelle-release[Crypto,DB,EFM,ObjectMaker,WebServer]>=2.41.4",
+    "python-dateutil>=2.9.0.post0",
+    "beautifulsoup4>=4.12.0",
+    "tqdm>=4.67.1",
+    "python-dotenv>=1.0.0",
+    # Normalization library (merged pipeline)
+    "data-normalization-service",
+]
+
+[tool.uv.sources]
+data-normalization-service = { path = "./normalization", editable = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.0",
+    "pytest-timeout>=2.4.0",
+    "pytest-mock>=3.10.0",
+]

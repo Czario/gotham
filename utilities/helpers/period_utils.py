@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""
+Centralized period utilities to eliminate duplication across the codebase
+"""
+
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any
+from dateutil.relativedelta import relativedelta
+import re
+
+# Import existing normalize_period_type function to avoid duplication
+from .period_normalizer import normalize_period_type
+
+
+class PeriodConfig:
+    """Configuration constants for period processing"""
+    
+    # Filing type to target duration mapping
+    FILING_TYPE_DURATIONS = {
+        '10-Q': 3,   # Quarterly
+        '10-K': 12,  # Annual
+    }
+    
+    # Period type indicators
+    QUARTERLY_INDICATORS = [
+        'three months', '3 months', 'three-months',
+        'quarter', 'quarterly', 'q1', 'q2', 'q3', 'q4'
+    ]
+    
+    CUMULATIVE_INDICATORS = [
+        'six months', '6 months', 'six-months',
+        'nine months', '9 months', 'nine-months', 
+        'twelve months', '12 months', 'twelve-months',
+        'year to date', 'ytd', 'cumulative'
+    ]
+    
+    ANNUAL_INDICATORS = [
+        'twelve months', '12 months', 'twelve-months',
+        'year ended', 'annual', 'yearly'
+    ]
+    
+    # Tolerance settings - STRICT MODE: Only exact 3-month periods allowed
+    DEFAULT_DURATION_TOLERANCE = 0.1  # Very strict tolerance (0.1 months = ~3 days)
+    QUARTERLY_STRICT_TOLERANCE = 0.05  # Ultra strict for quarterly (0.05 months = ~1.5 days)
+    ANNUAL_DURATION_TOLERANCE = 1.0
+    DATE_TOLERANCE_DAYS = 7
+    FISCAL_YEAR_TOLERANCE_DAYS = 7
+    
+    # Strict quarterly enforcement
+    STRICT_QUARTERLY_MODE = True  # Reject ALL non-quarterly periods for quarterly filings
+
+
+class PeriodParser:
+    """Centralized period parsing utilities"""
+    
+    @staticmethod
+    def extract_start_date_from_period_string(period_string: str) -> Optional[datetime]:
+        """Extract start date from period string format 'YYYY-MM-DD HH:MM:SS to YYYY-MM-DD HH:MM:SS'"""
+        if not period_string or ' to ' not in period_string:
+            return None
+        
+        try:
+            start_part = period_string.split(' to ')[0].strip()
+            # Handle both date-only and datetime formats
+            if ' ' in start_part:
+                date_part = start_part.split(' ')[0]
+            else:
+                date_part = start_part
+            
+            return datetime.strptime(date_part, '%Y-%m-%d')
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def extract_end_date_from_period_string(period_string: str) -> Optional[datetime]:
+        """Extract end date from period string format 'YYYY-MM-DD HH:MM:SS to YYYY-MM-DD HH:MM:SS'"""
+        if not period_string:
+            return None
+        
+        try:
+            if ' to ' in period_string:
+                end_part = period_string.split(' to ')[1].strip()
+            else:
+                end_part = period_string.strip()
+            
+            # Handle both date-only and datetime formats
+            if ' ' in end_part:
+                date_part = end_part.split(' ')[0]
+            else:
+                date_part = end_part
+            
+            return datetime.strptime(date_part, '%Y-%m-%d')
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def extract_date_from_period_name(period_name: str) -> Optional[datetime]:
+        """Extract date from period column name like '2025-03-29 (Q1)' or '2025-03-29'"""
+        if not period_name:
+            return None
+        
+        # Try to extract YYYY-MM-DD pattern
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', period_name)
+        if date_match:
+            try:
+                return datetime.strptime(date_match.group(1), '%Y-%m-%d')
+            except ValueError:
+                pass
+        
+        return None
+
+    @staticmethod
+    def calculate_duration_months(start_date: datetime, end_date: datetime) -> float:
+        """Calculate duration in months between two dates"""
+        duration_days = (end_date - start_date).days
+        return duration_days / 30.4  # Approximate month length
+
+
+class PeriodClassifier:
+    """Utilities for classifying period types"""
+    
+    @staticmethod
+    def is_quarterly_period(period_str: str) -> bool:
+        """Check if a period represents a quarterly period (3 months)"""
+        if not period_str:
+            return False
+        
+        period_lower = period_str.lower()
+        return any(indicator in period_lower for indicator in PeriodConfig.QUARTERLY_INDICATORS)
+
+    @staticmethod
+    def is_cumulative_period(period_str: str) -> bool:
+        """Check if a period represents a cumulative period (6, 9, or 12 months)"""
+        if not period_str:
+            return False
+        
+        period_lower = period_str.lower()
+        return any(indicator in period_lower for indicator in PeriodConfig.CUMULATIVE_INDICATORS)
+
+    @staticmethod
+    def is_annual_period(period_str: str) -> bool:
+        """Check if a period represents an annual period (12 months/year)"""
+        if not period_str:
+            return False
+        
+        period_lower = period_str.lower()
+        return any(indicator in period_lower for indicator in PeriodConfig.ANNUAL_INDICATORS)
+
+    @staticmethod
+    def get_cumulative_penalty(period_str: str) -> int:
+        """Get penalty score for cumulative periods based on duration"""
+        if not period_str:
+            return 50
+        
+        period_lower = period_str.lower()
+        
+        if 'six months' in period_lower or '6 months' in period_lower:
+            return 75  # 6 months is moderately bad for quarterly
+        elif 'nine months' in period_lower or '9 months' in period_lower:
+            return 100  # 9 months is worse
+        elif 'twelve months' in period_lower or '12 months' in period_lower or 'year' in period_lower:
+            return 150  # 12 months is worst for quarterly
+        
+        return 50  # Default penalty for other cumulative periods
+
+    @staticmethod
+    def get_period_type_description(period_name: str) -> str:
+        """Get a human-readable description of what period type a column represents"""
+        if not period_name:
+            return "Unknown period type"
+        
+        if PeriodClassifier.is_quarterly_period(period_name):
+            return "3-month quarterly period ✅"
+        elif 'six months' in period_name.lower() or '6 months' in period_name.lower():
+            return "6-month cumulative period ⚠️"
+        elif 'nine months' in period_name.lower() or '9 months' in period_name.lower():
+            return "9-month cumulative period ⚠️"
+        elif PeriodClassifier.is_annual_period(period_name):
+            return "12-month annual period"
+        
+        # Try to extract date for period identification
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', period_name)
+        if date_match:
+            return f"Period ending {date_match.group(1)}"
+        
+        return "Unknown period type"
+
+
+class PeriodMatcher:
+    """Utilities for matching periods against criteria"""
+    
+    @staticmethod
+    def get_target_duration_for_form(form_type: Optional[str]) -> int:
+        """Get the expected duration in months for a filing type"""
+        if not form_type:
+            return 3  # Default to quarterly
+        return PeriodConfig.FILING_TYPE_DURATIONS.get(form_type, 3)
+
+    @staticmethod
+    def get_duration_tolerance_for_form(form_type: Optional[str]) -> float:
+        """Get the duration tolerance for a filing type - STRICT MODE"""
+        if form_type == '10-K':
+            return PeriodConfig.ANNUAL_DURATION_TOLERANCE
+        elif form_type == '10-Q':
+            # Ultra strict for quarterly filings - must be exactly 3 months
+            return PeriodConfig.QUARTERLY_STRICT_TOLERANCE
+        return PeriodConfig.QUARTERLY_STRICT_TOLERANCE  # Default to strict quarterly
+
+    @staticmethod
+    def is_period_match(period_start: datetime, period_end: datetime, target_end: datetime, 
+                       actual_duration_months: float, target_duration_months: int, 
+                       form_type: Optional[str] = None) -> bool:
+        """Check if a period matches target criteria - STRICT MODE"""
+        
+        # Must end on or very close to the target date
+        end_date_diff = abs((period_end - target_end).days)
+        if end_date_diff > PeriodConfig.DATE_TOLERANCE_DAYS:
+            return False
+        
+        # STRICT ENFORCEMENT: For quarterly filings, absolutely no non-quarterly periods
+        if form_type == '10-Q' or target_duration_months == 3:
+            # Ultra strict tolerance for quarterly periods
+            duration_diff = abs(actual_duration_months - 3.0)
+            if duration_diff > PeriodConfig.QUARTERLY_STRICT_TOLERANCE:
+                return False
+        else:
+            # Duration must be close to target for other types
+            duration_diff = abs(actual_duration_months - target_duration_months)
+            tolerance = PeriodMatcher.get_duration_tolerance_for_form(form_type)
+            if duration_diff > tolerance:
+                return False
+        
+        return True
+
+    @staticmethod
+    def is_strictly_quarterly_period(duration_months: float) -> bool:
+        """Check if a period is strictly a quarterly period (exactly ~3 months)"""
+        return abs(duration_months - 3.0) <= PeriodConfig.QUARTERLY_STRICT_TOLERANCE
+
+    @staticmethod
+    def reject_non_quarterly_period(duration_months: float, form_type: Optional[str] = None) -> bool:
+        """Determine if a period should be rejected for not being quarterly"""
+        if form_type == '10-Q':
+            # Absolutely reject anything that's not exactly quarterly
+            return not PeriodMatcher.is_strictly_quarterly_period(duration_months)
+        return False  # Don't reject for other form types
+
+    @staticmethod
+    def log_strict_rejection(duration_months: float, period_str: str, form_type: str, reason: str = ""):
+        """Log detailed information about strict period rejections for debugging"""
+        tolerance = PeriodConfig.QUARTERLY_STRICT_TOLERANCE
+        print(f"🚫 STRICT REJECTION DETAILS:")
+        print(f"   Period: {period_str}")
+        print(f"   Duration: {duration_months:.3f} months")
+        print(f"   Filing type: {form_type}")
+        print(f"   Required: 3.000 ± {tolerance:.3f} months")
+        print(f"   Deviation: {abs(duration_months - 3.0):.3f} months")
+        if reason:
+            print(f"   Reason: {reason}")
+        print(f"   Status: {'✅ Would accept' if abs(duration_months - 3.0) <= tolerance else '🚫 Rejected'}")
+
+    @staticmethod
+    def validate_period_selection(selected_period: str, form_type: str) -> Tuple[bool, str]:
+        """Validate that the selected period is appropriate for the filing type - STRICT MODE"""
+        
+        if not selected_period:
+            return False, "No period selected"
+        
+        if form_type == '10-Q':
+            # STRICT VALIDATION: Only accept exactly quarterly periods
+            if (PeriodClassifier.is_cumulative_period(selected_period) and 
+                not PeriodClassifier.is_quarterly_period(selected_period)):
+                period_desc = PeriodClassifier.get_period_type_description(selected_period)
+                return False, f"STRICT REJECTION: {period_desc} for quarterly filing - MUST use exactly 3-month period"
+            elif not PeriodClassifier.is_quarterly_period(selected_period):
+                return False, f"STRICT REJECTION: Non-quarterly period for 10-Q filing - MUST use exactly 3-month period"
+        
+        elif form_type == '10-K':
+            if (PeriodClassifier.is_quarterly_period(selected_period) and 
+                not PeriodClassifier.is_annual_period(selected_period)):
+                return False, f"WARNING: Selected quarterly period for annual filing - should use 12-month period"
+        
+        return True, "Period selection is appropriate"
+
+
+class FiscalYearCalculator:
+    """Centralized fiscal year calculation utilities"""
+    
+    @staticmethod
+    def calculate_fiscal_quarter_boundaries(fiscal_year: int, quarter: int, fiscal_year_end_code: str) -> Optional[Tuple[datetime, datetime]]:
+        """
+        Calculate the start and end dates for a specific fiscal quarter.
+        
+        This is the DRY centralized function for fiscal quarter boundary calculation.
+        Use this instead of duplicating the logic everywhere.
+        
+        Args:
+            fiscal_year: The fiscal year (e.g., 2024)
+            quarter: The fiscal quarter (1, 2, 3, or 4)
+            fiscal_year_end_code: Company fiscal year end code (e.g., '0630' for June 30)
+            
+        Returns:
+            Tuple of (quarter_start_date, quarter_end_date) or None if calculation fails
+            
+        Example:
+            For Microsoft FY2024 Q2 (FYE: 0630):
+            calculate_fiscal_quarter_boundaries(2024, 2, '0630')
+            Returns: (datetime(2023, 10, 1), datetime(2023, 12, 31))
+        """
+        if not fiscal_year or not quarter or not fiscal_year_end_code:
+            return None
+        
+        if quarter not in [1, 2, 3, 4]:
+            return None
+        
+        try:
+            # Parse fiscal year end code (e.g., '0630' = June 30)
+            if len(fiscal_year_end_code) == 4:
+                fy_month = int(fiscal_year_end_code[:2])
+                fy_day = int(fiscal_year_end_code[2:])
+            else:
+                return None
+            
+            # Calculate fiscal year end date
+            fiscal_year_end = datetime(fiscal_year, fy_month, fy_day)
+            
+            # Calculate fiscal year start (day after previous fiscal year end)
+            fiscal_year_start = fiscal_year_end - relativedelta(months=12) + timedelta(days=1)
+            
+            # Calculate quarter boundaries
+            quarter_start = fiscal_year_start + relativedelta(months=3 * (quarter - 1))
+            quarter_end = quarter_start + relativedelta(months=3) - timedelta(days=1)
+            
+            return (quarter_start, quarter_end)
+            
+        except (ValueError, AttributeError):
+            return None
+    
+    @staticmethod
+    def determine_fiscal_year_from_date(end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
+        """
+        Determine which fiscal year a given date belongs to.
+        
+        Args:
+            end_date: The date to check
+            fiscal_year_end_code: Company fiscal year end code (e.g., '0630' for June 30)
+            
+        Returns:
+            The fiscal year that this date belongs to, or None if calculation fails
+            
+        Example:
+            For date 2023-12-31 with FYE 0630 (June 30):
+            This falls in FY2024 (which ends June 30, 2024)
+        """
+        if not end_date or not fiscal_year_end_code:
+            return None
+        
+        try:
+            # Parse fiscal year end code
+            if len(fiscal_year_end_code) == 4:
+                fy_month = int(fiscal_year_end_code[:2])
+                fy_day = int(fiscal_year_end_code[2:])
+            else:
+                return None
+            
+            # Try fiscal year ending in the current calendar year
+            fiscal_year_end_current = datetime(end_date.year, fy_month, fy_day)
+            
+            # Try fiscal year ending in the next calendar year
+            fiscal_year_end_next = datetime(end_date.year + 1, fy_month, fy_day)
+            
+            # Determine which fiscal year the end_date belongs to
+            tolerance_days = PeriodConfig.FISCAL_YEAR_TOLERANCE_DAYS
+            
+            # Calculate days to each potential fiscal year end
+            days_to_current = (fiscal_year_end_current - end_date).days
+            
+            # If we're within tolerance of the current year's fiscal year end, use it
+            if abs(days_to_current) <= tolerance_days:
+                return end_date.year
+            # If end_date is before or at the current year's fiscal year end, use current year
+            elif days_to_current >= 0:
+                return end_date.year
+            # Otherwise, the end_date is in the fiscal year ending next calendar year
+            else:
+                return end_date.year + 1
+                
+        except (ValueError, AttributeError):
+            return None
+    
+    @staticmethod
+    def determine_quarter_from_date(end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
+        """
+        Determine which fiscal quarter a given date belongs to.
+        
+        Args:
+            end_date: The date to check
+            fiscal_year_end_code: Company fiscal year end code (e.g., '0630' for June 30)
+            
+        Returns:
+            The fiscal quarter (1, 2, 3, or 4) that this date belongs to, or None if calculation fails
+        """
+        if not end_date or not fiscal_year_end_code:
+            return None
+        
+        try:
+            # First determine the fiscal year
+            fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(end_date, fiscal_year_end_code)
+            if not fiscal_year:
+                return None
+            
+            # Check each quarter to see which one contains this date
+            tolerance = timedelta(days=PeriodConfig.FISCAL_YEAR_TOLERANCE_DAYS)
+            
+            for q in [1, 2, 3, 4]:
+                boundaries = FiscalYearCalculator.calculate_fiscal_quarter_boundaries(
+                    fiscal_year, q, fiscal_year_end_code
+                )
+                if boundaries:
+                    q_start, q_end = boundaries
+                    # Check if end_date falls within this quarter (with tolerance)
+                    if q_start - tolerance <= end_date <= q_end + tolerance:
+                        return q
+            
+            # Default to Q4 if we can't determine (shouldn't happen)
+            return 4
+            
+        except (ValueError, AttributeError):
+            return None
+    
+    @staticmethod
+    def extract_quarter_from_xbrl_fiscal_period(fiscal_period: str) -> Optional[int]:
+        """Extract quarter number from XBRL fiscal_period field"""
+        if not fiscal_period:
+            return None
+        
+        fiscal_period = str(fiscal_period).strip().upper()
+        
+        quarter_map = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
+        return quarter_map.get(fiscal_period)
+
+    @staticmethod
+    def calculate_fiscal_year_and_quarter(end_date: datetime, fiscal_year_end_code: str) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Calculate fiscal year and quarter based on end date and fiscal year end code.
+        
+        This function now uses the centralized DRY logic for fiscal calculations.
+        """
+        if not end_date or not fiscal_year_end_code:
+            return None, None
+        
+        # Use centralized functions - DRY principle
+        fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(end_date, fiscal_year_end_code)
+        quarter = FiscalYearCalculator.determine_quarter_from_date(end_date, fiscal_year_end_code)
+        
+        return fiscal_year, quarter
+
+    @staticmethod
+    def determine_quarter_from_form_and_date(form_type: str, end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
+        """
+        Determine fiscal quarter using form type and end date.
+        
+        This function now uses the centralized DRY logic for fiscal calculations.
+        """
+        if not end_date or not fiscal_year_end_code:
+            return None
+        
+        # For 10-K filings, it's always Q4 (annual/full year)
+        if form_type == '10-K':
+            return 4
+        
+        # For 10-Q filings, use centralized quarter determination
+        if form_type == '10-Q':
+            return FiscalYearCalculator.determine_quarter_from_date(end_date, fiscal_year_end_code)
+        
+        # For other form types, return None
+        return None
+
+
+def create_period_query_filter(cik: str, statement_type: str, period_type: Optional[str] = None) -> Dict[str, Any]:
+    """Create MongoDB query filter for financial statements"""
+    query_filter = {
+        'company_cik': str(cik),
+        'statement_type': statement_type
+    }
+    
+    if period_type:
+        normalized_period = normalize_period_type(period_type)
+        query_filter['reporting_period.period_type'] = normalized_period
+    
+    return query_filter
