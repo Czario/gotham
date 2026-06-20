@@ -64,12 +64,20 @@ class ProgressManager:
             return
         self._company_bar = tqdm(
             total=total,
-            desc="Companies",
+            desc="  waiting",
             unit="co",
             colour="cyan",
             dynamic_ncols=True,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            bar_format="Companies {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]",
         )
+
+    def set_current_company(self, ticker: str) -> None:
+        """Update outer bar to show the company currently being processed."""
+        if self.verbose or self._company_bar is None:
+            return
+        self._company_bar.set_description_str(f"  {ticker:<6}")
+        self._company_bar.set_postfix_str("processing…")
+        self._company_bar.refresh()
 
     def advance_company(self, ticker: str, processed: int, skipped: int,
                         failed: int, reconciled: int = 0) -> None:
@@ -84,7 +92,8 @@ class ProgressManager:
             parts.append(f"{failed} ❌")
         if reconciled:
             parts.append(f"+{reconciled} filled")
-        self._company_bar.set_postfix_str(f"{ticker}: {', '.join(parts) or 'done'}")
+        self._company_bar.set_description_str(f"  {ticker:<6}")
+        self._company_bar.set_postfix_str(", ".join(parts) or "done")
         self._company_bar.update(1)
 
     def finish_companies(self) -> None:
@@ -98,11 +107,12 @@ class ProgressManager:
         return tqdm(
             total=total,
             desc=f"  {ticker:<6}",
-            unit="filing",
+            unit="f",
             leave=False,
             disable=self.verbose,
             dynamic_ncols=True,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}",
+            colour="green",
+            bar_format="  {desc} {l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}",
         )
 
     # -- One-line status (verbose suppressed) ------------------------------
@@ -634,15 +644,15 @@ class SECDataScraperApp:
             
             # Create per-company filing progress bar
             filing_iterator = target_filings
-            if target_filings:
-                self.progress.status(f"  {ticker}: {len(target_filings)} filings")
+            # Update outer bar immediately with the real ticker
+            self.progress.set_current_company(ticker)
             filing_bar = self.progress.filing_bar(ticker, len(target_filings))
 
             for i, filing in enumerate(filing_iterator, 1):
+                accession_number = filing.get('accessionNumber', '')
+                form_type = filing.get('form', '')
+                filing_bar.set_postfix_str(f"{form_type} {accession_number[-9:] if accession_number else ''}")
                 filing_bar.update(1)
-                
-                accession_number = filing.get('accessionNumber')
-                form_type = filing.get('form')
                 
                 # Log to summary file
                 if summary and accession_number:
@@ -1594,6 +1604,8 @@ class SECDataScraperApp:
                     print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
 
                 logger.info(f"Starting processing for CIK: {cik}")
+                # Show which company is active in the outer bar immediately
+                self.progress.set_current_company(cik)
                 stats = self.process_company(cik, summary=None)
 
                 ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or cik
@@ -1946,7 +1958,8 @@ def main():
                     print(f"⚠️  SEC_HTML_DOWNLOAD_PATH is not a directory: {html_download_path} — HTML downloads disabled")
                     html_download_path = None
                 else:
-                    print(f"📁 HTML filings will be saved to: {html_path.absolute()}")
+                    if is_verbose:
+                        tqdm.write(f"📁 HTML filings will be saved to: {html_path.absolute()}")
             except Exception as e:
                 print(f"⚠️  Invalid SEC_HTML_DOWNLOAD_PATH: {e} — HTML downloads disabled")
                 html_download_path = None
@@ -2025,7 +2038,8 @@ def main():
         elif args.file:
             companies_file = Path(args.file)
             if companies_file.exists():
-                print(f"Loading companies/tickers from {args.file}...")
+                if is_verbose:
+                    print(f"Loading companies/tickers from {args.file}...")
                 import json
                 import re
 
@@ -2061,29 +2075,33 @@ def main():
                                 # Validate CIK exists in SEC
                                 if sec_client.validate_cik(cik_val):
                                     cik_resolved = cik_val
-                                    print(f"✅ Validated CIK: {token}")
+                                    if is_verbose:
+                                        print(f"✅ Validated CIK: {token}")
                                 else:
-                                    print(f"❌ CIK not found in SEC: {token} — skipping")
+                                    tqdm.write(f"❌ CIK not found in SEC: {token} — skipping")
                             else:
                                 # Treat token as ticker symbol
                                 mapped = ticker_map.get(token.upper())
                                 if mapped:
                                     cik_resolved = mapped
-                                    print(f"✅ Found ticker in tickers.json: {token} → {mapped}")
+                                    if is_verbose:
+                                        print(f"✅ Found ticker in tickers.json: {token} → {mapped}")
                                 else:
                                     # Try to treat it as a CIK anyway (in case it's an unpadded CIK)
                                     if sec_client.validate_cik(token):
                                         cik_resolved = token.zfill(10)
-                                        print(f"✅ Validated as CIK in SEC: {token}")
+                                        if is_verbose:
+                                            print(f"✅ Validated as CIK in SEC: {token}")
                                     else:
-                                        print(f"⚠️  Unknown ticker or CIK: {token} — not in tickers.json and not found in SEC — skipping")
+                                        tqdm.write(f"⚠️  Unknown ticker or CIK: {token} — skipping")
 
                             if cik_resolved:
                                 companies.append(cik_resolved)
 
-                print(f"Loaded {len(companies)} companies from {args.file}")
+                if is_verbose:
+                    print(f"Loaded {len(companies)} companies from {args.file}")
             else:
-                print(f"❌ Companies file not found: {args.file}")
+                tqdm.write(f"❌ Companies file not found: {args.file}")
                 sys.exit(1)
         else:
             # Default behavior: use tickers.json
