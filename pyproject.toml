@@ -20,6 +20,15 @@ dependencies = [
     "data-normalization-service",
 ]
 
+[project.scripts]
+sec-scraper = "sec_scraper_cli:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools]
+py-modules = ["sec_scraper_cli"]
+
 [tool.uv.sources]
 data-normalization-service = { path = "./normalization", editable = true }
 

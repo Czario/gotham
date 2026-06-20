@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 
+# Ensure the project root is on sys.path when running as an installed entry point
+_PROJECT_ROOT = str(Path(__file__).resolve().parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -1842,7 +1847,9 @@ def download_xbrl_file_if_needed(sec_client, cik: str, accession_number: str, ar
     return True
 
 
-if __name__ == "__main__":
+
+
+def main():
     import argparse
     from pathlib import Path
     
@@ -2292,3 +2299,7 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
