@@ -1477,7 +1477,7 @@ class FlexibleXBRLExtractor:
             scored_facts.append((score, fact, duration_months))
         
         if not scored_facts:
-            logger.warning(f"No facts passed validation for {facts[0].qname if facts else 'unknown'} - falling back to first fact")
+            logger.debug(f"No facts passed validation for {facts[0].qname if facts else 'unknown'} - falling back to first fact")
             if facts and "DepreciationDepletionAndAmortization" in str(facts[0].qname):
                 logger.warning(f"FALLBACK for Depreciation: Using first fact with context {facts[0].contextID}")
             return facts[0] if facts else None

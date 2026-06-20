@@ -64,19 +64,25 @@ class ProgressManager:
             return
         self._company_bar = tqdm(
             total=total,
-            desc="  waiting",
+            desc="waiting       ",
             unit="co",
             colour="cyan",
             dynamic_ncols=True,
-            bar_format="Companies {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]",
+            bar_format="Companies [{desc}] {bar} {n_fmt}/{total_fmt}  {elapsed}<{remaining}",
         )
 
-    def set_current_company(self, ticker: str) -> None:
-        """Update outer bar to show the company currently being processed."""
+    def set_current_company(self, ticker: str, index: Optional[int] = None) -> None:
+        """Advance outer bar to index and show the company being processed.
+        
+        If index is None, only the description is updated (no bar advance).
+        """
         if self.verbose or self._company_bar is None:
             return
-        self._company_bar.set_description_str(f"  {ticker:<6}")
-        self._company_bar.set_postfix_str("processing…")
+        if index is not None:
+            delta = index - self._company_bar.n
+            if delta > 0:
+                self._company_bar.update(delta)
+        self._company_bar.set_description_str(f"{ticker:<6} processing")
         self._company_bar.refresh()
 
     def advance_company(self, ticker: str, processed: int, skipped: int,
@@ -92,9 +98,9 @@ class ProgressManager:
             parts.append(f"{failed} ❌")
         if reconciled:
             parts.append(f"+{reconciled} filled")
-        self._company_bar.set_description_str(f"  {ticker:<6}")
-        self._company_bar.set_postfix_str(", ".join(parts) or "done")
-        self._company_bar.update(1)
+        status = ", ".join(parts) or "done"
+        self._company_bar.set_description_str(f"{ticker:<6} {status}")
+        self._company_bar.refresh()
 
     def finish_companies(self) -> None:
         if self._company_bar is not None:
@@ -106,13 +112,13 @@ class ProgressManager:
         """Return a tqdm bar for the filing loop; disabled in verbose mode."""
         return tqdm(
             total=total,
-            desc=f"  {ticker:<6}",
+            desc=f"{ticker:<6}              ",
             unit="f",
             leave=False,
             disable=self.verbose,
             dynamic_ncols=True,
             colour="green",
-            bar_format="  {desc} {l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}",
+            bar_format="  [{desc}] {bar} {n_fmt}/{total_fmt}",
         )
 
     # -- One-line status (verbose suppressed) ------------------------------
@@ -651,7 +657,7 @@ class SECDataScraperApp:
             for i, filing in enumerate(filing_iterator, 1):
                 accession_number = filing.get('accessionNumber', '')
                 form_type = filing.get('form', '')
-                filing_bar.set_postfix_str(f"{form_type} {accession_number[-9:] if accession_number else ''}")
+                filing_bar.set_description_str(f"{ticker:<6} {form_type} {accession_number[-9:] if accession_number else ''}")
                 filing_bar.update(1)
                 
                 # Log to summary file
@@ -1605,7 +1611,7 @@ class SECDataScraperApp:
 
                 logger.info(f"Starting processing for CIK: {cik}")
                 # Show which company is active in the outer bar immediately
-                self.progress.set_current_company(cik)
+                self.progress.set_current_company(cik, i)
                 stats = self.process_company(cik, summary=None)
 
                 ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or cik
