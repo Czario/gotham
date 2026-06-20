@@ -73,6 +73,21 @@ class ProgressManager:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self._company_bar: Optional["tqdm"] = None
+        self._filing_bar: Optional["tqdm"] = None
+        self._current_index: int = 0
+        # Maps CIK -> the ticker symbol the user actually typed, so the bar
+        # shows e.g. "JPM" instead of whatever the reverse CIK->ticker map
+        # happens to return (a CIK can map to multiple tickers).
+        self.cik_labels: dict = {}
+
+    def label(self, cik: str, fallback: str) -> str:
+        """Return the user-supplied ticker for a CIK, else the fallback."""
+        if not cik:
+            return fallback
+        return (self.cik_labels.get(cik)
+                or self.cik_labels.get(str(cik).zfill(10))
+                or self.cik_labels.get(str(cik).lstrip('0'))
+                or fallback)
 
     # -- Company-level bar --------------------------------------------------
     def start_companies(self, total: int) -> None:
@@ -84,18 +99,24 @@ class ProgressManager:
             unit="co",
             colour="cyan",
             dynamic_ncols=True,
+            position=0,
+            leave=True,
             bar_format="Companies [{desc}] {bar} {n_fmt}/{total_fmt}  ⏱ {elapsed}  eta {remaining}",
         )
 
     def set_current_company(self, ticker: str, index: Optional[int] = None) -> None:
-        """Advance outer bar to index and show the company being processed.
-        
-        If index is None, only the description is updated (no bar advance).
+        """Show the company currently being processed in the outer bar.
+
+        The bar position reflects *completed* companies, so while company
+        ``index`` is in progress the bar sits at ``index - 1``. If ``index``
+        is None, only the description is updated.
         """
         if self.verbose or self._company_bar is None:
             return
         if index is not None:
-            delta = index - self._company_bar.n
+            self._current_index = index
+            target = index - 1  # companies finished before this one
+            delta = target - self._company_bar.n
             if delta > 0:
                 self._company_bar.update(delta)
         self._company_bar.set_description_str(f"{ticker:<6} processing")
@@ -115,18 +136,29 @@ class ProgressManager:
         if reconciled:
             parts.append(f"+{reconciled} filled")
         status = ", ".join(parts) or "done"
+        # Mark the current company as finished.
+        delta = self._current_index - self._company_bar.n
+        if delta > 0:
+            self._company_bar.update(delta)
         self._company_bar.set_description_str(f"{ticker:<6} {status}")
         self._company_bar.refresh()
 
     def finish_companies(self) -> None:
+        self.close_filing_bar()
         if self._company_bar is not None:
             self._company_bar.close()
             self._company_bar = None
 
     # -- Filing-level bar (per company) ------------------------------------
     def filing_bar(self, ticker: str, total: int) -> "tqdm":
-        """Return a tqdm bar for the filing loop; disabled in verbose mode."""
-        return tqdm(
+        """Return a tqdm bar for the filing loop; disabled in verbose mode.
+
+        The bar is pinned to ``position=1`` so it renders on its own line
+        directly beneath the company bar instead of overwriting it. Any
+        previously open filing bar is closed first.
+        """
+        self.close_filing_bar()
+        self._filing_bar = tqdm(
             total=total,
             desc=f"{ticker:<6}              ",
             unit="f",
@@ -134,8 +166,23 @@ class ProgressManager:
             disable=self.verbose,
             dynamic_ncols=True,
             colour="green",
+            position=1,
             bar_format="  [{desc}] {bar} {n_fmt}/{total_fmt}  ⏱ {elapsed}  eta {remaining}",
         )
+        return self._filing_bar
+
+    def close_filing_bar(self) -> None:
+        """Close the active filing bar if one is open."""
+        if self._filing_bar is not None:
+            self._filing_bar.close()
+            self._filing_bar = None
+
+    def close_all(self) -> None:
+        """Tear down every active bar cleanly (e.g. on interrupt)."""
+        self.close_filing_bar()
+        if self._company_bar is not None:
+            self._company_bar.close()
+            self._company_bar = None
 
     # -- One-line status (verbose suppressed) ------------------------------
     def status(self, msg: str) -> None:
@@ -637,7 +684,9 @@ class SECDataScraperApp:
                     form_summary = ", ".join([f"{form}: {count}" for form, count in form_counts.items()])
                     logger.info(f"Form types found: {form_summary}")
             else:
-                logger.warning(f"No filings found for company {company_data.get('name', 'Unknown')} from {self.start_year} onwards")
+                company_label = company_data.get('name', 'Unknown')
+                logger.info(f"No filings found for company {company_label} from {self.start_year} onwards")
+                self.progress.status(f"  ⓘ {company_label}: no filings from {self.start_year} onwards")
             
             # Update company name for logging
             company_name = company_data.get('name', 'Unknown')
@@ -660,6 +709,9 @@ class SECDataScraperApp:
             ticker = self.sec_client.get_ticker_from_cik(cik)
             if not ticker:
                 ticker = f"CIK_{cik}"
+            # Prefer the ticker symbol the user typed (a CIK may map to several)
+            if self.progress is not None:
+                ticker = self.progress.label(cik, ticker)
             
             # Track if we've logged the section header for this session
             session_header_logged = False
@@ -669,7 +721,6 @@ class SECDataScraperApp:
             # Update outer bar immediately with the real ticker
             self.progress.set_current_company(ticker)
             filing_bar = self.progress.filing_bar(ticker, len(target_filings))
-
             for i, filing in enumerate(filing_iterator, 1):
                 accession_number = filing.get('accessionNumber', '')
                 form_type = filing.get('form', '')
@@ -744,7 +795,7 @@ class SECDataScraperApp:
                 # Rate limiting to respect SEC API guidelines
                 time.sleep(0.1)
             
-            filing_bar.close()
+            self.progress.close_filing_bar()
 
             # Step 4: Run quarterly deaccumulation for this company (uses in-memory accumulator)
             self._flush_quarterly_accumulator(cik)
@@ -1626,11 +1677,15 @@ class SECDataScraperApp:
                     print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
 
                 logger.info(f"Starting processing for CIK: {cik}")
-                # Show which company is active in the outer bar immediately
-                self.progress.set_current_company(cik, i)
+                # Show which company is active in the outer bar immediately.
+                # Prefer the user-typed ticker, else the reverse CIK->ticker
+                # lookup, else the raw CIK.
+                display = self.progress.label(
+                    cik, self.sec_client.get_ticker_from_cik(cik) or cik)
+                self.progress.set_current_company(display, i)
                 stats = self.process_company(cik, summary=None)
 
-                ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or cik
+                ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
                 if isinstance(stats, dict):
                     results[cik] = stats.get('success', False)
                     self.progress.advance_company(
@@ -1936,6 +1991,20 @@ def main():
     # Build progress manager — verbose=False activates clean tqdm bars
     progress = ProgressManager(verbose=is_verbose)
 
+    # Install a SIGINT handler so the first Ctrl+C immediately tears down the
+    # progress bars (stopping any half-drawn refresh) before the normal
+    # KeyboardInterrupt unwinding runs the graceful shutdown path below.
+    import signal as _signal
+
+    def _handle_sigint(signum, frame):
+        try:
+            progress.close_all()
+        except Exception:
+            pass
+        raise KeyboardInterrupt
+
+    _signal.signal(_signal.SIGINT, _handle_sigint)
+
     # Log startup information
     logger.info("="*80)
     logger.info("SEC Data Scraper v9 - Enhanced with DRY Principles")
@@ -2119,6 +2188,11 @@ def main():
 
                             if cik_resolved:
                                 companies.append(cik_resolved)
+                                # Remember the symbol the user typed so the
+                                # progress bar can show it (CIK->ticker reverse
+                                # lookup may return a different sibling ticker).
+                                if not re.fullmatch(r'\d{1,10}', token):
+                                    progress.cik_labels[cik_resolved] = token.upper()
 
                 if is_verbose:
                     print(f"Loaded {len(companies)} companies from {args.file}")
@@ -2334,6 +2408,10 @@ def main():
         print(f"\nFor more features, try: python sec_scraper_cli.py --help")
         
     except KeyboardInterrupt:
+        try:
+            progress.close_all()
+        except Exception:
+            pass
         print("\nProcess interrupted by user")
         sys.exit(1)
     except Exception as e:
