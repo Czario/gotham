@@ -35,6 +35,78 @@ from utilities.helpers.error_handling import (
     format_filing_log_message
 )
 import re
+from tqdm import tqdm
+
+# ---------------------------------------------------------------------------
+# Progress display
+# ---------------------------------------------------------------------------
+class ProgressManager:
+    """Clean progress bars for multi-company processing.
+
+    In verbose mode all tqdm bars are disabled and full log output flows to
+    the console. In default (clean) mode logger console output is suppressed
+    and progress is communicated exclusively via tqdm bars.
+    """
+
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self._company_bar: Optional["tqdm"] = None
+
+    # -- Company-level bar --------------------------------------------------
+    def start_companies(self, total: int) -> None:
+        if self.verbose:
+            return
+        self._company_bar = tqdm(
+            total=total,
+            desc="Companies",
+            unit="co",
+            colour="cyan",
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+        )
+
+    def advance_company(self, ticker: str, processed: int, skipped: int,
+                        failed: int, reconciled: int = 0) -> None:
+        if self.verbose or self._company_bar is None:
+            return
+        parts = []
+        if processed:
+            parts.append(f"{processed} new")
+        if skipped:
+            parts.append(f"{skipped} skip")
+        if failed:
+            parts.append(f"{failed} ❌")
+        if reconciled:
+            parts.append(f"+{reconciled} filled")
+        self._company_bar.set_postfix_str(f"{ticker}: {', '.join(parts) or 'done'}")
+        self._company_bar.update(1)
+
+    def finish_companies(self) -> None:
+        if self._company_bar is not None:
+            self._company_bar.close()
+            self._company_bar = None
+
+    # -- Filing-level bar (per company) ------------------------------------
+    def filing_bar(self, ticker: str, total: int) -> "tqdm":
+        """Return a tqdm bar for the filing loop; disabled in verbose mode."""
+        return tqdm(
+            total=total,
+            desc=f"  {ticker:<6}",
+            unit="filing",
+            leave=False,
+            disable=self.verbose,
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}",
+        )
+
+    # -- One-line status (verbose suppressed) ------------------------------
+    def status(self, msg: str) -> None:
+        """Print a status line that appears above progress bars in clean mode."""
+        if not self.verbose:
+            tqdm.write(msg)
+
+    def error(self, msg: str) -> None:
+        tqdm.write(msg)
 
 # ---------------------------------------------------------------------------
 # Merged normalization pipeline
@@ -234,7 +306,7 @@ def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optio
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, enable_dimensions: bool = False, enable_extra_data: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_taxonomy: bool = False, enable_reconciliation: bool = True):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, enable_dimensions: bool = False, enable_extra_data: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_taxonomy: bool = False, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -244,6 +316,7 @@ class SECDataScraperApp:
         self.enable_dimensions = enable_dimensions
         self.enable_extra_data = enable_extra_data
         self.enable_reconciliation = enable_reconciliation
+        self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = target_fiscal_quarter
         self.reload = reload
@@ -553,16 +626,14 @@ class SECDataScraperApp:
             # Track if we've logged the section header for this session
             session_header_logged = False
             
-            # Create progress bar for filing processing
-            # Using simple counters for cleaner output
+            # Create per-company filing progress bar
             filing_iterator = target_filings
             if target_filings:
-                print(f"  Processing {len(target_filings)} filings...", flush=True)
-            
+                self.progress.status(f"  {ticker}: {len(target_filings)} filings")
+            filing_bar = self.progress.filing_bar(ticker, len(target_filings))
+
             for i, filing in enumerate(filing_iterator, 1):
-                # Simple counter for filing progress
-                if target_filings:
-                    print(f"  [{i}/{len(target_filings)}] Processing filing {filing.get('accessionNumber', 'unknown')}", flush=True)
+                filing_bar.update(1)
                 
                 accession_number = filing.get('accessionNumber')
                 form_type = filing.get('form')
@@ -635,16 +706,8 @@ class SECDataScraperApp:
                 # Rate limiting to respect SEC API guidelines
                 time.sleep(0.1)
             
-            # Log processing summary for this stock (disabled to avoid clutter)
-            # if target_filings and filings_failed > 0:
-            #     self.failure_logger.log_processing_summary(
-            #         ticker, cik,
-            #         total_filings=len(target_filings),
-            #         successful=filings_processed,
-            #         failed=filings_failed,
-            #         skipped=filings_skipped
-            #     )
-            
+            filing_bar.close()
+
             # Step 4: Run quarterly deaccumulation for this company (uses in-memory accumulator)
             self._flush_quarterly_accumulator(cik)
 
@@ -1516,35 +1579,45 @@ class SECDataScraperApp:
         results = {}
         
         logger.info(f"Processing {len(ciks)} companies: {ciks}")
-        print(f"Processing {len(ciks)} companies...\n")
-        
+        self.progress.status(f"\nProcessing {len(ciks)} companies...\n")
+        self.progress.start_companies(len(ciks))
+
         for i, cik in enumerate(ciks, 1):
             try:
-                print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
-                
+                if self.progress.verbose:
+                    print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
+
                 logger.info(f"Starting processing for CIK: {cik}")
                 stats = self.process_company(cik, summary=None)
-                
-                # Handle both new stats dict and old bool returns for backward compatibility
+
+                ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or cik
                 if isinstance(stats, dict):
                     results[cik] = stats.get('success', False)
+                    self.progress.advance_company(
+                        ticker,
+                        stats.get('processed', 0),
+                        stats.get('skipped', 0),
+                        stats.get('failed', 0),
+                    )
                     if not results[cik]:
-                        print(f"  ⚠️  CIK {cik} completed with errors")
+                        self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
                 else:
-                    # Fallback for old bool return
                     results[cik] = stats
+                    self.progress.advance_company(ticker, 0, 0, 0)
                     if not stats:
-                        print(f"  ⚠️  CIK {cik} completed with errors")
+                        self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
                 
                 # Rate limiting between companies
                 time.sleep(1)
                 
             except Exception as e:
                 logger.error(f"Failed to process CIK {cik}: {e}")
-                print(f"  ❌ CIK {cik} failed with exception: {e}")
+                self.progress.error(f"  ❌ CIK {cik} failed: {e}")
+                self.progress.advance_company(cik, 0, 0, 1)
                 results[cik] = False
 
-        print("\n✅ Processing complete")
+        self.progress.finish_companies()
+        self.progress.status("\n✅ Processing complete")
         
         return results
     
@@ -1801,28 +1874,29 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    # Validate conflicting options
-    if args.verbose and args.debug:
-        print("💡 Using --debug mode (--verbose is redundant with --debug)")
-    
-    # Configure logging based on verbosity flags
+    # --verbose implies debug-level console; --debug is the highest detail
+    is_verbose = args.verbose or args.debug
+
+    # Configure logging
     if args.debug:
         from utilities.helpers.logger_config import LoggerConfig
         LoggerConfig.setup_logging(level='DEBUG', detailed=True, console_output=True)
         logger.info("Debug logging enabled")
     elif args.verbose:
-        # Verbose mode - show INFO level but more details
         from utilities.helpers.logger_config import LoggerConfig
         LoggerConfig.setup_logging(level='INFO', detailed=True, console_output=True)
         logger.info("Verbose logging enabled")
     else:
-        # Default mode - quiet, only show WARNING level and above, no console output from logger
-        from utilities.helpers.logger_config import LoggerConfig 
+        # Clean mode: suppress logger console output; progress bars carry all UI
+        from utilities.helpers.logger_config import LoggerConfig
         LoggerConfig.setup_logging(level='WARNING', console_output=False)
-    
+
+    # Build progress manager — verbose=False activates clean tqdm bars
+    progress = ProgressManager(verbose=is_verbose)
+
     # Log startup information
     logger.info("="*80)
-    logger.info("SEC Data Scraper v9 - Enhanced with DRY Principles") 
+    logger.info("SEC Data Scraper v9 - Enhanced with DRY Principles")
     logger.info("="*80)
     logger.info(f"Arguments: {vars(args)}")
     
@@ -1907,6 +1981,7 @@ if __name__ == "__main__":
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_taxonomy=args.fix_lab,
                 enable_reconciliation=not args.no_reconciliation,
+                progress=progress,
             )
             
             if not app.setup_database():
@@ -2092,6 +2167,7 @@ if __name__ == "__main__":
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_taxonomy=args.fix_lab,
                 enable_reconciliation=not args.no_reconciliation,
+                progress=progress,
             )
             
             # Convert CIKs to tickers for local processing
@@ -2178,6 +2254,7 @@ if __name__ == "__main__":
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_taxonomy=args.fix_lab,
                 enable_reconciliation=not args.no_reconciliation,
+                progress=progress,
             )
             
             if not app.setup_database():
