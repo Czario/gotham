@@ -43,6 +43,22 @@ from utilities.helpers.error_handling import (
 import re
 from tqdm import tqdm
 
+def _fmt_time(seconds: float) -> str:
+    """Convert seconds to a human-readable string: 5s, 2m 15s, 1h 23m."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m:02d}m"
+
+
+# tqdm.format_meter() calls tqdm.format_interval() directly (not via self),
+# so subclass overrides are ignored. Patch the class method globally instead.
+tqdm.format_interval = staticmethod(_fmt_time)  # type: ignore[method-assign]
+
 # ---------------------------------------------------------------------------
 # Progress display
 # ---------------------------------------------------------------------------
@@ -68,7 +84,7 @@ class ProgressManager:
             unit="co",
             colour="cyan",
             dynamic_ncols=True,
-            bar_format="Companies [{desc}] {bar} {n_fmt}/{total_fmt}  {elapsed}<{remaining}",
+            bar_format="Companies [{desc}] {bar} {n_fmt}/{total_fmt}  ⏱ {elapsed}  eta {remaining}",
         )
 
     def set_current_company(self, ticker: str, index: Optional[int] = None) -> None:
@@ -118,7 +134,7 @@ class ProgressManager:
             disable=self.verbose,
             dynamic_ncols=True,
             colour="green",
-            bar_format="  [{desc}] {bar} {n_fmt}/{total_fmt}",
+            bar_format="  [{desc}] {bar} {n_fmt}/{total_fmt}  ⏱ {elapsed}  eta {remaining}",
         )
 
     # -- One-line status (verbose suppressed) ------------------------------
