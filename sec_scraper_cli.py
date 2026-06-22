@@ -2206,7 +2206,32 @@ def main():
         # Load companies
         companies = []
         if args.companies:
-            companies = args.companies
+            import json as _json
+            import re as _re
+            try:
+                with open('tickers.json', 'r') as _tf:
+                    _ticker_data = _json.load(_tf)
+                    _ticker_map = {k.upper(): v for k, v in _ticker_data.get('ticker_to_cik', {}).items()}
+            except Exception:
+                _ticker_map = {}
+
+            _sec_client_tmp = SECAPIClient()
+            for token in args.companies:
+                token = token.strip()
+                if not token:
+                    continue
+                if _re.fullmatch(r'\d{1,10}', token):
+                    # Numeric — treat as CIK
+                    cik_resolved = token.zfill(10)
+                    companies.append(cik_resolved)
+                else:
+                    # Try ticker lookup first
+                    mapped = _ticker_map.get(token.upper())
+                    if mapped:
+                        companies.append(mapped)
+                        progress.cik_labels[mapped] = token.upper()
+                    else:
+                        print(f"⚠️  Unknown ticker or CIK: {token} — skipping")
             print(f"Using specified companies: {companies}")
         elif args.file:
             companies_file = Path(args.file)
