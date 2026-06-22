@@ -30,7 +30,7 @@ class TestNormalizationServiceIntegration:
         mock_db_connection.return_value = Mock()
         mock_tracker.return_value = Mock()
         
-        service = FinancialNormalizationService(mock_config, enable_taxonomy=False)
+        service = FinancialNormalizationService(mock_config)
         
         assert service.config == mock_config
         assert not service.taxonomy_manager  # Should be None when disabled
@@ -49,7 +49,7 @@ class TestNormalizationServiceIntegration:
         mock_taxonomy.get_label_stats.return_value = {"total_concepts": 1000}
         mock_get_taxonomy.return_value = mock_taxonomy
         
-        service = FinancialNormalizationService(mock_config, enable_taxonomy=True)
+        service = FinancialNormalizationService(mock_config)
         
         assert service.config == mock_config
         assert service.taxonomy_manager == mock_taxonomy

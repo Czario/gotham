@@ -26,7 +26,7 @@ class TestSyncBehavior:
         mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
         config = Mock(spec=AppConfig)
         config.database = Mock()
-        service = FinancialNormalizationService(config, enable_taxonomy=False)
+        service = FinancialNormalizationService(config)
         
         # Mock the concept repository
         existing_concept_id = ObjectId()
@@ -67,7 +67,7 @@ class TestSyncBehavior:
         mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
         config = Mock(spec=AppConfig)
         config.database = Mock()
-        service = FinancialNormalizationService(config, enable_taxonomy=False)
+        service = FinancialNormalizationService(config)
         
         # Mock the value repository
         mock_value_repo = Mock()
@@ -119,7 +119,7 @@ class TestSyncBehavior:
         mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
         config = Mock(spec=AppConfig)
         config.database = Mock()
-        service = FinancialNormalizationService(config, enable_taxonomy=False)
+        service = FinancialNormalizationService(config)
         
         # Mock the value repository - return None to simulate value not exists
         mock_value_repo = Mock()
@@ -166,7 +166,7 @@ class TestSyncBehavior:
         mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
         config = Mock(spec=AppConfig)
         config.database = Mock()
-        service = FinancialNormalizationService(config, enable_taxonomy=False)
+        service = FinancialNormalizationService(config)
         
         # Mock the concept repository
         existing_dim_concept_id = ObjectId()

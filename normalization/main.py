@@ -71,8 +71,6 @@ def main() -> None:
     """Main function to run the normalization service."""
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Financial Data Normalization Service")
-    parser.add_argument('--fix-lab', action='store_true',
-                       help='Enable taxonomy label fixing functionality')
     parser.add_argument('--path', type=str,
                        help='Path to file containing one CIK/ticker per line')
     
@@ -105,8 +103,8 @@ def main() -> None:
         
         logger.info(f"Arguments: {args}")
         
-        # Create service with taxonomy settings
-        service = FinancialNormalizationService(config, args.fix_lab)
+        # Create service
+        service = FinancialNormalizationService(config)
 
         requested_identifiers = _load_company_identifiers_from_file(args.path) if args.path else []
         resolved_cik_list = _resolve_to_ciks(service, requested_identifiers) if requested_identifiers else []

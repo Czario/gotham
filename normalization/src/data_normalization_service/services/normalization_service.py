@@ -37,7 +37,7 @@ class DimensionalConceptInfo(NamedTuple):
 class FinancialNormalizationService:
     """Service for normalizing financial statement data."""
     
-    def __init__(self, config: AppConfig, enable_taxonomy: bool = False):
+    def __init__(self, config: AppConfig):
         self.config = config
         self.db_connection = DatabaseConnection(config.database)
         
@@ -78,14 +78,8 @@ class FinancialNormalizationService:
         # Key is (ConceptKey, form_type) to separate annual and quarterly concepts
         self.concept_cache: Dict[tuple, ObjectId] = {}
         
-        # Conditionally initialize taxonomy manager (loads concept labels)
+        # Taxonomy label fixing is not supported; taxonomy_manager is always None.
         self.taxonomy_manager = None
-        if enable_taxonomy:
-            logger.info("Initializing XBRL taxonomy manager...")
-            self.taxonomy_manager = get_taxonomy_manager()
-            logger.info(f"Taxonomy loaded with {self.taxonomy_manager.get_label_stats()['total_concepts']} concept labels")
-        else:
-            logger.info("Taxonomy functionality disabled (use --fix-lab to enable)")
 
     def _get_concept_repo_by_form_type(self, form_type: str) -> ConceptRepository:
         """Get the appropriate concept repository based on form type."""

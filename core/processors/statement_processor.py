@@ -31,13 +31,12 @@ logger = logging.getLogger(__name__)
 class EnhancedFinancialStatementProcessor:
     """Process financial statements from XBRL data with dimensions support using Arelle"""
     
-    def __init__(self, current_period_only: bool = True, max_periods: int = 3, include_dimensions: bool = True, enable_extra_data: bool = False, local_xbrl_directory: Optional[str] = None, company_repo = None):
+    def __init__(self, current_period_only: bool = True, max_periods: int = 3, include_dimensions: bool = True, local_xbrl_directory: Optional[str] = None, company_repo = None):
         self.current_period_only = current_period_only
         self.max_periods = max_periods
-        self.include_dimensions = include_dimensions  # New flag to enable dimensions
-        self.enable_extra_data = enable_extra_data  # New flag to enable missing facts detection
+        self.include_dimensions = include_dimensions
         self.local_xbrl_directory = local_xbrl_directory or os.getenv('XBRL_ZIP_CACHE_PATH', '')
-        self.company_repo = company_repo  # Store company repo for fiscal year end retrieval
+        self.company_repo = company_repo
         
         # Initialize unified URL detector
         self.url_detector = SECURLDetector()

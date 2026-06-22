@@ -391,15 +391,15 @@ def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optio
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, enable_dimensions: bool = False, enable_extra_data: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_taxonomy: bool = False, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
             raise RuntimeError("Failed to connect to database")
         self.db = self.db_config.get_database()
         self.start_year = start_year
+        self.end_year = end_year
         self.enable_dimensions = enable_dimensions
-        self.enable_extra_data = enable_extra_data
         self.enable_reconciliation = enable_reconciliation
         self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
         self.target_fiscal_year = target_fiscal_year
@@ -439,7 +439,7 @@ class SECDataScraperApp:
                 database_name=_database_name,
             )
         )
-        self._norm_service = _NormService(_norm_config, enable_taxonomy=enable_taxonomy)
+        self._norm_service = _NormService(_norm_config)
         self._quarterly_service = _QuarterlyService(_norm_config)
         # companyfacts reconciliation: fills genuine extraction gaps (incl. the
         # latest filing's edge) from the SEC companyfacts API after each company.
@@ -459,13 +459,11 @@ class SECDataScraperApp:
         
         # Initialize financial processor (always use enhanced processor with configurable dimensions)
         logger.info(f"🎯 Initializing Financial Processor with dimensions {'ENABLED' if enable_dimensions else 'DISABLED'}")
-        logger.info(f"🔍 Extra data detection {'ENABLED' if self.enable_extra_data else 'DISABLED'}")
         self.financial_processor = EnhancedFinancialStatementProcessor(
-            current_period_only=True,  # Enforce strict single-period extraction at the source
-            max_periods=1,             # Only keep one period in memory
-            include_dimensions=enable_dimensions,  # Toggle dimensions based on flag
-            enable_extra_data=self.enable_extra_data,  # Toggle missing facts detection
-            company_repo=None  # Company data passed in-memory via company_info_enriched
+            current_period_only=True,
+            max_periods=1,
+            include_dimensions=enable_dimensions,
+            company_repo=None
         )
             
         self.company_transformer = CompanyDataTransformer()
@@ -635,7 +633,8 @@ class SECDataScraperApp:
                     logger.info(f"📅 INCREMENTAL MODE: No existing data found for CIK: {cik}, processing from {self.start_year}")
                     effective_start_year = self.start_year
             else:
-                logger.info(f"Processing company CIK: {cik} (filings from {self.start_year} onwards)")
+                range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
+                logger.info(f"Processing company CIK: {cik} (filings {range_desc})")
                 effective_start_year = self.start_year
             
             # Step 1: Fetch company information from SEC API
@@ -644,14 +643,15 @@ class SECDataScraperApp:
                 logger.info(f"🔄 RELOAD mode: refreshing data for CIK: {cik}")
                 if self.target_fiscal_year or self.target_fiscal_quarter:
                     logger.info(f"🎯 Will reload specific period: FY{self.target_fiscal_year} {self.target_fiscal_quarter or 'complete'}")
-            company_data, filings_list = self.sec_client.get_company_submissions(cik, start_year=effective_start_year)
+            company_data, filings_list = self.sec_client.get_company_submissions(cik, start_year=effective_start_year, end_year=self.end_year)
             if not company_data:
                 error_msg = f"Failed to fetch company data for CIK: {cik}"
                 logger.error(error_msg)
                 return False
             self.current_company_data = company_data
 
-            logger.info(f"Fetched {len(filings_list)} total filings for company {company_data.get('name', 'Unknown')} from {self.start_year} onwards")
+            _range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
+            logger.info(f"Fetched {len(filings_list)} total filings for company {company_data.get('name', 'Unknown')} {_range_desc}")
             
             # Apply fiscal year/quarter filtering if specified
             if self.target_fiscal_year or self.target_fiscal_quarter:
@@ -685,8 +685,9 @@ class SECDataScraperApp:
                     logger.info(f"Form types found: {form_summary}")
             else:
                 company_label = company_data.get('name', 'Unknown')
-                logger.info(f"No filings found for company {company_label} from {self.start_year} onwards")
-                self.progress.status(f"  ⓘ {company_label}: no filings from {self.start_year} onwards")
+                _no_range = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
+                logger.info(f"No filings found for company {company_label} {_no_range}")
+                self.progress.status(f"  ⓘ {company_label}: no filings {_no_range}")
             
             # Update company name for logging
             company_name = company_data.get('name', 'Unknown')
@@ -1944,30 +1945,103 @@ def main():
     from pathlib import Path
     
     # Set up argument parser
-    parser = argparse.ArgumentParser(description='SEC Data Scraper - Main Entry Point')
-    parser.add_argument('--companies', nargs='+', help='Company CIKs to process')
-    parser.add_argument('--file', help='File with company CIKs (alternative to --tickers)')
-    parser.add_argument('--tickers', action='store_true', help='Use tickers.json as company source (default: True)')
-    parser.add_argument('--limit', type=int, default=10, help='Number of companies to process from tickers.json (default: 10)')
-    parser.add_argument('--url', help='Direct URL to a specific SEC filing to process (e.g., https://www.sec.gov/cgi-bin/viewer?action=view&cik=320193&accession_number=0000320193-23-000077)')
-    parser.add_argument('--year', type=int, default=2010, help='Start year for filings (default: 2010)')
-    parser.add_argument('--fiscal-year', type=int, help='Process specific fiscal year (e.g., 2024)')
-    parser.add_argument('--fiscal-quarter', choices=['Q1', 'Q2', 'Q3', 'Q4'], help='Process specific fiscal quarter (Q1, Q2, Q3, Q4). Requires --fiscal-year')
-    parser.add_argument('--no-dimensions', action='store_true', help='Disable dimensional data processing (segments, products, geography). Dimensions are ON by default.')
-    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--verbose', action='store_true', help='Enable detailed output and debugging information')
-    parser.add_argument('--extra-data', action='store_true', help='Enable comprehensive missing facts detection to find additional financial data')
-    parser.add_argument('--local', action='store_true', help='Process local XBRL zip files instead of downloading from SEC API')
-    parser.add_argument('--reload', action='store_true', help='Force reload of existing data for specified fiscal year/quarter or all filings')
-    parser.add_argument('--incremental', action='store_true', help='Process only new filings since the last filing date in database for each company')
-    parser.add_argument('--no-download-html-filings', action='store_true',
-                       help='Disable HTML filing downloads. By default filings are downloaded to SEC_HTML_DOWNLOAD_PATH (if set). Pass this flag to skip HTML downloads entirely.')
-    parser.add_argument('--only-download-files', action='store_true',
-                       help='Only download HTML files for existing company data in database. Requires existing XBRL data and accession numbers. Use with --download-html-filings to specify download path.')
-    parser.add_argument('--fix-lab', action='store_true',
-                       help='Enable XBRL taxonomy label fixing when normalizing (looks up official US-GAAP labels).')
-    parser.add_argument('--no-reconciliation', action='store_true',
-                       help='Disable the post-processing SEC companyfacts gap-fill reconciliation (enabled by default).')
+    parser = argparse.ArgumentParser(
+        prog='sec-scraper',
+        description=(
+            'SEC EDGAR Data Scraper — downloads and normalises 10-K/10-Q XBRL '
+            'filings from the SEC API into MongoDB.\n\n'
+            'Quickstart examples:\n'
+            '  sec-scraper --file tickers.txt\n'
+            '  sec-scraper --companies 0000320193 0001065280 --year 2015 --end-year 2026\n'
+            '  sec-scraper --companies AAPL NFLX --reload --fiscal-year 2023\n'
+            '  sec-scraper --url https://www.sec.gov/Archives/edgar/data/1065280/.../nflx-20230930.htm'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # --- Company / filing selection ----------------------------------------
+    src = parser.add_argument_group('Company / filing selection')
+    src.add_argument(
+        '--companies', nargs='+', metavar='CIK_OR_TICKER',
+        help='One or more company CIKs or ticker symbols to process (e.g. AAPL 0001065280).')
+    src.add_argument(
+        '--file', metavar='FILE',
+        help='Path to a plain-text file containing one CIK or ticker per line.')
+    src.add_argument(
+        '--tickers', action='store_true',
+        help='Use the bundled tickers.json as the company source. Combined with --limit.')
+    src.add_argument(
+        '--limit', type=int, default=10, metavar='N',
+        help='Max companies to process when using --tickers (default: 10).')
+    src.add_argument(
+        '--url', metavar='URL',
+        help='Process a single SEC filing directly from its URL. '
+             'Accepts EDGAR archives URLs or the viewer URL with cik= and accession_number= params.')
+
+    # --- Year / period filtering -------------------------------------------
+    period = parser.add_argument_group('Year / period filtering')
+    period.add_argument(
+        '--year', type=int, default=2010, metavar='YEAR',
+        help='Earliest filing year to include (default: 2010). '
+             'Combined with --end-year this defines a closed range.')
+    period.add_argument(
+        '--end-year', type=int, metavar='YEAR',
+        help='Latest filing year to include (inclusive). '
+             'Omit to process all filings from --year onwards. '
+             'Example: --year 2015 --end-year 2026.')
+    period.add_argument(
+        '--fiscal-year', type=int, metavar='YEAR',
+        help='Restrict processing to a specific fiscal year (e.g. 2024). '
+             'Overrides --year / --end-year for period matching.')
+    period.add_argument(
+        '--fiscal-quarter', choices=['Q1', 'Q2', 'Q3', 'Q4'],
+        help='Restrict to a specific fiscal quarter within --fiscal-year (e.g. Q3). '
+             'Requires --fiscal-year.')
+
+    # --- Processing behaviour ----------------------------------------------
+    proc = parser.add_argument_group('Processing behaviour')
+    proc.add_argument(
+        '--reload', action='store_true',
+        help='Force reprocessing of filings that are already in the database. '
+             'Scope with --year / --end-year or --fiscal-year / --fiscal-quarter '
+             'to reload only a specific range.')
+    proc.add_argument(
+        '--incremental', action='store_true',
+        help='Process only filings filed after the most recent filing already '
+             'stored for each company. Useful for routine updates.')
+    proc.add_argument(
+        '--no-dimensions', action='store_true',
+        help='Skip dimensional (segment / product / geography) data extraction. '
+             'Dimensions are enabled by default.')
+    proc.add_argument(
+        '--local', action='store_true',
+        help='Read XBRL zip files from XBRL_ZIP_CACHE_PATH instead of '
+             'downloading from the SEC API.')
+    proc.add_argument(
+        '--no-reconciliation', action='store_true',
+        help='Disable the post-processing gap-fill step that back-fills missing '
+             'periods from SEC companyfacts (enabled by default).')
+
+    # --- HTML download options --------------------------------------------
+    html = parser.add_argument_group('HTML filing downloads')
+    html.add_argument(
+        '--no-download-html-filings', action='store_true',
+        help='Skip HTML filing downloads entirely. '
+             'By default, filings are saved to SEC_HTML_DOWNLOAD_PATH when that '
+             'env variable is set.')
+    html.add_argument(
+        '--only-download-files', action='store_true',
+        help='Download HTML filings only — no XBRL extraction or database writes. '
+             'Requires SEC_HTML_DOWNLOAD_PATH to be set.')
+
+    # --- Output / logging -------------------------------------------------
+    log = parser.add_argument_group('Output / logging')
+    log.add_argument(
+        '--verbose', action='store_true',
+        help='Print detailed per-filing log output. Disables the progress bars.')
+    log.add_argument(
+        '--debug', action='store_true',
+        help='Print DEBUG-level logs (implies --verbose). Use for troubleshooting.')
     
     args = parser.parse_args()
     
@@ -2018,6 +2092,10 @@ def main():
     
     if args.fiscal_year and args.fiscal_year < 1990:
         print("❌ --fiscal-year must be 1990 or later")
+        sys.exit(1)
+    
+    if args.end_year is not None and args.end_year < args.year:
+        print(f"❌ --end-year ({args.end_year}) cannot be earlier than --year ({args.year})")
         sys.exit(1)
     
     if args.limit and not args.tickers and not args.companies and not args.file and not args.url:
@@ -2083,15 +2161,14 @@ def main():
             # Initialize scraper app
             app = SECDataScraperApp(
                 start_year=args.year,
+                end_year=args.end_year,
                 enable_dimensions=not args.no_dimensions,
-                enable_extra_data=args.extra_data,
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
                 reload=args.reload,
                 incremental=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
-                enable_taxonomy=args.fix_lab,
                 enable_reconciliation=not args.no_reconciliation,
                 progress=progress,
             )
@@ -2222,7 +2299,10 @@ def main():
                 else:
                     print(f"Target: Complete Fiscal Year {args.fiscal_year}")
             else:
-                print(f"Start year: {args.year}")
+                if args.end_year:
+                    print(f"Year range: {args.year} to {args.end_year}")
+                else:
+                    print(f"Start year: {args.year}")
             print(f"{'='*50}")
             if args.local:
                 print("LOCAL PROCESSING MODE - Using offline XBRL zip files")
@@ -2281,14 +2361,13 @@ def main():
             scraper_app = SECDataScraperApp(
                 database_config=database_config,
                 start_year=args.year or 2010,
+                end_year=args.end_year,
                 enable_dimensions=not args.no_dimensions,
-                enable_extra_data=False,
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
                 reload=args.reload,
                 html_download_path=html_download_path,
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
-                enable_taxonomy=args.fix_lab,
                 enable_reconciliation=not args.no_reconciliation,
                 progress=progress,
             )
@@ -2367,15 +2446,14 @@ def main():
             # Use standard online processing
             app = SECDataScraperApp(
                 start_year=args.year, 
+                end_year=args.end_year,
                 enable_dimensions=not args.no_dimensions, 
-                enable_extra_data=args.extra_data,
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
                 reload=args.reload,
                 incremental=args.incremental,
                 html_download_path=html_download_path,
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
-                enable_taxonomy=args.fix_lab,
                 enable_reconciliation=not args.no_reconciliation,
                 progress=progress,
             )

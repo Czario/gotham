@@ -114,13 +114,14 @@ class SECAPIClient:
                 logger.warning(f"JSON parsing failed for {url}: {e}")
                 return None
     
-    def get_company_submissions(self, cik: str, start_year: int = 2010) -> Tuple[Optional[Dict], List[Dict]]:
+    def get_company_submissions(self, cik: str, start_year: int = 2010, end_year: Optional[int] = None) -> Tuple[Optional[Dict], List[Dict]]:
         """
         Fetch company submissions from SEC API including historical data
         
         Args:
             cik: Company CIK identifier
             start_year: Earliest year to include filings from (default: 2010)
+            end_year: Latest year to include filings from (inclusive). None means no upper bound.
             
         Returns:
             Tuple of (company_info, filings_list)
@@ -137,10 +138,10 @@ class SECAPIClient:
         company_info = self._extract_company_info(data)
         
         # Extract recent filings with date filtering
-        filings = self._extract_filings(data, start_year=start_year, company_cik=cik_formatted)
+        filings = self._extract_filings(data, start_year=start_year, end_year=end_year, company_cik=cik_formatted)
         
         # Fetch historical data from additional files if needed
-        historical_filings = self._fetch_historical_filings(cik_formatted, data, start_year)
+        historical_filings = self._fetch_historical_filings(cik_formatted, data, start_year, end_year)
         filings.extend(historical_filings)
         
         # Sort filings by date (most recent first)
@@ -169,7 +170,7 @@ class SECAPIClient:
             'filings': data.get('filings', {})
         }
     
-    def _extract_filings(self, data: Dict, forms_filter: List[str] = ['10-K', '10-Q'], start_year: int = 2010, company_cik: Optional[str] = None) -> List[Dict]:
+    def _extract_filings(self, data: Dict, forms_filter: List[str] = ['10-K', '10-Q'], start_year: int = 2010, end_year: Optional[int] = None, company_cik: Optional[str] = None) -> List[Dict]:
         """Extract filings from SEC response, filtered by form types and fiscal year range"""
         # Handle both main response format and historical file format
         if 'filings' in data and 'recent' in data['filings']:
@@ -232,6 +233,26 @@ class SECAPIClient:
                     
                     if not should_include:
                         continue
+
+                    # Apply upper bound (inclusive). A filing is kept when either its
+                    # filing year or its computed fiscal year falls at/below end_year,
+                    # mirroring the lower-bound logic above.
+                    if end_year is not None:
+                        within_end = filing_year <= end_year
+                        if not within_end and report_date:
+                            effective_fiscal_year_end = fiscal_year_end or company_fiscal_year_end
+                            if effective_fiscal_year_end:
+                                try:
+                                    report_end_date = datetime.strptime(report_date, '%Y-%m-%d')
+                                    fiscal_year, _ = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                                        report_end_date, effective_fiscal_year_end
+                                    )
+                                    if fiscal_year and fiscal_year <= end_year:
+                                        within_end = True
+                                except (ValueError, AttributeError):
+                                    pass
+                        if not within_end:
+                            continue
                         
                 except (ValueError, IndexError):
                     # Skip if date parsing fails
@@ -253,7 +274,7 @@ class SECAPIClient:
         
         return filings_data
     
-    def _fetch_historical_filings(self, cik_formatted: str, main_data: Dict, start_year: int) -> List[Dict]:
+    def _fetch_historical_filings(self, cik_formatted: str, main_data: Dict, start_year: int, end_year: Optional[int] = None) -> List[Dict]:
         """Fetch historical filings from additional SEC JSON files"""
         historical_filings = []
         
@@ -281,7 +302,7 @@ class SECAPIClient:
                 continue
             
             # Extract filings from historical data
-            historical_batch = self._extract_filings(historical_data, start_year=start_year, company_cik=cik_formatted)
+            historical_batch = self._extract_filings(historical_data, start_year=start_year, end_year=end_year, company_cik=cik_formatted)
             
             if historical_batch:
                 # Get date range of this batch
