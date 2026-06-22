@@ -353,10 +353,10 @@ class EnhancedFinancialStatementProcessor:
         filing_form_type = filing_info.get('form') or reporting_period.get('form_type')
         logger.debug(f"Processing {filing_form_type or 'unknown'} filing with dimensional filtering")
         
-        # Map Arelle statement types to expected types.
-        # equity_changes is included: it carries unique data (dividends, share
-        # buybacks, retained-earnings and AOCI roll-forward) that no other
-        # statement reports, and the normalization service already accepts it.
+        # Map Arelle statement types to the three core stored types.
+        # equity_changes is folded into balance_sheet — equity is a section of
+        # the balance sheet and its concepts (dividends, buybacks, retained
+        # earnings roll-forward) are most naturally grouped there.
         # comprehensive_income is intentionally excluded — its key metrics
         # (NetIncomeLoss, ComprehensiveIncomeNetOfTax) are already captured from
         # the income_statement, so storing it would only duplicate concepts.
@@ -364,23 +364,29 @@ class EnhancedFinancialStatementProcessor:
             'income_statement': 'income_statement',
             'balance_sheet': 'balance_sheet',
             'cash_flow': 'cash_flows',
-            'equity_changes': 'equity_changes',
+            'equity_changes': 'balance_sheet',
         }
         
         for arelle_type, expected_type in statement_mapping.items():
             logger.debug(f"Checking for {arelle_type} in arelle_statements...")
             if arelle_type in arelle_statements:
                 logger.info(f"Found {arelle_type}, converting to {expected_type}...")
-                # Convert Arelle hierarchy to flat list format
                 converted_data = self._convert_arelle_hierarchy_to_flat_list(
                     arelle_statements[arelle_type]['hierarchy'],
                     expected_type,
                     filing_form_type,
-                    financial_data.get('filing_info', {})  # Pass filing info for fiscal year/quarter
+                    financial_data.get('filing_info', {})
                 )
                 if converted_data:
-                    statements[expected_type] = converted_data
-                    logger.info(f"✅ Converted {arelle_type} -> {expected_type}: {len(converted_data)} items")
+                    if expected_type in statements:
+                        # equity_changes maps to balance_sheet which may already exist — merge
+                        existing_concepts = {it.get('concept') for it in statements[expected_type]}
+                        new_items = [it for it in converted_data if it.get('concept') not in existing_concepts]
+                        statements[expected_type].extend(new_items)
+                        logger.info(f"✅ Merged {arelle_type} -> {expected_type}: +{len(new_items)} items (deduped)")
+                    else:
+                        statements[expected_type] = converted_data
+                        logger.info(f"✅ Converted {arelle_type} -> {expected_type}: {len(converted_data)} items")
                 else:
                     logger.warning(f"⚠️  {arelle_type} -> {expected_type}: conversion resulted in empty data")
             else:
@@ -390,15 +396,16 @@ class EnhancedFinancialStatementProcessor:
         
         # ----------------------------------------------------------------------
         # Capture concepts discovered OUTSIDE the presentation tree (segment /
-        # disclosure data). These are real reported facts — dimensional segment
-        # breakdowns and plain numeric facts never wired into any presentation
-        # linkbase — that the four standard statements would otherwise drop.
+        # disclosure data). Route each concept into the most relevant core
+        # statement rather than creating a separate statement type:
+        #   - Revenue/income/expense concepts → income_statement
+        #   - Everything else → balance_sheet
+        # This keeps storage to the 3 core statement types while still capturing
+        # the extra facts that would otherwise be silently dropped.
         # ----------------------------------------------------------------------
         missing_section = arelle_statements.get('missing_dimensional_concepts')
         if missing_section and missing_section.get('hierarchy'):
-            # Concepts already represented in the standard statements — skip them
-            # to avoid double-counting (a fact already stored under, say,
-            # income_statement should not be duplicated under segment).
+            # Build dedupe set from all core statements already assembled
             captured_concepts = set()
             for stmt_items in statements.values():
                 for it in stmt_items:
@@ -406,12 +413,16 @@ class EnhancedFinancialStatementProcessor:
                     if c:
                         captured_concepts.add(str(c))
 
-            segment_data = self._convert_missing_concepts_to_flat_list(
+            routed = self._route_missing_concepts_to_core_statements(
                 missing_section['hierarchy'], captured_concepts
             )
-            if segment_data:
-                statements['segment'] = segment_data
-                logger.info(f"✅ Captured segment/disclosure data: {len(segment_data)} concepts outside presentation")
+            for target_stmt, items in routed.items():
+                if items:
+                    if target_stmt in statements:
+                        statements[target_stmt].extend(items)
+                    else:
+                        statements[target_stmt] = items
+                    logger.info(f"✅ Appended {len(items)} outside-presentation concepts to {target_stmt}")
 
         result = {
             'filing_info': filing_info,
@@ -719,23 +730,59 @@ class EnhancedFinancialStatementProcessor:
         
         return flat_data
 
-    def _convert_missing_concepts_to_flat_list(self, hierarchy: List[Dict], captured_concepts: set) -> List[Dict]:
+    # Keywords that indicate a concept belongs in income_statement
+    _INCOME_STMT_KEYWORDS = frozenset([
+        'revenue', 'revenues', 'income', 'expense', 'expenses', 'profit',
+        'loss', 'sales', 'earnings', 'earningspershare', 'eps', 'diluted',
+        'basic', 'margin', 'operating', 'interest', 'tax', 'cost', 'costs',
+        'selling', 'marketing', 'general', 'administrative', 'research',
+        'development', 'amortization', 'depreciation', 'impairment',
+        'royalt', 'licens', 'service', 'product',
+    ])
+
+    # Keywords that indicate a concept belongs in cash_flows
+    _CASH_FLOW_KEYWORDS = frozenset([
+        'proceeds', 'payment', 'repayment', 'repurchase', 'issuance',
+        'cashpaid', 'cashreceived', 'netcash', 'purchaseof', 'saleof',
+        'acquisitionof', 'capitalexpenditure', 'capex',
+    ])
+
+    @classmethod
+    def _classify_concept_statement(cls, concept_qname: str) -> str:
         """
-        Convert the dict-shaped ``missing_dimensional_concepts`` line items into
-        the same flat record format the rest of the pipeline (transformer +
-        normalization) consumes for the standard statements.
+        Route an outside-presentation concept to the most appropriate core
+        statement type based on concept name keywords.
+
+        Returns 'income_statement', 'cash_flows', or 'balance_sheet'.
+        """
+        local = (concept_qname.split(':')[-1] if ':' in concept_qname else concept_qname).lower()
+        for kw in cls._CASH_FLOW_KEYWORDS:
+            if kw in local:
+                return 'cash_flows'
+        for kw in cls._INCOME_STMT_KEYWORDS:
+            if kw in local:
+                return 'income_statement'
+        return 'balance_sheet'
+
+    def _route_missing_concepts_to_core_statements(
+        self, hierarchy: List[Dict], captured_concepts: set
+    ) -> dict:
+        """
+        Convert outside-presentation line-item dicts and route each concept
+        into the correct core statement (income_statement / cash_flows /
+        balance_sheet) based on concept-name keywords.
 
         Args:
-            hierarchy: list of missing-concept line-item dicts produced by
+            hierarchy: list of missing-concept dicts from
                 ``EnhancedDimensionalExtractor._create_line_items_for_missing_concepts``
-            captured_concepts: concept qnames already present in the four standard
-                statements (used to de-duplicate)
+            captured_concepts: concept qnames already in the core statements
+                (for deduplication)
 
         Returns:
-            List of flat fact dicts tagged ``statement_type='segment'``
+            dict mapping statement_type → list of flat fact dicts
         """
-        flat_data: List[Dict] = []
-        seen_concepts = set()
+        routed: dict = {'income_statement': [], 'cash_flows': [], 'balance_sheet': []}
+        seen_concepts: set = set()
 
         for item in hierarchy:
             if not isinstance(item, dict):
@@ -746,18 +793,17 @@ class EnhancedFinancialStatementProcessor:
                 continue
             concept = str(concept)
 
-            # De-dup against the standard statements and within this section
             if concept in captured_concepts or concept in seen_concepts:
                 continue
 
             dimensional_facts = item.get('dimensional_facts', []) if self.include_dimensions else []
 
-            # A missing concept is only worth storing if it has a primary value
-            # or at least one dimensional fact carrying data.
             has_value = item.get('value') is not None
             has_dim_data = bool(dimensional_facts)
             if not has_value and not has_dim_data:
                 continue
+
+            target = self._classify_concept_statement(concept)
 
             fact_dict = {
                 'concept': concept,
@@ -769,14 +815,14 @@ class EnhancedFinancialStatementProcessor:
                 'level': item.get('level', 0),
                 'order': item.get('order', 999999),
                 'abstract': False,
-                'statement_type': 'segment',
+                'statement_type': target,
                 'dimensional_facts': dimensional_facts,
             }
 
-            flat_data.append(fact_dict)
+            routed[target].append(fact_dict)
             seen_concepts.add(concept)
 
-        return flat_data
+        return routed
 
     def _filter_current_period_facts(self, dimensional_facts: List[Dict], filing_form_type: Optional[str] = None, 
                                     fiscal_year: Optional[int] = None, quarter: Optional[int] = None, 

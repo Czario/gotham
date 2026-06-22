@@ -76,7 +76,7 @@ Three primary collections defined with JSON Schema validators in `database/confi
 
 - **`companies`** — indexed by `cik` (unique), name, tickers, SIC code
 - **`filings`** — `(company_cik, accession_number)` unique; `form_type` is an enum: `10-K`, `10-Q`, `8-K`, `DEF 14A`, `S-1`, `S-3`
-- **`financial_statements`** — `financial_data` is an array where each item has `order`, `concept`, `label`, `level`, `abstract` (bool), `dimension` (bool); `statement_type` is an enum: `income_statement`, `balance_sheet`, `cash_flows`, `equity_changes`, `comprehensive_income`
+- **`financial_statements`** — `financial_data` is an array where each item has `order`, `concept`, `label`, `level`, `abstract` (bool), `dimension` (bool); `statement_type` is an enum: `income_statement`, `balance_sheet`, `cash_flows`
 
 ## Key Conventions
 
