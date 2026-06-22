@@ -357,6 +357,18 @@ class FlexibleXBRLExtractor:
                             'discovery_note': 'These concepts contain dimensional data but were not included in standard financial statement presentations'
                         }
                     }
+
+            # Step 2a metrics: surface how much data lives outside the presentation
+            # tree so coverage gains from the segment/disclosure capture are visible.
+            if missing_dimensional_concepts:
+                _facts_total = sum(li.get('fact_count', 0) for li in missing_dimensional_concepts)
+                _with_values = sum(1 for li in missing_dimensional_concepts if li.get('value') is not None)
+                _dim_facts = sum(li.get('dimensional_fact_count', 0) for li in missing_dimensional_concepts)
+                logger.info(
+                    f"📈 Outside-presentation discovery: {len(missing_dimensional_concepts)} concepts "
+                    f"({_with_values} with primary values), {_facts_total} total facts "
+                    f"({_dim_facts} dimensional) captured for segment/disclosure storage"
+                )
             
             result = {
                 'filing_info': filing_info,

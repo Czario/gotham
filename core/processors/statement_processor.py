@@ -353,13 +353,18 @@ class EnhancedFinancialStatementProcessor:
         filing_form_type = filing_info.get('form') or reporting_period.get('form_type')
         logger.debug(f"Processing {filing_form_type or 'unknown'} filing with dimensional filtering")
         
-        # Map Arelle statement types to expected types
-        # Only the three core financial statements are stored; comprehensive_income
-        # and equity are intentionally excluded.
+        # Map Arelle statement types to expected types.
+        # equity_changes is included: it carries unique data (dividends, share
+        # buybacks, retained-earnings and AOCI roll-forward) that no other
+        # statement reports, and the normalization service already accepts it.
+        # comprehensive_income is intentionally excluded — its key metrics
+        # (NetIncomeLoss, ComprehensiveIncomeNetOfTax) are already captured from
+        # the income_statement, so storing it would only duplicate concepts.
         statement_mapping = {
             'income_statement': 'income_statement',
             'balance_sheet': 'balance_sheet',
             'cash_flow': 'cash_flows',
+            'equity_changes': 'equity_changes',
         }
         
         for arelle_type, expected_type in statement_mapping.items():
@@ -383,6 +388,31 @@ class EnhancedFinancialStatementProcessor:
         
         logger.info(f"Final converted statements: {list(statements.keys())}")
         
+        # ----------------------------------------------------------------------
+        # Capture concepts discovered OUTSIDE the presentation tree (segment /
+        # disclosure data). These are real reported facts — dimensional segment
+        # breakdowns and plain numeric facts never wired into any presentation
+        # linkbase — that the four standard statements would otherwise drop.
+        # ----------------------------------------------------------------------
+        missing_section = arelle_statements.get('missing_dimensional_concepts')
+        if missing_section and missing_section.get('hierarchy'):
+            # Concepts already represented in the standard statements — skip them
+            # to avoid double-counting (a fact already stored under, say,
+            # income_statement should not be duplicated under segment).
+            captured_concepts = set()
+            for stmt_items in statements.values():
+                for it in stmt_items:
+                    c = it.get('concept')
+                    if c:
+                        captured_concepts.add(str(c))
+
+            segment_data = self._convert_missing_concepts_to_flat_list(
+                missing_section['hierarchy'], captured_concepts
+            )
+            if segment_data:
+                statements['segment'] = segment_data
+                logger.info(f"✅ Captured segment/disclosure data: {len(segment_data)} concepts outside presentation")
+
         result = {
             'filing_info': filing_info,
             'company_cik': str(company_cik),
@@ -687,6 +717,65 @@ class EnhancedFinancialStatementProcessor:
             if total_before != total_after:
                 logger.debug(f"Context filters: {total_before} dimensional facts → {total_after} kept ({total_before - total_after} removed)")
         
+        return flat_data
+
+    def _convert_missing_concepts_to_flat_list(self, hierarchy: List[Dict], captured_concepts: set) -> List[Dict]:
+        """
+        Convert the dict-shaped ``missing_dimensional_concepts`` line items into
+        the same flat record format the rest of the pipeline (transformer +
+        normalization) consumes for the standard statements.
+
+        Args:
+            hierarchy: list of missing-concept line-item dicts produced by
+                ``EnhancedDimensionalExtractor._create_line_items_for_missing_concepts``
+            captured_concepts: concept qnames already present in the four standard
+                statements (used to de-duplicate)
+
+        Returns:
+            List of flat fact dicts tagged ``statement_type='segment'``
+        """
+        flat_data: List[Dict] = []
+        seen_concepts = set()
+
+        for item in hierarchy:
+            if not isinstance(item, dict):
+                continue
+
+            concept = item.get('name') or item.get('concept')
+            if not concept:
+                continue
+            concept = str(concept)
+
+            # De-dup against the standard statements and within this section
+            if concept in captured_concepts or concept in seen_concepts:
+                continue
+
+            dimensional_facts = item.get('dimensional_facts', []) if self.include_dimensions else []
+
+            # A missing concept is only worth storing if it has a primary value
+            # or at least one dimensional fact carrying data.
+            has_value = item.get('value') is not None
+            has_dim_data = bool(dimensional_facts)
+            if not has_value and not has_dim_data:
+                continue
+
+            fact_dict = {
+                'concept': concept,
+                'label': item.get('label') or item.get('concept_local_name') or concept,
+                'value': item.get('value'),
+                'context_id': item.get('context_id'),
+                'unit': item.get('unit_id'),
+                'period': item.get('period'),
+                'level': item.get('level', 0),
+                'order': item.get('order', 999999),
+                'abstract': False,
+                'statement_type': 'segment',
+                'dimensional_facts': dimensional_facts,
+            }
+
+            flat_data.append(fact_dict)
+            seen_concepts.add(concept)
+
         return flat_data
 
     def _filter_current_period_facts(self, dimensional_facts: List[Dict], filing_form_type: Optional[str] = None, 

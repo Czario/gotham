@@ -373,7 +373,102 @@ class EnhancedDimensionalExtractor:
         except Exception as e:
             logger.debug(f"Error extracting enhanced dimensional fact: {e}")
             return None
-    
+
+    def _extract_simple_fact(self, fact) -> Optional[Dict]:
+        """
+        Extract a numeric fact that has NO dimensional context.
+
+        Mirrors the dict shape returned by ``_extract_enhanced_dimensional_fact``
+        (empty ``dimensions``/``dimension_details``) so that non-dimensional
+        facts discovered outside the presentation tree can flow through the same
+        line-item creation path.
+        """
+        if fact is None or fact.context is None:
+            return None
+
+        try:
+            # Numeric value extraction (matches enhanced extractor logic)
+            value = None
+            raw_value = None
+            if hasattr(fact, 'xValue') and fact.xValue is not None:
+                raw_value = fact.xValue
+            elif hasattr(fact, 'effectiveValue') and fact.effectiveValue is not None:
+                raw_value = fact.effectiveValue
+            elif hasattr(fact, 'value') and fact.value is not None:
+                raw_value = fact.value
+
+            if raw_value is not None:
+                if isinstance(raw_value, (int, float)):
+                    value = float(raw_value)
+                else:
+                    try:
+                        clean_value = str(raw_value).replace(',', '').replace('$', '').strip()
+                        if clean_value and clean_value not in ['', '-', 'N/A', 'n/a']:
+                            value = float(clean_value)
+                    except (ValueError, TypeError):
+                        value = None
+
+            # Non-dimensional facts with no numeric value carry no information
+            if value is None:
+                return None
+
+            # Period information
+            period_info = ""
+            period_type = None
+            if hasattr(fact.context, 'period'):
+                if hasattr(fact.context, 'isInstantPeriod') and fact.context.isInstantPeriod:
+                    period_type = "instant"
+                    period_info = str(fact.context.instantDatetime) if fact.context.instantDatetime else ""
+                elif hasattr(fact.context, 'isStartEndPeriod') and fact.context.isStartEndPeriod:
+                    period_type = "duration"
+                    start_date = str(fact.context.startDatetime) if fact.context.startDatetime else ""
+                    end_date = str(fact.context.endDatetime) if fact.context.endDatetime else ""
+                    period_info = f"{start_date} to {end_date}"
+                elif hasattr(fact.context, 'isForeverPeriod') and fact.context.isForeverPeriod:
+                    period_type = "forever"
+                    period_info = "forever"
+
+            entity_info = {}
+            if hasattr(fact.context, 'entityIdentifier'):
+                entity_info = {
+                    'scheme': fact.context.entityIdentifier[0] if len(fact.context.entityIdentifier) > 0 else 'http://www.sec.gov/CIK',
+                    'identifier': fact.context.entityIdentifier[1] if len(fact.context.entityIdentifier) > 1 else None
+                }
+
+            unit_info = {}
+            if fact.unit is not None:
+                unit_info = {'id': fact.unitID, 'measures': []}
+                if hasattr(fact.unit, 'measures'):
+                    multiply_measures, divide_measures = fact.unit.measures
+                    for measure in (multiply_measures or []):
+                        unit_info['measures'].append(str(measure))
+                    for measure in (divide_measures or []):
+                        unit_info['measures'].append(str(measure))
+
+            return {
+                'value': value,
+                'dimensions': {},
+                'dimension_details': {},
+                'context_id': fact.contextID,
+                'unit_id': fact.unitID if fact.unit is not None else None,
+                'unit_info': unit_info,
+                'period': period_info,
+                'period_type': period_type,
+                'entity_info': entity_info,
+                'concept_name': str(fact.concept.qname) if fact.concept is not None else None,
+                'concept_local_name': fact.concept.qname.localName if (fact.concept is not None and hasattr(fact.concept.qname, 'localName')) else None,
+                'has_dimensions': False,
+                'dimension_count': 0,
+                'fact_id': getattr(fact, 'id', None),
+                'decimals': getattr(fact, 'decimals', None),
+                'precision': getattr(fact, 'precision', None),
+                'source': 'non_dimensional_discovery'
+            }
+
+        except Exception as e:
+            logger.debug(f"Error extracting non-dimensional fact: {e}")
+            return None
+
     def _check_for_missing_dimensional_context(self, fact, modelXbrl) -> Optional[Dict]:
         """
         Check if a fact should have dimensional context based on the discovered
@@ -512,10 +607,50 @@ class EnhancedDimensionalExtractor:
         except (ValueError, TypeError):
             return str(fact.value) if hasattr(fact, 'value') else None
     
-    def _discover_missing_dimensional_concepts(self, modelXbrl, presentation_facts) -> Dict[str, List]:
+    @staticmethod
+    def _is_capturable_numeric_concept(fact) -> bool:
         """
-        Discover concepts that have dimensional data but don't appear in standard presentation relationships.
-        These are the concepts that the system normally misses but contain valuable dimensional information.
+        Decide whether a non-dimensional fact is worth capturing outside the
+        presentation tree. We only want genuine numeric financial facts and must
+        exclude entity/cover-page metadata (``dei`` namespace) and non-numeric
+        text blocks, which would otherwise add noise.
+        """
+        concept = getattr(fact, 'concept', None)
+        if concept is None or not hasattr(concept, 'qname'):
+            return False
+
+        # Must be numeric
+        is_numeric = getattr(concept, 'isNumeric', None)
+        if is_numeric is None:
+            # Fall back to checking the fact value can be parsed as a number later
+            is_numeric = not getattr(concept, 'isTextBlock', False)
+        if not is_numeric:
+            return False
+
+        # Skip abstract concepts and DEI / cover-page metadata
+        if getattr(concept, 'isAbstract', False):
+            return False
+        namespace = getattr(concept.qname, 'namespaceURI', '') or ''
+        if 'dei' in namespace.lower():
+            return False
+
+        # Skip nil facts
+        if getattr(fact, 'isNil', False):
+            return False
+
+        return True
+
+    def _discover_missing_dimensional_concepts(self, modelXbrl, presentation_facts,
+                                               include_non_dimensional: bool = True) -> Dict[str, List]:
+        """
+        Discover concepts that don't appear in standard presentation relationships.
+
+        Captures two classes of otherwise-dropped facts:
+          1. Concepts carrying dimensional data (segment/product/geography breakdowns).
+          2. (when ``include_non_dimensional`` is True) plain numeric facts that
+             exist in the instance document but were never wired into any
+             presentation linkbase — these are real reported values the standard
+             pass silently misses.
         """
         logger.debug("Discovering missing dimensional concepts...")
         logger.debug(f"Input presentation_facts count: {len(presentation_facts)}")
@@ -546,7 +681,8 @@ class EnhancedDimensionalExtractor:
         
         dimensional_fact_count = 0
         missing_concept_count = 0
-        
+        non_dimensional_fact_count = 0
+
         for fact in modelXbrl.facts:
             try:
                 # Check if this fact has dimensional context
@@ -566,15 +702,28 @@ class EnhancedDimensionalExtractor:
                                 missing_concept_count += 1
                             
                             missing_dimensional_concepts[concept_qname].append(fact)
-                            
+
+                # Non-dimensional numeric facts outside the presentation tree
+                elif include_non_dimensional:
+                    if (fact.concept is not None and hasattr(fact.concept, 'qname') and
+                            self._is_capturable_numeric_concept(fact)):
+                        concept_qname = str(fact.concept.qname)
+                        if concept_qname not in presentation_concept_qnames:
+                            if concept_qname not in missing_dimensional_concepts:
+                                missing_dimensional_concepts[concept_qname] = []
+                                missing_concept_count += 1
+                            missing_dimensional_concepts[concept_qname].append(fact)
+                            non_dimensional_fact_count += 1
+
             except Exception as e:
                 logger.debug(f"Error analyzing fact for missing concepts: {e}")
                 continue
         
         logger.debug(f"Analysis complete:")
         logger.debug(f"   {dimensional_fact_count} total facts with dimensional data")
+        logger.debug(f"   {non_dimensional_fact_count} non-dimensional numeric facts captured outside presentation")
         logger.debug(f"   {len(presentation_concept_qnames)} concepts in standard presentation")
-        logger.debug(f"   {len(missing_dimensional_concepts)} concepts with dimensional data NOT in presentation")
+        logger.debug(f"   {len(missing_dimensional_concepts)} concepts NOT in presentation")
         logger.debug(f"   {sum(len(facts) for facts in missing_dimensional_concepts.values())} dimensional facts from missing concepts")
         
         # Log some examples of missing concepts for debugging
@@ -729,10 +878,13 @@ class EnhancedDimensionalExtractor:
                     except:
                         pass
                 
-                # Extract all dimensional facts for this concept
+                # Extract all facts for this concept (dimensional and non-dimensional)
                 all_dimensional_facts = []
                 for fact in concept_facts:
                     enhanced_fact = self._extract_enhanced_dimensional_fact(fact)
+                    if not enhanced_fact:
+                        # Non-dimensional numeric fact discovered outside presentation
+                        enhanced_fact = self._extract_simple_fact(fact)
                     if enhanced_fact:
                         enhanced_fact['concept_name'] = concept_qname
                         enhanced_fact['concept_local_name'] = concept_local_name

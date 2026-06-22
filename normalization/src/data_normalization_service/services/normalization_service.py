@@ -401,7 +401,7 @@ class FinancialNormalizationService:
         # Core statements plus equity_changes (share buybacks, dividends, retained earnings).
         # comprehensive_income is intentionally excluded — its key metrics (NetIncomeLoss,
         # ComprehensiveIncomeNetOfTax) are already captured from the income_statement.
-        _ALLOWED_STATEMENT_TYPES = {'income_statement', 'balance_sheet', 'cash_flows', 'equity_changes'}
+        _ALLOWED_STATEMENT_TYPES = {'income_statement', 'balance_sheet', 'cash_flows', 'equity_changes', 'segment'}
         if statement.statement_type not in _ALLOWED_STATEMENT_TYPES:
             logger.debug(f"Skipping statement_type='{statement.statement_type}' (not in allowed set)")
             return

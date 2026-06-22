@@ -134,7 +134,7 @@ COLLECTIONS_CONFIG = {
                 "properties": {
                     "company_cik": {"bsonType": "string"},
                     "filing_id": {"bsonType": ["objectId", "string"]},  # Accept both ObjectId and string
-                    "statement_type": {"enum": ["income_statement", "balance_sheet", "cash_flows", "equity_changes", "comprehensive_income"]},
+                    "statement_type": {"enum": ["income_statement", "balance_sheet", "cash_flows", "equity_changes", "comprehensive_income", "segment"]},
                     "reporting_period": {
                         "bsonType": "object",
                         "required": ["end_date"],
