@@ -1668,7 +1668,29 @@ class FinancialNormalizationService:
                     primary_axis = axis_name
                     primary_member = concept
                     break
-        
+
+        # Priority 9: Typed date dimensions (e.g. performance obligation timing).
+        # These axes carry a raw date string as the "member" rather than a named
+        # explicit member.  Build a stable, human-identifiable concept key so the
+        # UI never displays a bare date as a concept name.
+        if not segment_type:
+            import re as _re
+            _DATE_RE = _re.compile(r'^\d{4}-\d{2}-\d{2}$')
+            for axis_name, member_name in meaningful_dimensions.items():
+                if _DATE_RE.match(str(member_name)):
+                    axis_lower = axis_name.lower()
+                    if 'revenueremainingperformanceobligation' in axis_lower or 'performanceobligation' in axis_lower:
+                        segment_type = 'performance_obligation'
+                        concept = f'us-gaap:RevenueRemainingPerformanceObligation_{member_name}'
+                    else:
+                        # Generic typed-date axis — derive a readable segment type
+                        axis_clean = axis_name.replace('Axis', '').lower()
+                        segment_type = f'typed_date_{axis_clean}' if axis_clean else 'typed_date'
+                        concept = f'{axis_clean}_{member_name}' if axis_clean else member_name
+                    primary_axis = axis_name
+                    primary_member = concept
+                    break
+
         # Fallback: Use first dimension but create more descriptive segment type
         if not segment_type and meaningful_dimensions:
             first_axis = list(meaningful_dimensions.keys())[0]
@@ -1796,6 +1818,19 @@ class FinancialNormalizationService:
             dimensional_concept_doc.label = dimension_data['fact_label']
         elif 'label' in dimension_data:
             dimensional_concept_doc.label = dimension_data['label']
+
+        # For typed-date concepts the member has no label at all; build one from
+        # the fact label (e.g. "Revenue, Remaining Performance Obligation, Percentage")
+        # and the date qualifier so the UI shows something meaningful.
+        if not dimensional_concept_doc.label:
+            import re as _re2
+            _date_match = _re2.search(r'(\d{4}-\d{2}-\d{2})$', dimensional_concept_doc.concept or '')
+            if _date_match:
+                date_str = _date_match.group(1)
+                base_label = (dimension_data.get('fact_label') or
+                              dimension_data.get('label') or
+                              'Revenue Remaining Performance Obligation')
+                dimensional_concept_doc.label = f"{base_label} ({date_str})"
 
         # The `concept` parameter is already correct — do NOT overwrite it from dimension_details,
         # which would pick the wrong axis for dual-axis facts (regression fix).
