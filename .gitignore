@@ -73,11 +73,6 @@ _debug_*.py
 /*_improvements.py
 /*_instructions.py
 
-# ─── Runtime user input files ─────────────────────────────────────────────────
-# stocks_download.txt is a per-user runtime input; use stocks_download.txt.example
-# as the committed template (if desired)
-stocks_download.txt
-
 # ─── Output / generated data files ───────────────────────────────────────────
 output.json
 *_income.json
