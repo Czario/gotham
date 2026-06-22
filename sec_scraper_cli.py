@@ -884,12 +884,17 @@ class SECDataScraperApp:
             
             # Process the filing
             success = self.process_filing_with_full_data(cik, target_filing, is_local=False)
-            
+
             if success:
                 logger.info(f"✅ Successfully processed filing {accession_number}")
             else:
                 logger.error(f"❌ Failed to process filing {accession_number}")
-            
+
+            # Deaccumulate quarterly deltas and fill extraction gaps, same as
+            # the multi-filing path.
+            self._flush_quarterly_accumulator(cik)
+            self._run_companyfacts_reconciliation(cik)
+
             return success
             
         except Exception as e:
