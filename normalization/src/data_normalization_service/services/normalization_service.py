@@ -1685,16 +1685,24 @@ class FinancialNormalizationService:
             primary_axis = first_axis
             primary_member = concept
         
-        # Handle multi-dimensional cases - create composite concept if multiple meaningful dimensions
+        # Handle multi-dimensional cases - only create composite concept when the secondary
+        # dimension adds genuine specificity (e.g. Product × Geography).
+        # Wrapper/consolidation axes like ConsolidationItemsAxis are redundant — they merely
+        # flag that the row belongs to an operating segment and must NOT be appended.
+        _WRAPPER_AXES = {
+            'consolidationitemsaxis',       # srt:ConsolidationItemsAxis / us-gaap:ConsolidationItemsAxis
+            'consolidationaxis',
+            'segmentreportingaxis',
+        }
         if len(meaningful_dimensions) > 1 and primary_axis and concept:
-            # For multi-dimensional, append other significant dimensions to concept
-            other_dimensions = {k: v for k, v in meaningful_dimensions.items() if k != primary_axis}
+            other_dimensions = {
+                k: v for k, v in meaningful_dimensions.items()
+                if k != primary_axis and k.lower() not in _WRAPPER_AXES
+            }
             if other_dimensions:
-                # Add the most significant other dimension to make concept more specific
                 significant_other = next(iter(other_dimensions.items()))
                 other_axis, other_member = significant_other
                 other_qualified = get_qualified_member_name(other_axis, other_member)
-                # Create compound concept name using the original concept (which is already qualified)
                 concept = f"{concept}_{other_qualified}"
         
         # Don't clean up concept name - preserve the qualified names with namespaces
@@ -1760,39 +1768,37 @@ class FinancialNormalizationService:
         
         # Extract member_label as label and member_qname as concept from source database
         dimension_details = dimension_data.get('dimension_details', {})
-        
-        # Priority 1: Use member_label from dimension_details as the label
-        member_label_found = False
-        for axis_name, axis_details in dimension_details.items():
-            if isinstance(axis_details, dict) and 'member_label' in axis_details:
-                dimensional_concept_doc.label = axis_details['member_label']
-                member_label_found = True
-                break
-        
-        # Priority 2: Use member_qname from dimension_details as the concept
-        member_qname_found = False
-        for axis_name, axis_details in dimension_details.items():
-            if isinstance(axis_details, dict) and 'member_qname' in axis_details:
-                dimensional_concept_doc.concept = axis_details['member_qname']
-                member_qname_found = True
-                break
-        
-        # Fallback for label if member_label not found
-        if not member_label_found:
-            if 'fact_label' in dimension_data:
-                dimensional_concept_doc.label = dimension_data['fact_label']
-            elif 'label' in dimension_data:
-                dimensional_concept_doc.label = dimension_data['label']
-            else:
-                # Use member_local_name as final fallback
-                for axis_name, axis_details in dimension_details.items():
-                    if isinstance(axis_details, dict) and 'member_local_name' in axis_details:
-                        dimensional_concept_doc.label = axis_details['member_local_name']
-                        break
-        
-        # Fallback for concept if member_qname not found (keep original concept parameter)
-        if not member_qname_found:
-            dimensional_concept_doc.concept = concept
+
+        # For multi-axis facts (e.g. ConsolidationItemsAxis + StatementBusinessSegmentsAxis),
+        # the `concept` parameter was already correctly identified by _determine_segment_info
+        # as the semantically meaningful member (e.g. aapl:AmericasSegmentMember).
+        # We must find the axis whose member_qname MATCHES `concept` so we use the right label,
+        # rather than blindly taking the first axis (which may be a consolidation/wrapper axis).
+        def _find_primary_axis_details() -> dict:
+            """Return the dimension_details entry whose member_qname matches `concept`."""
+            for _ax, _details in dimension_details.items():
+                if isinstance(_details, dict) and _details.get('member_qname') == concept:
+                    return _details
+            # Fallback: return first axis details that has a member_qname
+            for _ax, _details in dimension_details.items():
+                if isinstance(_details, dict) and 'member_qname' in _details:
+                    return _details
+            return {}
+
+        primary_axis_details = _find_primary_axis_details()
+
+        # Use label from the primary (semantically correct) axis
+        if primary_axis_details.get('member_label'):
+            dimensional_concept_doc.label = primary_axis_details['member_label']
+        elif primary_axis_details.get('member_local_name'):
+            dimensional_concept_doc.label = primary_axis_details['member_local_name']
+        elif 'fact_label' in dimension_data:
+            dimensional_concept_doc.label = dimension_data['fact_label']
+        elif 'label' in dimension_data:
+            dimensional_concept_doc.label = dimension_data['label']
+
+        # The `concept` parameter is already correct — do NOT overwrite it from dimension_details,
+        # which would pick the wrong axis for dual-axis facts (regression fix).
         
         # Store new dimensional data fields
         dimensional_fields = {
