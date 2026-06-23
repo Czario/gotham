@@ -139,7 +139,7 @@ class DuplicatePreventionManager:
         })
         
         if existing and existing.get('concept') != concept_doc.concept:
-            logger.info(
+            logger.debug(
                 f"Path-order combination already exists! "
                 f"Path: {concept_doc.path}, Order: {concept_doc.order_key} "
                 f"Existing: {existing.get('concept')}, New: {concept_doc.concept}"
@@ -153,7 +153,7 @@ class DuplicatePreventionManager:
                 concept_doc.order_key
             )
             
-            logger.info(f"Adjusted order_key from '{concept_doc.order_key}' to '{next_order_key}' for concept {concept_doc.concept}")
+            logger.debug(f"Adjusted order_key from '{concept_doc.order_key}' to '{next_order_key}' for concept {concept_doc.concept}")
             
             # Create new concept doc with adjusted order_key, preserving all fields
             adjusted_concept = ConceptDocument(
