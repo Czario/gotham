@@ -80,6 +80,10 @@ class LoggerConfig:
             console_handler.setLevel(cls.LOG_LEVELS.get(level.upper(), logging.INFO))
             console_handler.setFormatter(formatter)
             root_logger.addHandler(console_handler)
+        else:
+            # Add a NullHandler to prevent Python's "last resort" stderr handler
+            # from printing WARNING+ messages when no handlers are configured.
+            root_logger.addHandler(logging.NullHandler())
         
         # File handler with rotation (optional)
         if file_output:

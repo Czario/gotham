@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 from utilities.helpers.period_utils import FiscalYearCalculator
 from utilities.sec_url_detector import SECURLDetector
+from utilities.sec_rate_limiter import _global_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ class SECAPIClient:
         """Make rate-limited request to SEC API with retry logic for transient errors"""
         for attempt in range(max_retries):
             try:
-                time.sleep(self.rate_limit_delay)  # Rate limiting
+                _global_rate_limiter.acquire()  # Rate limiting (shared token bucket, 8 req/s)
                 response = self.session.get(url, timeout=30)
                 response.raise_for_status()
                 return response.json()

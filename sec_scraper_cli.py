@@ -4,6 +4,8 @@ import sys
 import os
 import time
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -70,11 +72,13 @@ class ProgressManager:
     and progress is communicated exclusively via tqdm bars.
     """
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, parallel: bool = False):
         self.verbose = verbose
+        self.parallel = parallel
         self._company_bar: Optional["tqdm"] = None
         self._filing_bar: Optional["tqdm"] = None
         self._current_index: int = 0
+        self._lock = threading.Lock()
         # Maps CIK -> the ticker symbol the user actually typed, so the bar
         # shows e.g. "JPM" instead of whatever the reverse CIK->ticker map
         # happens to return (a CIK can map to multiple tickers).
@@ -113,14 +117,15 @@ class ProgressManager:
         """
         if self.verbose or self._company_bar is None:
             return
-        if index is not None:
-            self._current_index = index
-            target = index - 1  # companies finished before this one
-            delta = target - self._company_bar.n
-            if delta > 0:
-                self._company_bar.update(delta)
-        self._company_bar.set_description_str(f"{ticker:<6} processing")
-        self._company_bar.refresh()
+        with self._lock:
+            if index is not None and not self.parallel:
+                self._current_index = index
+                target = index - 1  # companies finished before this one
+                delta = target - self._company_bar.n
+                if delta > 0:
+                    self._company_bar.update(delta)
+            self._company_bar.set_description_str(f"{ticker:<6} processing")
+            self._company_bar.refresh()
 
     def advance_company(self, ticker: str, processed: int, skipped: int,
                         failed: int, reconciled: int = 0) -> None:
@@ -136,12 +141,17 @@ class ProgressManager:
         if reconciled:
             parts.append(f"+{reconciled} filled")
         status = ", ".join(parts) or "done"
-        # Mark the current company as finished.
-        delta = self._current_index - self._company_bar.n
-        if delta > 0:
-            self._company_bar.update(delta)
-        self._company_bar.set_description_str(f"{ticker:<6} {status}")
-        self._company_bar.refresh()
+        with self._lock:
+            if self.parallel:
+                # Companies complete out of order; simply increment by 1.
+                self._company_bar.update(1)
+            else:
+                # Sequential: advance to the current index.
+                delta = self._current_index - self._company_bar.n
+                if delta > 0:
+                    self._company_bar.update(delta)
+            self._company_bar.set_description_str(f"{ticker:<6} {status}")
+            self._company_bar.refresh()
 
     def finish_companies(self) -> None:
         self.close_filing_bar()
@@ -151,12 +161,18 @@ class ProgressManager:
 
     # -- Filing-level bar (per company) ------------------------------------
     def filing_bar(self, ticker: str, total: int) -> "tqdm":
-        """Return a tqdm bar for the filing loop; disabled in verbose mode.
+        """Return a tqdm bar for the filing loop; disabled in verbose or parallel mode.
 
         The bar is pinned to ``position=1`` so it renders on its own line
         directly beneath the company bar instead of overwriting it. Any
         previously open filing bar is closed first.
         """
+        if self.parallel:
+            # In parallel mode multiple companies run simultaneously; a single
+            # shared bar would be chaotic. Return a silent bar instead so that
+            # all callers can still call .update() / .set_description_str()
+            # without crashing.
+            return tqdm(total=total, disable=True)
         self.close_filing_bar()
         self._filing_bar = tqdm(
             total=total,
@@ -391,7 +407,7 @@ def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optio
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -401,7 +417,13 @@ class SECDataScraperApp:
         self.end_year = end_year
         self.enable_dimensions = enable_dimensions
         self.enable_reconciliation = enable_reconciliation
+        self.workers = max(1, workers)
         self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
+        # Thread-local storage for per-company state (current_company_doc / data)
+        # so parallel workers don't overwrite each other's company context.
+        self._thread_local = threading.local()
+        # Lock protecting the shared _quarterly_accumulator dict during parallel runs.
+        self._qaccum_lock = threading.Lock()
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = target_fiscal_quarter
         self.reload = reload
@@ -525,11 +547,13 @@ class SECDataScraperApp:
             'data': statement_doc.get('data', []),
             '_filing_doc': filing_doc,  # carry filing for accession_number lookup
         }
-        self._quarterly_accumulator.setdefault(cik, []).append(entry)
+        with self._qaccum_lock:
+            self._quarterly_accumulator.setdefault(cik, []).append(entry)
 
     def _flush_quarterly_accumulator(self, cik: str) -> None:
         """Run deaccumulation for a company then free its accumulator entry."""
-        statements = self._quarterly_accumulator.pop(cik, [])
+        with self._qaccum_lock:
+            statements = self._quarterly_accumulator.pop(cik, [])
         if not statements:
             return
         logger.info(f"Running quarterly deaccumulation for {cik} ({len(statements)} statements)")
@@ -648,7 +672,7 @@ class SECDataScraperApp:
                 error_msg = f"Failed to fetch company data for CIK: {cik}"
                 logger.error(error_msg)
                 return False
-            self.current_company_data = company_data
+            self._thread_local.current_company_data = company_data
 
             _range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
             logger.info(f"Fetched {len(filings_list)} total filings for company {company_data.get('name', 'Unknown')} {_range_desc}")
@@ -694,7 +718,7 @@ class SECDataScraperApp:
             
             # Step 2: Prepare company doc for in-memory passing to normalization service
             company_doc = self.company_transformer.transform_company_data(company_data)
-            self.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
+            self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
             logger.info(f"Company data ready for CIK: {cik}")
             
             # Step 3: Process filings (10-K and 10-Q) with existence checks and reload logic
@@ -851,11 +875,11 @@ class SECDataScraperApp:
                 return False
             
             # Store company data for use in financial processing
-            self.current_company_data = company_data
+            self._thread_local.current_company_data = company_data
             
             # Transform company doc for in-memory passing to normalization service
             company_doc = self.company_transformer.transform_company_data(company_data)
-            self.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
+            self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
             logger.info(f"Company data ready for CIK: {cik}")
             
             # Find the specific filing in the filings list
@@ -1069,11 +1093,11 @@ class SECDataScraperApp:
                     'fiscalYearEnd': '1231'  # Default fallback
                 }
             
-            self.current_company_data = company_data
+            self._thread_local.current_company_data = company_data
             if self.reload:
                 logger.info(f"🔄 RELOAD mode: refreshing data for {ticker} (CIK: {cik})")
             company_doc = self.company_transformer.transform_company_data(company_data)
-            self.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
+            self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
             logger.info(f"Company data ready for {ticker} (CIK: {cik})")
             
             # Get local filing list
@@ -1247,10 +1271,10 @@ class SECDataScraperApp:
         # Calculate fiscal year and quarter if possible
         fiscal_year = None
         fiscal_quarter = None
-        if hasattr(self, 'current_company_data') and self.current_company_data:
+        if hasattr(self._thread_local, 'current_company_data') and self._thread_local.current_company_data:
             try:
                 from utilities.helpers.period_utils import FiscalYearCalculator
-                fiscal_year_end = self.current_company_data.get('fiscalYearEnd', '1231')
+                fiscal_year_end = self._thread_local.current_company_data.get('fiscalYearEnd', '1231')
                 if report_period:
                     report_end_date = datetime.strptime(report_period, '%Y-%m-%d')
                     fiscal_year, quarter_num = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
@@ -1273,7 +1297,17 @@ class SECDataScraperApp:
         # Save XBRL zip to local replay cache (idempotent; skipped for already-local files)
         if not is_local:
             self._save_xbrl_zip_to_cache(ticker, form_type, accession_number, cik)
-        
+
+        # Cache-first: if the XBRL zip is on disk (either pre-existing or just saved),
+        # read from cache instead of re-downloading via Arelle + SEC URL detection.
+        if not is_local:
+            cached_zip = self._xbrl_zip_cache_path_for(ticker, form_type, accession_number)
+            if cached_zip.exists():
+                logger.debug(f"Using cached XBRL zip for {accession_number}: {cached_zip}")
+                filing_info = dict(filing_info)  # don't mutate the original
+                filing_info['zip_file_path'] = str(cached_zip)
+                is_local = True
+
         # Generate a stable filing_id from the accession number (no DB write)
         filing_id = self._make_filing_id(accession_number)
         
@@ -1331,7 +1365,7 @@ class SECDataScraperApp:
         
         try:
             # Enrich company info with fiscal year information for this specific filing
-            company_info_enriched = getattr(self, 'current_company_data', None) or {}
+            company_info_enriched = getattr(self._thread_local, 'current_company_data', None) or {}
             
             # Calculate fiscal year and quarter for this filing to pass to XBRL parser
             if company_info_enriched and filing_info:
@@ -1437,7 +1471,7 @@ class SECDataScraperApp:
                     # Merged pipeline: normalize directly into normalize_data
                     # ----------------------------------------------------------
                     logger.debug(f"   Normalizing {statement_type} into normalize_data...")
-                    company_doc = getattr(self, 'current_company_doc', {}) or {}
+                    company_doc = getattr(self._thread_local, 'current_company_doc', {}) or {}
                     filing_doc_for_norm = {
                         '_id': filing_id,
                         'form_type': filing_info.get('form', filing_info.get('form_type', 'UNKNOWN')),
@@ -1662,64 +1696,96 @@ class SECDataScraperApp:
     
     def process_multiple_companies(self, ciks: List[str], resume: bool = True) -> Dict[str, bool]:
         """
-        Process multiple companies
-        
+        Process multiple companies, optionally in parallel.
+
         Args:
             ciks: List of company CIK identifiers
             resume: Whether to resume from previous progress (deprecated - no longer used)
-            
+
         Returns:
             dict: Results for each CIK
         """
-        results = {}
-        
+        results: Dict[str, Any] = {}
+
         logger.info(f"Processing {len(ciks)} companies: {ciks}")
         self.progress.status(f"\nProcessing {len(ciks)} companies...\n")
         self.progress.start_companies(len(ciks))
 
-        for i, cik in enumerate(ciks, 1):
-            try:
-                if self.progress.verbose:
-                    print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
+        if self.workers > 1:
+            # ── Parallel mode ──────────────────────────────────────────────
+            def _process_one(cik: str):
+                try:
+                    display = self.progress.label(
+                        cik, self.sec_client.get_ticker_from_cik(cik) or cik)
+                    stats = self.process_company(cik, summary=None)
+                    return cik, stats, display
+                except Exception as e:
+                    logger.error(f"Failed to process CIK {cik}: {e}")
+                    return cik, False, cik
 
-                logger.info(f"Starting processing for CIK: {cik}")
-                # Show which company is active in the outer bar immediately.
-                # Prefer the user-typed ticker, else the reverse CIK->ticker
-                # lookup, else the raw CIK.
-                display = self.progress.label(
-                    cik, self.sec_client.get_ticker_from_cik(cik) or cik)
-                self.progress.set_current_company(display, i)
-                stats = self.process_company(cik, summary=None)
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {executor.submit(_process_one, cik): cik for cik in ciks}
+                for future in as_completed(futures):
+                    cik, stats, display = future.result()
+                    ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
+                    if isinstance(stats, dict):
+                        results[cik] = stats
+                        self.progress.advance_company(
+                            ticker,
+                            stats.get('processed', 0),
+                            stats.get('skipped', 0),
+                            stats.get('failed', 0),
+                        )
+                        if not stats.get('success', False):
+                            self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
+                    else:
+                        results[cik] = {'ticker': display, 'success': bool(stats), 'processed': 0, 'skipped': 0, 'failed': 0}
+                        self.progress.advance_company(ticker, 0, 0, 0 if stats else 1)
+                        if not stats:
+                            self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
+        else:
+            # ── Sequential mode (existing behaviour) ───────────────────────
+            for i, cik in enumerate(ciks, 1):
+                try:
+                    if self.progress.verbose:
+                        print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
 
-                ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
-                if isinstance(stats, dict):
-                    results[cik] = stats.get('success', False)
-                    self.progress.advance_company(
-                        ticker,
-                        stats.get('processed', 0),
-                        stats.get('skipped', 0),
-                        stats.get('failed', 0),
-                    )
-                    if not results[cik]:
-                        self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
-                else:
-                    results[cik] = stats
-                    self.progress.advance_company(ticker, 0, 0, 0)
-                    if not stats:
-                        self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
-                
-                # Rate limiting between companies
-                time.sleep(1)
-                
-            except Exception as e:
-                logger.error(f"Failed to process CIK {cik}: {e}")
-                self.progress.error(f"  ❌ CIK {cik} failed: {e}")
-                self.progress.advance_company(cik, 0, 0, 1)
-                results[cik] = False
+                    logger.info(f"Starting processing for CIK: {cik}")
+                    display = self.progress.label(
+                        cik, self.sec_client.get_ticker_from_cik(cik) or cik)
+                    self.progress.set_current_company(display, i)
+                    stats = self.process_company(cik, summary=None)
+
+                    ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
+                    if isinstance(stats, dict):
+                        results[cik] = stats
+                        self.progress.advance_company(
+                            ticker,
+                            stats.get('processed', 0),
+                            stats.get('skipped', 0),
+                            stats.get('failed', 0),
+                        )
+                        if not stats.get('success', False):
+                            self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
+                    else:
+                        results[cik] = {'ticker': display, 'success': bool(stats), 'processed': 0, 'skipped': 0, 'failed': 0}
+                        self.progress.advance_company(ticker, 0, 0, 0)
+                        if not stats:
+                            self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
+
+                    # Brief pause between companies (rate limiter handles
+                    # per-request pacing; this gives a small inter-company gap)
+                    time.sleep(1)
+
+                except Exception as e:
+                    logger.error(f"Failed to process CIK {cik}: {e}")
+                    self.progress.error(f"  ❌ CIK {cik} failed: {e}")
+                    self.progress.advance_company(cik, 0, 0, 1)
+                    results[cik] = {'ticker': cik, 'success': False, 'processed': 0, 'skipped': 0, 'failed': 1, 'error': str(e)}
 
         self.progress.finish_companies()
         self.progress.status("\n✅ Processing complete")
-        
+
         return results
     
     def get_company_summary(self, cik: str) -> Dict[str, Any]:
@@ -2068,7 +2134,8 @@ def main():
         LoggerConfig.setup_logging(level='WARNING', console_output=False)
 
     # Build progress manager — verbose=False activates clean tqdm bars
-    progress = ProgressManager(verbose=is_verbose)
+    _workers = max(1, int(os.getenv('SEC_WORKERS', '1')))
+    progress = ProgressManager(verbose=is_verbose, parallel=_workers > 1)
 
     # Install a SIGINT handler so the first Ctrl+C immediately tears down the
     # progress bars (stopping any half-drawn refresh) before the normal
@@ -2486,6 +2553,7 @@ def main():
                 xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_reconciliation=not args.no_reconciliation,
                 progress=progress,
+                workers=_workers,
             )
             
             if not app.setup_database():
@@ -2496,22 +2564,46 @@ def main():
             results = app.process_multiple_companies(companies, resume=True)
         
         # Show results
-        successful = sum(1 for success in results.values() if success)
+        successful = sum(1 for s in results.values() if (s.get('success', False) if isinstance(s, dict) else bool(s)))
         total = len(results)
         
         print(f"\n{'='*50}")
         print(f"PROCESSING COMPLETE")
         print(f"{'='*50}")
-        print(f"Companies processed: {successful}/{total}")
+        
+        # Per-company breakdown
+        for cik, s in results.items():
+            if isinstance(s, dict):
+                ticker  = s.get('ticker', cik)
+                new_    = s.get('processed', 0)
+                skip_   = s.get('skipped', 0)
+                fail_   = s.get('failed', 0)
+                ok      = s.get('success', False)
+                parts = []
+                if new_:
+                    parts.append(f"{new_} new")
+                if skip_:
+                    parts.append(f"{skip_} skipped")
+                if fail_:
+                    parts.append(f"{fail_} failed")
+                if not parts:
+                    parts.append("no filings")
+                icon = "✅" if ok else "⚠️ "
+                print(f"  {icon} {ticker:<8} {', '.join(parts)}")
+            else:
+                icon = "✅" if s else "❌"
+                print(f"  {icon} {cik}")
+        
+        print(f"\nCompanies: {successful}/{total} succeeded")
         
         # Cleanup (only cleanup app if in online mode and app exists)
         if not args.local and app is not None:
             app.cleanup()
         
         if successful == total:
-            print(f"\nAll companies processed successfully!")
+            print("All companies processed successfully!")
         else:
-            print(f"\n{total - successful} companies had issues. Check logs for details.")
+            print(f"{total - successful} company/companies had issues. Run with --verbose for details.")
         
         print(f"\nFor more features, try: python sec_scraper_cli.py --help")
         

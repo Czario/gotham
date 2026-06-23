@@ -56,7 +56,7 @@ class EnhancedFinancialStatementProcessor:
                 self.ticker_to_cik = data.get('ticker_to_cik', {})
                 self.cik_to_ticker = {v: k for k, v in self.ticker_to_cik.items()}
         except Exception as e:
-            print(f"Warning: Could not load ticker mappings: {e}")
+            logger.warning(f"Could not load ticker mappings: {e}")
     
     def process_filing(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict] = None, filing_url: Optional[str] = None, is_local: bool = False) -> Optional[Dict]:
         """
@@ -85,7 +85,7 @@ class EnhancedFinancialStatementProcessor:
                 return self._process_online_filing(filing_info, company_cik, company_info, filing_url)
                 
         except Exception as e:
-            print(f"Error processing filing {filing_info.get('accessionNumber', 'unknown')}: {e}")
+            logger.error(f"Error processing filing {filing_info.get('accessionNumber', 'unknown')}: {e}")
             return None
     
     def _process_online_filing(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict] = None, filing_url: Optional[str] = None) -> Optional[Dict]:
@@ -101,11 +101,9 @@ class EnhancedFinancialStatementProcessor:
                 url_to_use = self._discover_xbrl_url(filing_info, company_cik)
                 if not url_to_use:
                     logger.error(f"❌ XBRL URL Discovery Failed for filing {accession_number}: Could not find XBRL file in SEC directory")
-                    print(f"Could not discover XBRL URL for filing {accession_number}")
                     return None
             except Exception as e:
                 logger.error(f"❌ XBRL URL Discovery Error for filing {accession_number}: {str(e)}")
-                print(f"Error discovering XBRL URL for filing {accession_number}: {e}")
                 return None
         
         logger.debug(f"Processing filing with Arelle: {url_to_use}")
@@ -148,7 +146,6 @@ class EnhancedFinancialStatementProcessor:
                 
                 if not financial_data:
                     logger.error(f"❌ XBRL Extraction Failed for filing {accession_number}: FlexibleXBRLExtractor returned None")
-                    print(f"Failed to extract XBRL data for filing {accession_number}: Extractor returned no data")
                     return None
                 
                 if not financial_data.get('statements'):
@@ -158,10 +155,8 @@ class EnhancedFinancialStatementProcessor:
                             f"the XBRL era or has no XBRL exhibits (and no companion amendment "
                             f"supplies them). Skipping."
                         )
-                        print(f"Skipping filing {accession_number}: no XBRL data available (pre-XBRL era)")
                         return None
                     logger.error(f"❌ No Statements Found in XBRL for filing {accession_number}: XBRL parsed but no financial statements identified")
-                    print(f"Failed to extract XBRL data for filing {accession_number}: No statements in parsed data")
                     return None
                 
                 reporting_period = extract_period_info_from_sec_api(filing_info, company_info or {})
@@ -169,7 +164,6 @@ class EnhancedFinancialStatementProcessor:
                 return self._convert_arelle_data_to_result(financial_data, filing_info, company_cik, reporting_period)
         except Exception as e:
             logger.error(f"❌ XBRL Extraction Exception for filing {accession_number}: {str(e)}")
-            print(f"Exception during XBRL extraction for filing {accession_number}: {e}")
             return None
     
     def _process_local_filing(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict] = None) -> Optional[Dict]:
@@ -185,7 +179,6 @@ class EnhancedFinancialStatementProcessor:
                 return None
         except Exception as e:
             logger.error(f"❌ Local XBRL Extraction Error for filing {accession_number}: {str(e)}")
-            print(f"Error extracting local XBRL file for filing {accession_number}: {e}")
             return None
         
         # Step 2: Use FlexibleXBRLExtractor to extract financial statements and filing info (SAME as online)
@@ -230,16 +223,13 @@ class EnhancedFinancialStatementProcessor:
                 
                 if not financial_data:
                     logger.error(f"❌ Local XBRL Extraction Failed for filing {accession_number}: FlexibleXBRLExtractor returned None")
-                    print(f"Failed to extract XBRL data for local filing {accession_number}: Extractor returned no data")
                     return None
                 
                 if not financial_data.get('statements'):
                     logger.error(f"❌ No Statements Found in Local XBRL for filing {accession_number}: XBRL parsed but no financial statements identified")
-                    print(f"Failed to extract XBRL data for local filing {accession_number}: No statements in parsed data")
                     return None
         except Exception as e:
             logger.error(f"❌ Local XBRL Extraction Exception for filing {accession_number}: {str(e)}")
-            print(f"Exception during local XBRL extraction for filing {accession_number}: {e}")
             return None
         
         # Step 3: Extract period info from XBRL data and create normalized filing_info
@@ -266,13 +256,13 @@ class EnhancedFinancialStatementProcessor:
         """Extract local XBRL file and return best file URL - clean, focused method"""
         zip_file_path = filing_info.get('zip_file_path')
         if not zip_file_path or not os.path.exists(zip_file_path):
-            print(f"Local XBRL file not found: {zip_file_path}")
+            logger.error(f"Local XBRL file not found: {zip_file_path}")
             return None
         
         # Extract and find best XBRL file
         xbrl_file_paths = self._extract_xbrl_from_zip(zip_file_path)
         if not xbrl_file_paths:
-            print(f"Could not extract any XBRL files from {zip_file_path}")
+            logger.warning(f"Could not extract any XBRL files from {zip_file_path}")
             return None
         
         # Return the best file as file:// URL (first in list is highest scored)
@@ -473,12 +463,12 @@ class EnhancedFinancialStatementProcessor:
                 candidate_files = [item[0] for item in potential_files]
                 
                 if candidate_files:
-                    print(f"Found {len(candidate_files)} potential XBRL files in {os.path.basename(zip_file_path)}")
+                    logger.debug(f"Found {len(candidate_files)} potential XBRL files in {os.path.basename(zip_file_path)}")
                     for i, (file_path, score, filename) in enumerate(potential_files[:5], 1):  # Show top 5
-                        print(f"  {i}. {filename} (score: {score})")
+                        logger.debug(f"  {i}. {filename} (score: {score})")
                 
         except Exception as e:
-            print(f"Error extracting XBRL files from {zip_file_path}: {e}")
+            logger.error(f"Error extracting XBRL files from {zip_file_path}: {e}")
             return []
         
         return candidate_files
@@ -1121,8 +1111,8 @@ class EnhancedFinancialStatementProcessor:
                     if verbose:
                         all_periods = [f"{pf['duration_months']:.1f}m" for pf in period_facts]
                         logger.debug(f"STRICT MODE: NO VALID QUARTERLY PERIODS for {end_date_key}")
-                        print(f"   All periods rejected: {all_periods}")
-                        print(f"   Required: Exactly 3.0 months (±{PeriodConfig.QUARTERLY_STRICT_TOLERANCE:.2f})")
+                        logger.debug(f"   All periods rejected: {all_periods}")
+                        logger.debug(f"   Required: Exactly 3.0 months (±{PeriodConfig.QUARTERLY_STRICT_TOLERANCE:.2f})")
                     continue  # Skip this entire end date - no valid periods
                 
                 valid_periods = strictly_quarterly_facts

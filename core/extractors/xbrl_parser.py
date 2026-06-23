@@ -193,7 +193,7 @@ class FlexibleXBRLExtractor:
                             break
             
             if not cik or not accession_number:
-                logger.warning(f"Could not extract CIK or accession number from URL: {filing_url}")
+                logger.debug(f"Could not extract CIK or accession number from URL: {filing_url}")
                 return filing_url
             
             # Extract filing date from accession number (YY-MMDDXX format)
@@ -1809,7 +1809,7 @@ class FlexibleXBRLExtractor:
                 
             except Exception as e:
                 # Log the error but continue processing other facts
-                print(f"⚠️  Error processing fact {getattr(fact, 'contextID', 'unknown')}: {e}")
+                logger.debug(f"Error processing fact {getattr(fact, 'contextID', 'unknown')}: {e}")
                 continue
         
         # Sort dimensional facts by period and dimension count for consistent ordering
@@ -2105,7 +2105,7 @@ class FlexibleXBRLExtractor:
                                 if rel.toModelObject is not None and hasattr(rel.toModelObject, 'qname'):
                                     presentation_concept_qnames.add(str(rel.toModelObject.qname))
                     except Exception as e:
-                        print(f"⚠️  Failed building presentation concept list: {e}")
+                        logger.debug(f"Failed building presentation concept list: {e}")
 
                     # Safeguard: pull concepts from previously built statements hierarchy if any
                     if not presentation_concept_qnames and self.statements:
@@ -2116,7 +2116,7 @@ class FlexibleXBRLExtractor:
                                     presentation_concept_qnames.add(str(concept_name))
 
                     if not presentation_concept_qnames:
-                        print("ℹ️  Presentation concept list empty after relationship scan; missing concept detection may under-report.")
+                        logger.debug("Presentation concept list empty after relationship scan; missing concept detection may under-report.")
                     else:
                         logger.debug(f"Collected {len(presentation_concept_qnames)} presentation concepts across link roles for enhancement baseline")
 
@@ -2156,7 +2156,7 @@ class FlexibleXBRLExtractor:
                                 dimensional_facts.append(enhanced_fact)
                                 
             except Exception as e:
-                print(f"⚠️  Enhanced dimensional extraction failed for {concept.qname}: {e}")
+                logger.debug(f"Enhanced dimensional extraction failed for {concept.qname}: {e}")
                 # Continue with standard extraction
                                 
         # Reuse cached enhanced results for subsequent concepts
@@ -2233,7 +2233,7 @@ class FlexibleXBRLExtractor:
                     self._extract_dimension_defaults(modelXbrl, concept, dimensional_facts)
                 
             except Exception as e:
-                print(f"⚠️  Error in comprehensive dimensional extraction for {concept.qname}: {e}")
+                logger.debug(f"Error in comprehensive dimensional extraction for {concept.qname}: {e}")
         
         # FINAL STEP: Apply period filtering to any enhanced facts that may have been added
         # Convert dimensional_facts back to fact-like objects for filtering, then back to dimensional format
@@ -2422,9 +2422,7 @@ class FlexibleXBRLExtractor:
                 del result['decimals']
             
         except Exception as e:
-            print(f"⚠️  Error extracting detailed dimensional fact: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.debug(f"Error extracting detailed dimensional fact: {e}")
             return None
     
     def _extract_dimension_defaults(self, modelXbrl, concept, dimensional_facts):
@@ -2441,7 +2439,7 @@ class FlexibleXBRLExtractor:
                         pass
                         
         except Exception as e:
-            print(f"⚠️  Error extracting dimension defaults: {e}")
+            logger.debug(f"Error extracting dimension defaults: {e}")
     
     def _extract_unit_measures(self, unit):
         """Extract comprehensive unit measure information using Arelle's unit model"""
@@ -2498,7 +2496,7 @@ class FlexibleXBRLExtractor:
             return unit_info
             
         except Exception as e:
-            print(f"⚠️  Error extracting unit measures: {e}")
+            logger.debug(f"Error extracting unit measures: {e}")
             return None
     
     def _extract_period_info(self, context):
@@ -2568,7 +2566,7 @@ class FlexibleXBRLExtractor:
             return period_info
             
         except Exception as e:
-            print(f"⚠️  Error extracting period info: {e}")
+            logger.debug(f"Error extracting period info: {e}")
             return None
     
     def _extract_fact_value(self, fact):
@@ -2660,7 +2658,7 @@ class FlexibleXBRLExtractor:
             return value
             
         except Exception as e:
-            print(f"⚠️  Error extracting fact value: {e}")
+            logger.debug(f"Error extracting fact value: {e}")
             return None
     
     def _extract_calculations(self, modelXbrl, concept):
@@ -2752,10 +2750,10 @@ class FlexibleXBRLExtractor:
             if primary_period_only:
                 primary_period = self._identify_primary_period(filing_info, statement_data['hierarchy'], statement_type)
                 if primary_period:
-                    print(f"🎯 Filtering {statement_type} to primary period: {self._format_period_display(primary_period)}")
+                    logger.debug(f"Filtering {statement_type} to primary period: {self._format_period_display(primary_period)}")
                     filtered_hierarchy = self._filter_hierarchy_to_primary_period(statement_data['hierarchy'], primary_period)
                 else:
-                    print(f"⚠️  No primary period found for {statement_type}, exporting all data")
+                    logger.debug(f"No primary period found for {statement_type}, exporting all data")
                     filtered_hierarchy = statement_data['hierarchy']
             else:
                 filtered_hierarchy = statement_data['hierarchy']
@@ -2800,7 +2798,7 @@ class FlexibleXBRLExtractor:
         """
         
         if not EXCEL_AVAILABLE:
-            print("⚠️  Excel export not available. Please install: pip install openpyxl xlsxwriter")
+            logger.warning("Excel export not available. Please install: pip install openpyxl xlsxwriter")
             return {}
         
         # Store the filtering preference for use in sheet creation
@@ -2980,14 +2978,14 @@ class FlexibleXBRLExtractor:
         if statement_type == 'balance_sheet':
             instant_period = primary_period_info.get('instant_period')
             if instant_period:
-                print(f"🎯 Primary period for {statement_type} from XBRL contexts: {instant_period}")
+                logger.debug(f"Primary period for {statement_type} from XBRL contexts: {instant_period}")
                 return instant_period
         
         # For income statement and cash flow, use duration period
         elif statement_type in ['income_statement', 'cash_flow']:
             duration_period = primary_period_info.get('duration_period')
             if duration_period:
-                print(f"🎯 Primary period for {statement_type} from XBRL contexts: {duration_period}")
+                logger.debug(f"Primary period for {statement_type} from XBRL contexts: {duration_period}")
                 return duration_period
         
         # If no statement type specified or no direct period found, use the old logic as fallback
@@ -2996,14 +2994,14 @@ class FlexibleXBRLExtractor:
         
         # Prefer duration period for most statements, instant for balance sheet-like data
         if duration_period:
-            print(f"🎯 Primary period from XBRL contexts (duration): {duration_period}")
+            logger.debug(f"Primary period from XBRL contexts (duration): {duration_period}")
             return duration_period
         elif instant_period:
-            print(f"🎯 Primary period from XBRL contexts (instant): {instant_period}")
+            logger.debug(f"Primary period from XBRL contexts (instant): {instant_period}")
             return instant_period
         
         # Fallback to old method if direct extraction failed
-        print("⚠️  Using fallback primary period identification")
+        logger.debug("Using fallback primary period identification")
         return self._identify_primary_period_fallback(filing_info, hierarchy)
     
     def _identify_primary_period_fallback(self, filing_info: Dict[str, Any], hierarchy: List[FinancialLineItem]) -> str:
@@ -3035,7 +3033,7 @@ class FlexibleXBRLExtractor:
         collect_all_periods(hierarchy)
         
         if not all_periods:
-            print("⚠️  No periods found in hierarchy")
+            logger.debug("No periods found in hierarchy")
             return ""
         
         # Parse document period end date for comparison
@@ -3055,7 +3053,7 @@ class FlexibleXBRLExtractor:
                         period_date = datetime.strptime(period.split(" ")[0], "%Y-%m-%d")
                         # Allow 1-2 days difference for fiscal year end dates
                         if abs((period_date - doc_end_date).days) <= 2:
-                            print(f"🎯 Primary period identified by document end date match: {period}")
+                            logger.debug(f"Primary period identified by document end date match: {period}")
                             return period
                     except ValueError:
                         continue
@@ -3068,7 +3066,7 @@ class FlexibleXBRLExtractor:
                             end_dt = datetime.strptime(parts[1].split(" ")[0], "%Y-%m-%d")
                             # Allow 1-2 days difference for fiscal year end dates
                             if abs((end_dt - doc_end_date).days) <= 2:
-                                print(f"🎯 Primary period identified by document end date match: {period}")
+                                logger.debug(f"Primary period identified by document end date match: {period}")
                                 return period
                         except ValueError:
                             continue
@@ -3107,23 +3105,23 @@ class FlexibleXBRLExtractor:
             # Sort by end date, most recent first
             fiscal_year_periods.sort(key=lambda x: x[1], reverse=True)
             most_recent_fiscal_year = fiscal_year_periods[0][0]
-            print(f"🎯 Primary period identified as most recent fiscal year: {most_recent_fiscal_year}")
+            logger.debug(f"Primary period identified as most recent fiscal year: {most_recent_fiscal_year}")
             return most_recent_fiscal_year
         
         # Strategy 3: If no fiscal year periods found, use the most recent instant period
         if instant_periods:
             instant_periods.sort(key=lambda x: x[1], reverse=True)
             most_recent_instant = instant_periods[0][0]
-            print(f"🎯 Primary period identified as most recent instant period: {most_recent_instant}")
+            logger.debug(f"Primary period identified as most recent instant period: {most_recent_instant}")
             return most_recent_instant
         
         # Strategy 4: Fallback to most recent period by string comparison
         if all_periods:
             primary_period = sorted(all_periods, reverse=True)[0]
-            print(f"🎯 Primary period fallback to most recent: {primary_period}")
+            logger.debug(f"Primary period fallback to most recent: {primary_period}")
             return primary_period
         
-        print("⚠️  No primary period could be identified")
+        logger.debug("No primary period could be identified")
         return ""
     
     def _collect_unique_periods(self, hierarchy: List[FinancialLineItem], filing_info: Optional[Dict[str, Any]] = None, primary_only: bool = False, statement_type: Optional[str] = None) -> Set[str]:
@@ -3502,7 +3500,7 @@ class FlexibleXBRLExtractor:
             
             wb.save(file_path)
         except Exception as e:
-            print(f"⚠️  Warning: Could not format consolidated workbook: {e}")
+            logger.warning(f"Could not format consolidated workbook: {e}")
     
     def _convert_hierarchy_to_json(self, hierarchy: List[FinancialLineItem], filing_info: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Convert FinancialLineItem hierarchy to JSON-serializable format"""

@@ -11,6 +11,7 @@ import time
 from typing import Optional, Dict, Tuple, List, Union
 from datetime import datetime
 import logging
+from utilities.sec_rate_limiter import _global_rate_limiter
 
 
 # Custom filter to suppress Arelle transformation namespace warnings
@@ -122,7 +123,7 @@ class SECURLDetector:
     def _get_json(self, url: str) -> Optional[Dict]:
         """Fetch and parse a JSON document from SEC, returning None on failure."""
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             response = self.session.get(url, timeout=15)
             if response.status_code == 200:
                 return response.json()
@@ -306,7 +307,7 @@ class SECURLDetector:
         
         # Try to get directory listing
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             response = self.session.get(directory_url, timeout=10)
             
             if response.status_code == 200:
@@ -325,7 +326,7 @@ class SECURLDetector:
         Returns the highest-scoring file that can be validated as a potential XBRL instance
         """
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             response = self.session.get(directory_url, timeout=10)
             
             if response.status_code != 200:
@@ -404,7 +405,7 @@ class SECURLDetector:
         Discover HTML filing from directory listing
         """
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             response = self.session.get(directory_url, timeout=10)
             
             if response.status_code != 200:
@@ -657,7 +658,7 @@ class SECURLDetector:
             bool: True if URL appears to be a valid XBRL/iXBRL file
         """
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             # Use HEAD request first to check if file exists
             response = self.session.head(url, timeout=5, allow_redirects=True)
             
@@ -774,7 +775,7 @@ class SECURLDetector:
     def _check_url_exists(self, url: str) -> bool:
         """Check if a URL exists (returns 200)"""
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             response = self.session.head(url, timeout=5, allow_redirects=True)
             return response.status_code == 200
         except Exception:
@@ -788,7 +789,7 @@ class SECURLDetector:
             Tuple of (success: bool, content: str, error_message: str)
         """
         try:
-            time.sleep(self.rate_limit_delay)
+            _global_rate_limiter.acquire()
             response = self.session.get(url, timeout=timeout)
             response.raise_for_status()
             return True, response.text, None
