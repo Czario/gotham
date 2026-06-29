@@ -193,18 +193,38 @@ class DuplicatePreventionManager:
         Returns:
             ObjectId if successful, None if insertion fails
         """
-        # SYNC BEHAVIOR: First check if this concept already exists by name
-        # This prevents creating duplicates when reprocessing
-        existing_by_name = self.concept_repo.find_existing(
-            concept_doc.company_cik,
-            concept_doc.statement_type,
-            concept_doc.concept,
-            dimension_concept=concept_doc.dimension_concept
-        )
-        
-        if existing_by_name:
-            logger.debug(f"Concept {concept_doc.concept} already exists (ID: {existing_by_name['_id']}), reusing it instead of creating new")
-            return existing_by_name['_id']
+        # SYNC BEHAVIOR: First check if this concept already exists.
+        # For dimensional concepts, uniqueness must include the parent concept
+        # relationship (concept_id). Reusing by member name alone (e.g.
+        # ProductMember) incorrectly collapses different parents like Revenue
+        # and CostOfGoodsAndServicesSold into the same dimensional concept.
+        if concept_doc.dimension_concept:
+            existing = self.concept_repo.find_dimensional_existing(
+                company_cik=concept_doc.company_cik,
+                statement_type=concept_doc.statement_type,
+                segment_type=concept_doc.segment_type or 'unknown',
+                concept=concept_doc.concept,
+                parent_concept_id=concept_doc.concept_id,
+                context_id=concept_doc.context_id,
+            )
+            if existing:
+                logger.debug(
+                    f"Dimensional concept {concept_doc.concept} already exists "
+                    f"for parent {concept_doc.concept_id} (ID: {existing['_id']}), "
+                    f"reusing it instead of creating new"
+                )
+                return existing['_id']
+        else:
+            existing_by_name = self.concept_repo.find_existing(
+                concept_doc.company_cik,
+                concept_doc.statement_type,
+                concept_doc.concept,
+                dimension_concept=concept_doc.dimension_concept
+            )
+
+            if existing_by_name:
+                logger.debug(f"Concept {concept_doc.concept} already exists (ID: {existing_by_name['_id']}), reusing it instead of creating new")
+                return existing_by_name['_id']
         
         # If concept doesn't exist by name, validate and adjust to prevent path-order conflicts
         adjusted_concept = self.validate_and_adjust_concept(concept_doc)
