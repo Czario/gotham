@@ -641,7 +641,7 @@ class EnhancedDimensionalExtractor:
         return True
 
     def _discover_missing_dimensional_concepts(self, modelXbrl, presentation_facts,
-                                               include_non_dimensional: bool = True) -> Dict[str, List]:
+                                               include_non_dimensional: bool = False) -> Dict[str, List]:
         """
         Discover concepts that don't appear in standard presentation relationships.
 

@@ -586,12 +586,20 @@ class FlexibleXBRLExtractor:
         
         from datetime import datetime
         
+        # Validate document_period_end looks like YYYY-MM-DD before trusting it.
+        # Old XBRL filings (pre-2012) may have numeric facts whose qname contains
+        # 'PeriodEnd' as a substring (e.g. share counts), causing garbage values.
+        _raw_doc_period = entity_info.get('document_period_end')
+        if _raw_doc_period and not re.match(r'^\d{4}-\d{2}-\d{2}$', str(_raw_doc_period).strip()):
+            logger.warning(f"Ignoring non-date document_period_end from XBRL entity info: {_raw_doc_period!r}")
+            _raw_doc_period = None
+
         primary_period_info = {
             'instant_period': None,           # For balance sheet (point in time)
             'duration_period': None,         # For income statement, cash flow (period)
             'fiscal_year_end': None,         # Fiscal year end date
             'fiscal_year': None,             # Fiscal year number
-            'document_period_end': entity_info.get('document_period_end'),
+            'document_period_end': _raw_doc_period,
             'fiscal_period': entity_info.get('fiscal_period')
         }
         

@@ -200,6 +200,18 @@ class ProgressManager:
             self._company_bar.close()
             self._company_bar = None
 
+    def set_status(self, msg: str) -> None:
+        """Update company bar description without changing progress count.
+
+        Use this for transient states like 'fetching...' or live filing counts
+        that are shown inside the company bar description area.
+        """
+        if self.verbose or self._company_bar is None:
+            return
+        with self._lock:
+            self._company_bar.set_description_str(msg)
+            self._company_bar.refresh()
+
     # -- One-line status (verbose suppressed) ------------------------------
     def status(self, msg: str) -> None:
         """Print a status line that appears above progress bars in clean mode."""
@@ -407,7 +419,7 @@ def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optio
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, xbrl_zip_cache_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -434,13 +446,6 @@ class SECDataScraperApp:
                 "SEC_HTML_DOWNLOAD_PATH is not set. Please set SEC_HTML_DOWNLOAD_PATH in your .env "
                 "file (e.g. SEC_HTML_DOWNLOAD_PATH=/Users/aijaz/sec_html_filings) before running."
             )
-        self.xbrl_zip_cache_path = xbrl_zip_cache_path or os.getenv('XBRL_ZIP_CACHE_PATH')
-        if not self.xbrl_zip_cache_path:
-            raise RuntimeError(
-                "XBRL_ZIP_CACHE_PATH is not set. Please set XBRL_ZIP_CACHE_PATH in your .env "
-                "file (e.g. XBRL_ZIP_CACHE_PATH=/Users/aijaz/xbrl_zip_cache) before running."
-            )
-
         # Lightweight dedup tracker — only stores accession_number + metadata, no raw data
         from pymongo import MongoClient as _MongoClient
         _mongo_uri = os.getenv('MONGODB_URI')
@@ -493,40 +498,6 @@ class SECDataScraperApp:
         self.financial_transformer = FinancialDataTransformer()
         
         logger.info("SEC Data Scraper initialized successfully")
-
-    # ------------------------------------------------------------------
-    # XBRL zip replay-cache helpers
-    # ------------------------------------------------------------------
-
-    def _xbrl_zip_cache_path_for(self, ticker: str, form_type: str, accession_number: str) -> Path:
-        """Return local path for this filing's cached XBRL zip."""
-        form_dir = '10-K' if '10-K' in form_type else '10-Q'
-        return Path(self.xbrl_zip_cache_path) / ticker / form_dir / f"{accession_number}.zip"
-
-    def _save_xbrl_zip_to_cache(self, ticker: str, form_type: str, accession_number: str,
-                                 cik: str) -> None:
-        """Download and save the XBRL zip to the local replay cache (idempotent)."""
-        dest = self._xbrl_zip_cache_path_for(ticker, form_type, accession_number)
-        if dest.exists():
-            logger.debug(f"XBRL zip already cached: {dest}")
-            return
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            # Build SEC EDGAR zip URL
-            clean_accession = accession_number.replace('-', '')
-            zip_url = (
-                f"https://www.sec.gov/Archives/edgar/data/"
-                f"{int(cik)}/{clean_accession}/{accession_number}-xbrl.zip"
-            )
-            import requests as _req
-            resp = _req.get(zip_url, headers={'User-Agent': self.sec_client.user_agent}, timeout=30)
-            if resp.status_code == 200 and resp.content:
-                dest.write_bytes(resp.content)
-                logger.info(f"Cached XBRL zip: {dest} ({len(resp.content):,} bytes)")
-            else:
-                logger.debug(f"XBRL zip not available at {zip_url} (status {resp.status_code}), skipping cache")
-        except Exception as e:
-            logger.debug(f"Could not cache XBRL zip for {accession_number}: {e}")
 
     # ------------------------------------------------------------------
     # Quarterly accumulator helpers
@@ -662,6 +633,9 @@ class SECDataScraperApp:
                 effective_start_year = self.start_year
             
             # Step 1: Fetch company information from SEC API
+            # Show 'fetching' in the progress bar during the network call (can take several seconds)
+            _label_hint = self.progress.label(cik, cik)
+            self.progress.set_status(f"{_label_hint:<6} fetching filings...")
             filings_list = []  # Initialize to avoid unbound variable
             if self.reload:
                 logger.info(f"🔄 RELOAD mode: refreshing data for CIK: {cik}")
@@ -743,13 +717,15 @@ class SECDataScraperApp:
             
             # Create per-company filing progress bar
             filing_iterator = target_filings
-            # Update outer bar immediately with the real ticker
-            self.progress.set_current_company(ticker)
-            filing_bar = self.progress.filing_bar(ticker, len(target_filings))
+            total_target = len(target_filings)
+            # Update outer bar: show total filing count so user knows what's ahead
+            self.progress.set_status(f"{ticker:<6} 0/{total_target} filings")
+            filing_bar = self.progress.filing_bar(ticker, total_target)
             for i, filing in enumerate(filing_iterator, 1):
                 accession_number = filing.get('accessionNumber', '')
                 form_type = filing.get('form', '')
-                filing_bar.set_description_str(f"{ticker:<6} {form_type} {accession_number[-9:] if accession_number else ''}")
+                filing_date_short = (filing.get('filingDate') or '')[:7]  # YYYY-MM
+                filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} ⬇ net")
                 filing_bar.update(1)
                 
                 # Log to summary file
@@ -777,13 +753,13 @@ class SECDataScraperApp:
                             self.sec_client.download_html_filing(cik, accession_number, filing_date or '2010-01-01', self.html_download_path, ticker)
                         filings_skipped += 1
                         if summary:
-                            summary.log_filing_progress(ticker, i, len(target_filings), accession_number, "skipped")
+                            summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
                         continue
                     else:
                         logger.debug(f"📋 Filing {accession_number} exists but outside target period, skipping")
                         filings_skipped += 1
                         if summary:
-                            summary.log_filing_progress(ticker, i, len(target_filings), accession_number, "skipped")
+                            summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
                         continue
                 elif existing_filing and self.reload:
                     should_reload = True
@@ -799,24 +775,28 @@ class SECDataScraperApp:
                         continue
                 
                 # Process individual filing with full SEC API data
-                processing_result = self.process_filing_with_full_data(cik, filing, is_local=False)
+                processing_result = self.process_filing_with_full_data(cik, filing)
                 
                 if processing_result:
                     filings_processed += 1
                     # Log to summary
                     if summary:
-                        summary.log_filing_progress(ticker, i, len(target_filings), accession_number, "processed")
+                        summary.log_filing_progress(ticker, i, total_target, accession_number, "processed")
                 else:
-                    # Log section header on first failure (disabled to avoid clutter)
-                    # if not session_header_logged:
-                    #     self.failure_logger.log_section_header(ticker, cik, f"Processing Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    #     session_header_logged = True
-                    
                     filings_failed += 1
                     # Log to summary
                     if summary:
-                        summary.log_filing_progress(ticker, i, len(target_filings), accession_number, "failed")
-                
+                        summary.log_filing_progress(ticker, i, total_target, accession_number, "failed")
+
+                # Update company bar with live filing counts
+                _done = filings_processed + filings_skipped + filings_failed
+                _parts = [f"{filings_processed}✓"]
+                if filings_skipped:
+                    _parts.append(f"{filings_skipped}⏭")
+                if filings_failed:
+                    _parts.append(f"{filings_failed}❌")
+                self.progress.set_status(f"{ticker:<6} {' '.join(_parts)} / {total_target}")
+
                 # Rate limiting to respect SEC API guidelines
                 time.sleep(0.1)
             
@@ -907,7 +887,7 @@ class SECDataScraperApp:
             logger.info(f"Processing filing {accession_number} for {company_name} ({ticker})")
             
             # Process the filing
-            success = self.process_filing_with_full_data(cik, target_filing, is_local=False)
+            success = self.process_filing_with_full_data(cik, target_filing)
 
             if success:
                 logger.info(f"✅ Successfully processed filing {accession_number}")
@@ -933,17 +913,6 @@ class SECDataScraperApp:
             return filings_list
         
         from utilities.helpers.period_utils import FiscalYearCalculator
-        
-        # Check if these are local filings (they won't have reportDate)
-        has_report_dates = any(filing.get('reportDate') for filing in filings_list)
-        
-        if not has_report_dates:
-            # These are local filings - period information is not readily available
-            logger.warning("⚠️  Fiscal year/quarter filtering is not available for local XBRL files")
-            logger.warning("💡 Period information must be extracted from XBRL content, which is not implemented")
-            logger.warning("💡 Consider using online mode (without --local) for fiscal period filtering")
-            logger.warning(f"🔄 Processing all {len(filings_list)} local filings instead")
-            return filings_list
         
         fiscal_year_end_code = company_data.get('fiscalYearEnd')
         if not fiscal_year_end_code:
@@ -1042,224 +1011,26 @@ class SECDataScraperApp:
             logger.debug(f"Could not calculate fiscal year for filing {filing.get('accessionNumber', 'unknown')}: {e}")
             return True  # Include it to be safe
 
-    def process_company_local(self, ticker: str, filing_limit: Optional[int] = None) -> Dict[str, Any]:
-        """
-        Process a company's local XBRL files using the same pipeline as online processing
-        
-        Args:
-            ticker: Company ticker symbol (e.g., 'AAPL')
-            filing_limit: Maximum number of filings to process (None for all)
-            
-        Returns:
-            Processing results summary
-        """
-        company_start_time = time.time()
-        
-        # Get CIK from ticker
-        cik = self.financial_processor.ticker_to_cik.get(ticker)
-        if not cik:
-            return {'error': f'No CIK found for ticker {ticker}'}
-        
-        try:
-            logger.info(f"Processing company {ticker} (CIK: {cik}) from local XBRL files")
-            
-            # Get company data from SEC API for fiscal year end and other metadata
-            try:
-                company_data, _ = self.sec_client.get_company_submissions(cik)
-                if not company_data:
-                    logger.warning(f"Could not fetch company data from SEC API for {ticker} (CIK: {cik}), using fallback")
-                    company_data = {
-                        'cik': cik,
-                        'ticker': ticker,
-                        'name': f'{ticker} Company',
-                        'sic': None,
-                        'sicDescription': None,
-                        'entityType': None,
-                        'category': None,
-                        'fiscalYearEnd': '1231'  # Default fallback
-                    }
-                else:
-                    logger.info(f"✅ Fetched company metadata from SEC API: fiscal year end = {company_data.get('fiscalYearEnd', 'N/A')}")
-            except Exception as e:
-                logger.warning(f"Failed to fetch company data from SEC API for {ticker}: {e}, using fallback")
-                company_data = {
-                    'cik': cik,
-                    'ticker': ticker,
-                    'name': f'{ticker} Company',
-                    'sic': None,
-                    'sicDescription': None,
-                    'entityType': None,
-                    'category': None,
-                    'fiscalYearEnd': '1231'  # Default fallback
-                }
-            
-            self._thread_local.current_company_data = company_data
-            if self.reload:
-                logger.info(f"🔄 RELOAD mode: refreshing data for {ticker} (CIK: {cik})")
-            company_doc = self.company_transformer.transform_company_data(company_data)
-            self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
-            logger.info(f"Company data ready for {ticker} (CIK: {cik})")
-            
-            # Get local filing list
-            local_filings = self._get_local_filing_list(ticker, filing_limit)
-            if not local_filings:
-                error_msg = f"No local XBRL files found for {ticker}"
-                return {'error': error_msg}
-            
-            logger.info(f"Found {len(local_filings)} local filings for {ticker}")
-            
-            # Apply fiscal year/quarter filtering if specified
-            if self.target_fiscal_year or self.target_fiscal_quarter:
-                local_filings = self._filter_filings_by_fiscal_period(local_filings, company_data)
-                logger.info(f"After fiscal year/quarter filtering: {len(local_filings)} local filings")
-            
-            # Process filings with existence checks and reload logic
-            filings_processed = 0
-            filings_skipped = 0
-            filings_failed = 0
-            
-            # Track if we've logged the section header for this session
-            session_header_logged = False
-            
-            for filing_info in local_filings:
-                accession_number = filing_info.get('accessionNumber')
-                
-                # Skip if accession number is missing
-                if not accession_number:
-                    logger.warning(f"Skipping local filing with missing accession number: {filing_info}")
-                    continue
-                
-                # Check if filing already processed (via lightweight tracker)
-                existing_filing = self._processed_col.find_one({'_id': accession_number})
-
-                if existing_filing and not self.reload:
-                    should_process = True
-                    if self.target_fiscal_year or self.target_fiscal_quarter:
-                        should_process = self._should_process_filing_for_period(filing_info, company_data)
-                    if should_process:
-                        logger.debug(f"📋 Local filing {accession_number} already processed, skipping")
-                        filings_skipped += 1
-                        continue
-                    else:
-                        logger.debug(f"📋 Local filing {accession_number} outside target period, skipping")
-                        filings_skipped += 1
-                        continue
-                elif existing_filing and self.reload:
-                    should_reload = True
-                    if self.target_fiscal_year or self.target_fiscal_quarter:
-                        should_reload = self._should_process_filing_for_period(filing_info, company_data)
-                    if should_reload:
-                        logger.info(f"🔄 RELOAD: Removing tracker entry for local filing {accession_number}")
-                        self._processed_col.delete_one({'_id': accession_number})
-                    else:
-                        logger.debug(f"📋 Local filing {accession_number} outside reload period, skipping")
-                        filings_skipped += 1
-                        continue
-                
-                # Process each filing
-                processing_result = self.process_filing_with_full_data(cik, filing_info, is_local=True)
-                
-                if processing_result:
-                    filings_processed += 1
-                else:
-                    # Log section header on first failure (disabled to avoid clutter)
-                    # if not session_header_logged:
-                    #     self.failure_logger.log_section_header(ticker, cik, f"Local Processing Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    #     session_header_logged = True
-                    pass
-                    
-                    filings_failed += 1
-            
-            # Log processing summary for this stock (disabled to avoid clutter)
-            # if local_filings and filings_failed > 0:
-            #     self.failure_logger.log_processing_summary(
-            #         ticker, cik,
-            #         total_filings=len(local_filings),
-            #         successful=filings_processed,
-            #         failed=filings_failed,
-            #         skipped=filings_skipped
-            #     )
-            
-            # Calculate processing stats
-            # Run quarterly deaccumulation for this company (uses in-memory accumulator)
-            self._flush_quarterly_accumulator(cik)
-
-            # Fill genuine extraction gaps from SEC companyfacts (edge mode)
-            self._run_companyfacts_reconciliation(cik)
-
-            processing_time = time.time() - company_start_time
-            
-            logger.info(f"Processed {filings_processed} filings, skipped {filings_skipped} existing filings for company {ticker} (CIK: {cik})")
-            return {
-                'ticker': ticker,
-                'cik': cik,
-                'total_filings': len(local_filings),
-                'processed_successfully': filings_processed,
-                'skipped': filings_skipped,
-                'failed': filings_failed,
-                'results': [],
-                'processing_time': processing_time
-            }
-            
-        except Exception as e:
-            error_msg = f"Error processing company {ticker} (CIK: {cik}): {e}"
-            logger.error(error_msg)
-            return {'error': error_msg}
-    
-    def _get_local_filing_list(self, ticker: str, filing_limit: Optional[int] = None) -> List[Dict]:
-        """Get list of local XBRL filings in SEC API format for uniform processing"""
-        from pathlib import Path
-        
-        local_xbrl_directory = self.xbrl_zip_cache_path
-        company_dir = Path(local_xbrl_directory) / ticker
-        
-        if not company_dir.exists():
-            return []
-        
-        # Find all zip files and convert to SEC API format
-        local_filings = []
-        for form_dir in company_dir.iterdir():
-            if form_dir.is_dir() and form_dir.name in ['10-K', '10-Q']:
-                for zip_file in form_dir.glob('*.zip'):
-                    # Convert to SEC API format for uniform processing
-                    filing_info = {
-                        'accessionNumber': zip_file.stem,
-                        'form': form_dir.name,
-                        'filingDate': '2023-01-01',  # Default for local files
-                        'acceptanceDateTime': '2023-01-01T00:00:00.000Z',
-                        'zip_file_path': str(zip_file),  # Local-specific field
-                        'ticker': ticker  # Local-specific field
-                    }
-                    local_filings.append(filing_info)
-        
-        # Sort by accession number (newest first) and apply limit
-        local_filings.sort(key=lambda x: x['accessionNumber'], reverse=True)
-        if filing_limit:
-            local_filings = local_filings[:filing_limit]
-        
-        return local_filings
-    
     @safe_processing_operation("filing_processing", default_return=False)
-    def process_filing_with_full_data(self, cik: str, filing_info: Dict, is_local: bool = False) -> bool:
+    def process_filing_with_full_data(self, cik: str, filing_info: Dict) -> bool:
         """
-        Process a filing with full data (unified method for both online and local)
-        
+        Process a filing with full data (online mode).
+
         Args:
             cik: Company CIK identifier
             filing_info: Complete filing information
-            is_local: Whether this is a local filing or online SEC filing
-            
+
         Returns:
             bool: True if processing successful, False otherwise
         """
         # Validate required fields
         required_fields = ['accessionNumber', 'form']
-        if not validate_required_fields(filing_info, required_fields, f"process_filing_with_full_data ({'local' if is_local else 'online'})"):
+        if not validate_required_fields(filing_info, required_fields, "process_filing_with_full_data"):
             return False
         
         accession_number: str = filing_info['accessionNumber']  # Type assertion after validation
         form_type: str = filing_info['form']  # Type assertion after validation
-        filing_type = "local" if is_local else "online"
+        filing_type = "online"
         
         # Get ticker for failure logging (always ensure it's a string)
         ticker = self.sec_client.get_ticker_from_cik(cik) or f"CIK_{cik}"
@@ -1284,43 +1055,29 @@ class SECDataScraperApp:
             except Exception as e:
                 logger.debug(f"Could not calculate fiscal period: {e}")
         
-        logger.info(f"Processing {filing_type} filing {accession_number} for CIK: {cik}")
+        logger.info(f"Processing online filing {accession_number} for CIK: {cik}")
         
-        # Build SEC URL for online filings
-        sec_url = None if is_local else self._build_sec_url(cik, accession_number)
+        # Build SEC URL
+        sec_url = self._build_sec_url(cik, accession_number)
         
-        # Download HTML filing if requested and not processing local files
-        if self.html_download_path and not is_local:
+        # Download HTML filing if requested
+        if self.html_download_path:
             filing_date_for_download = filing_info.get('filingDate', filing_info.get('reportDate', '2010-01-01'))
             self.sec_client.download_html_filing(cik, accession_number, filing_date_for_download, self.html_download_path, ticker)
 
-        # Save XBRL zip to local replay cache (idempotent; skipped for already-local files)
-        if not is_local:
-            self._save_xbrl_zip_to_cache(ticker, form_type, accession_number, cik)
-
-        # Cache-first: if the XBRL zip is on disk (either pre-existing or just saved),
-        # read from cache instead of re-downloading via Arelle + SEC URL detection.
-        if not is_local:
-            cached_zip = self._xbrl_zip_cache_path_for(ticker, form_type, accession_number)
-            if cached_zip.exists():
-                logger.debug(f"Using cached XBRL zip for {accession_number}: {cached_zip}")
-                filing_info = dict(filing_info)  # don't mutate the original
-                filing_info['zip_file_path'] = str(cached_zip)
-                is_local = True
-
         # Generate a stable filing_id from the accession number (no DB write)
         filing_id = self._make_filing_id(accession_number)
-        
-        # Process financial statements (unified method)
-        statements_processed = self.process_financial_statements_enhanced(cik, accession_number, filing_id, filing_info, is_local)
-        
+
+        # Process financial statements (online only)
+        statements_processed = self.process_financial_statements_enhanced(cik, accession_number, filing_id, filing_info, is_local=False)
+
         url_info = f" - URL: {sec_url}" if sec_url else ""
-        
+
         # Determine if processing was successful
         if statements_processed > 0:
             log_operation_result(
-                f"{filing_type.capitalize()} filing {accession_number}{url_info}", 
-                True, 
+                f"{filing_type.capitalize()} filing {accession_number}{url_info}",
+                True,
                 f"Statements: {statements_processed}"
             )
             return True
@@ -2085,10 +1842,6 @@ def main():
         help='Skip dimensional (segment / product / geography) data extraction. '
              'Dimensions are enabled by default.')
     proc.add_argument(
-        '--local', action='store_true',
-        help='Read XBRL zip files from XBRL_ZIP_CACHE_PATH instead of '
-             'downloading from the SEC API.')
-    proc.add_argument(
         '--no-reconciliation', action='store_true',
         help='Disable the post-processing gap-fill step that back-fills missing '
              'periods from SEC companyfacts (enabled by default).')
@@ -2179,9 +1932,6 @@ def main():
         if args.companies or args.file or args.tickers:
             print("❌ --url cannot be used with --companies, --file, or --tickers")
             sys.exit(1)
-        if args.local:
-            print("❌ --url cannot be used with --local (local processing mode)")
-            sys.exit(1)
         if args.only_download_files:
             print("❌ --url cannot be used with --only-download-files")
             sys.exit(1)
@@ -2240,7 +1990,6 @@ def main():
                 reload=args.reload,
                 incremental=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
-                xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
                 enable_reconciliation=not args.no_reconciliation,
                 progress=progress,
             )
@@ -2401,10 +2150,7 @@ def main():
                 else:
                     print(f"Start year: {args.year}")
             print(f"{'='*50}")
-            if args.local:
-                print("LOCAL PROCESSING MODE - Using offline XBRL zip files")
-            else:
-                print("ONLINE PROCESSING MODE - Downloading from SEC API")
+            print("ONLINE PROCESSING MODE - Downloading from SEC API")
             if args.no_dimensions:
                 print("Dimensions processing DISABLED")
             else:
@@ -2452,116 +2198,26 @@ def main():
             
             sys.exit(0)
         
-        if args.local:
-            # Use full scraper app for local XBRL files with database storage
-            database_config = DatabaseConfig()
-            scraper_app = SECDataScraperApp(
-                database_config=database_config,
-                start_year=args.year or 2010,
-                end_year=args.end_year,
-                enable_dimensions=not args.no_dimensions,
-                target_fiscal_year=args.fiscal_year,
-                target_fiscal_quarter=args.fiscal_quarter,
-                reload=args.reload,
-                html_download_path=html_download_path,
-                xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
-                enable_reconciliation=not args.no_reconciliation,
-                progress=progress,
-            )
-            
-            # Convert CIKs to tickers for local processing
-            if args.verbose:
-                print("Converting CIKs to tickers for local processing...")
-            tickers_to_process = []
-            
-            # Load ticker mappings
-            import json
-            with open('tickers.json', 'r') as f:
-                ticker_data = json.load(f)
-            cik_to_ticker = {v: k for k, v in ticker_data.get('ticker_to_cik', {}).items()}
-            
-            for cik in companies:
-                # Normalize CIK (remove leading zeros for lookup)
-                normalized_cik = str(int(cik)) if cik.isdigit() else cik
-                
-                # Try both original CIK and normalized CIK
-                ticker = cik_to_ticker.get(cik) or cik_to_ticker.get(normalized_cik)
-                
-                if ticker:
-                    tickers_to_process.append(ticker)
-                    if args.verbose:
-                        print(f"  CIK {cik} → {ticker}")
-                else:
-                    if args.verbose:
-                        print(f"  CIK {cik} not found in ticker mappings, skipping")
-            
-            if not tickers_to_process:
-                print("No valid tickers found for local processing")
-                sys.exit(1)
-            
-            print(f"\nProcessing {len(tickers_to_process)} companies locally: {', '.join(tickers_to_process)}")
-            
-            # Process companies using unified financial processor
-            results = {}
-            for ticker in tickers_to_process:
-                print(f"\n🏢 Processing {ticker}...")
-                try:
-                    result = scraper_app.process_company_local(ticker, filing_limit=None)
-                    
-                    # Check for errors in the result
-                    if 'error' in result:
-                        print(f"❌ {ticker}: {result['error']}")
-                        results[ticker] = False
-                        continue
-                    
-                    success = result.get('processed_successfully', 0) > 0
-                    results[ticker] = success
-                    
-                    if success:
-                        total_statements = sum(len(r.get('statements', [])) for r in result.get('results', []) if r.get('status') == 'success')
-                        print(f"✅ {ticker}: {result.get('processed_successfully', 0)} filings processed, {total_statements} statements extracted")
-                    else:
-                        failed_count = result.get('failed', 0)
-                        print(f"❌ {ticker}: {failed_count} failures out of {result.get('total_filings', 0)} filings")
-                        
-                        # Show failed filing details only in verbose mode
-                        if args.verbose:
-                            failed_results = [r for r in result.get('results', []) if r.get('status') in ['failed', 'error']]
-                            for failed_result in failed_results[:3]:  # Show first 3 failures
-                                accession = failed_result.get('accession_number', 'unknown')
-                                error_msg = failed_result.get('error', 'unknown error')
-                                print(f"    💥 {accession}: {error_msg}")
-                    
-                except Exception as e:
-                    print(f"❌ {ticker}: Exception - {e}")
-                    results[ticker] = False
-                    
-            # No app to cleanup in local mode
-            app = None
-            
-        else:
-            # Use standard online processing
-            app = SECDataScraperApp(
-                start_year=args.year, 
-                end_year=args.end_year,
-                enable_dimensions=not args.no_dimensions, 
-                target_fiscal_year=args.fiscal_year,
-                target_fiscal_quarter=args.fiscal_quarter,
-                reload=args.reload,
-                incremental=args.incremental,
-                html_download_path=html_download_path,
-                xbrl_zip_cache_path=os.getenv('XBRL_ZIP_CACHE_PATH'),
-                enable_reconciliation=not args.no_reconciliation,
-                progress=progress,
-                workers=_workers,
-            )
-            
-            if not app.setup_database():
-                print("Failed to setup database")
-                sys.exit(1)
-            
-            # Process companies
-            results = app.process_multiple_companies(companies, resume=True)
+        app = SECDataScraperApp(
+            start_year=args.year,
+            end_year=args.end_year,
+            enable_dimensions=not args.no_dimensions,
+            target_fiscal_year=args.fiscal_year,
+            target_fiscal_quarter=args.fiscal_quarter,
+            reload=args.reload,
+            incremental=args.incremental,
+            html_download_path=html_download_path,
+            enable_reconciliation=not args.no_reconciliation,
+            progress=progress,
+            workers=_workers,
+        )
+
+        if not app.setup_database():
+            print("Failed to setup database")
+            sys.exit(1)
+        
+        # Process companies
+        results = app.process_multiple_companies(companies, resume=True)
         
         # Show results
         successful = sum(1 for s in results.values() if (s.get('success', False) if isinstance(s, dict) else bool(s)))
@@ -2596,8 +2252,8 @@ def main():
         
         print(f"\nCompanies: {successful}/{total} succeeded")
         
-        # Cleanup (only cleanup app if in online mode and app exists)
-        if not args.local and app is not None:
+        # Cleanup
+        if app is not None:
             app.cleanup()
         
         if successful == total:
