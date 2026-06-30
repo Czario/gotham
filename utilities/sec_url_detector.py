@@ -233,15 +233,17 @@ class SECURLDetector:
         """
         directory_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{clean_accession}/"
         txt_url = f"{directory_url}{accession_number}.txt"
-        
-        # Try to discover actual files from directory listing
+
+        # Discover XBRL files; _discover_xbrl_from_directory populates self._last_xbrl_candidates
         xbrl_url = self._discover_xbrl_from_directory(directory_url, accession_number)
+        xbrl_candidates = list(getattr(self, '_last_xbrl_candidates', []))
         html_url = self._discover_html_from_directory(directory_url, accession_number)
-        
+
         return {
             'directory_url': directory_url,
             'txt_url': txt_url,
             'xbrl_url': xbrl_url or txt_url,  # Fallback to txt if XBRL not found
+            'xbrl_candidates': xbrl_candidates,
             'html_url': html_url,
             'is_legacy': False
         }
@@ -262,24 +264,27 @@ class SECURLDetector:
         if self._check_url_exists(directory_url):
             logger.debug(f"Legacy filing has accessible directory: {directory_url}")
             xbrl_url = self._discover_xbrl_from_directory(directory_url, accession_number)
+            xbrl_candidates = list(getattr(self, '_last_xbrl_candidates', []))
             html_url = self._discover_html_from_directory(directory_url, accession_number)
         else:
             # Directory not accessible - use alternative patterns
             logger.debug(f"Legacy filing directory not accessible, trying alternative patterns")
             xbrl_url = self._try_legacy_xbrl_patterns(cik, accession_number, clean_accession)
+            xbrl_candidates = [xbrl_url] if xbrl_url else []
             html_url = self._try_legacy_html_patterns(cik, accession_number, clean_accession)
-        
+
         # For very old filings, the .txt file might be in a parent directory
         if not self._check_url_exists(txt_url):
             # Try alternative .txt location
             alt_txt_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{accession_number}.txt"
             if self._check_url_exists(alt_txt_url):
                 txt_url = alt_txt_url
-        
+
         return {
             'directory_url': directory_url,
             'txt_url': txt_url,
             'xbrl_url': xbrl_url or txt_url,  # Fallback to txt
+            'xbrl_candidates': xbrl_candidates,
             'html_url': html_url,
             'is_legacy': True
         }
@@ -320,84 +325,97 @@ class SECURLDetector:
     
     def _discover_xbrl_from_directory(self, directory_url: str, accession_number: str) -> Optional[str]:
         """
-        Discover XBRL file from directory listing with fallback validation
-        Priority: .htm (iXBRL) > _htm.xml > .xml > .txt
-        
-        Returns the highest-scoring file that can be validated as a potential XBRL instance
+        Discover XBRL file from directory listing with fallback validation.
+        Returns the highest-scoring validated candidate URL, or None.
+
+        Also populates ``self._last_xbrl_candidates`` with the full ordered list of
+        validated (URL-accessible) candidate URLs so callers can iterate through
+        fallbacks without a second network round-trip.
         """
+        self._last_xbrl_candidates: List[str] = []
+
         try:
             _global_rate_limiter.acquire()
             response = self.session.get(directory_url, timeout=10)
-            
+
             if response.status_code != 200:
                 logger.debug(f"Directory not accessible: {directory_url} (HTTP {response.status_code})")
                 return None
-            
-            # Parse directory listing
+
+            # Parse directory listing and score every relevant file
             file_links = self._parse_file_links(response.text)
-            
-            # Score and prioritize XBRL files
-            xbrl_candidates = []
-            
+            scored = []
             for filename in file_links:
-                # Include .htm files for iXBRL (modern filings), .xml for traditional XBRL, and .txt as fallback
                 if filename.lower().endswith(('.htm', '.html', '.xml', '.txt')):
                     score = self._score_xbrl_file(filename, accession_number)
                     if score > 0:
-                        xbrl_candidates.append({
-                            'filename': filename,
-                            'url': directory_url + filename,
-                            'score': score
-                        })
-            
-            if xbrl_candidates:
-                # Sort by score (highest first)
-                xbrl_candidates.sort(key=lambda x: x['score'], reverse=True)
-                
-                logger.debug(f"Found {len(xbrl_candidates)} XBRL candidates, selecting best...")
-                
-                # HIGH-CONFIDENCE FAST PATH: ticker-date pattern files (score >= 90) are highly
-                # reliable instance documents. Trust _validate_xbrl_url alone for these —
-                # spinning up a full Arelle controller per candidate is extremely expensive and
-                # almost always ends in the fallback anyway for older filings.
-                HIGH_CONFIDENCE_SCORE = 90
+                        scored.append({'filename': filename, 'url': directory_url + filename, 'score': score})
 
-                for i, candidate in enumerate(xbrl_candidates, 1):
-                    logger.debug(f"  [{i}/{len(xbrl_candidates)}] Trying: {candidate['filename']} (score: {candidate['score']})")
-                    
-                    if not self._validate_xbrl_url(candidate['url']):
-                        logger.debug(f"      ❌ Failed basic validation (not accessible or not XBRL-like)")
-                        continue
-                    
-                    if candidate['score'] >= HIGH_CONFIDENCE_SCORE:
-                        # Ticker-date pattern — URL content check is sufficient
-                        logger.debug(f"      ✅ High-confidence XBRL instance accepted: {candidate['filename']} (score: {candidate['score']})")
-                        return candidate['url']
-                    
-                    # For lower-confidence candidates, use full Arelle validation
-                    if self._validate_xbrl_instance(candidate['url']):
-                        logger.info(f"✅ Found valid XBRL instance: {candidate['filename']} (score: {candidate['score']})")
-                        return candidate['url']
-                    else:
-                        logger.debug(f"      ❌ Not a valid XBRL instance (Arelle check failed)")
-                
-                # Fallback: return highest-scored candidate that is at least URL-accessible
-                for candidate in xbrl_candidates:
-                    if self._validate_xbrl_url(candidate['url']):
-                        logger.debug(f"Using highest accessible candidate as fallback: {candidate['filename']} (score: {candidate['score']})")
-                        return candidate['url']
-                
-                # Last resort: return top candidate without any validation
-                best = xbrl_candidates[0]
-                logger.warning(f"⚠️  All XBRL candidates failed URL validation, using top-scored: {best['filename']} (score: {best['score']})")
-                return best['url']
-            else:
+            if not scored:
                 logger.warning(f"No XBRL files found in directory: {directory_url}")
                 return None
-        
+
+            scored.sort(key=lambda x: x['score'], reverse=True)
+            logger.debug(f"Found {len(scored)} XBRL candidates, validating in priority order...")
+
+            # HIGH-CONFIDENCE FAST PATH: files scoring >= 90 are trusted with URL-only validation.
+            # Only high-confidence candidates (score >= 90) are ever included as fallbacks.
+            # Low-score files like R*.xml XBRL-viewer fragments (score ~60) are excluded on purpose:
+            # they are not XBRL instance documents and would only cause rate-limit hammering.
+            HIGH_CONFIDENCE_SCORE = 90
+
+            # Collect all confidently-validated candidates in score order
+            for i, candidate in enumerate(scored, 1):
+                url = candidate['url']
+                logger.debug(f"  [{i}/{len(scored)}] {candidate['filename']} (score: {candidate['score']})")
+
+                # Skip low-confidence candidates entirely — no HTTP request made
+                if candidate['score'] < HIGH_CONFIDENCE_SCORE:
+                    logger.debug(f"      ⏭ Score {candidate['score']} < {HIGH_CONFIDENCE_SCORE}, skipping")
+                    continue
+
+                # High-confidence candidates are trusted by filename pattern alone.
+                # The SEC directory listing already confirmed the file is present — no
+                # additional HTTP check is needed or desirable. Transient HEAD failures
+                # under load would otherwise silently drop valid XBRL files. Arelle's
+                # own load step in extract_financial_statements() handles any real failures.
+                logger.debug(f"      ✅ High-confidence instance accepted (trusted by directory listing)")
+                self._last_xbrl_candidates.append(url)
+
+            if self._last_xbrl_candidates:
+                best = self._last_xbrl_candidates[0]
+                logger.info(f"✅ Best XBRL candidate: {best.split('/')[-1]} "
+                            f"({len(self._last_xbrl_candidates)} total candidates available)")
+                return best
+
+            # Fallback: try Arelle-validation for lower-confidence candidates (one at a time,
+            # stopping at the first one that passes — avoids bulk HTTP hammering)
+            for candidate in scored:
+                if candidate['score'] >= HIGH_CONFIDENCE_SCORE:
+                    continue  # already tried above
+                url = candidate['url']
+                if self._validate_xbrl_url(url) and self._validate_xbrl_instance(url):
+                    logger.info(f"✅ Lower-confidence XBRL instance validated: {candidate['filename']}")
+                    self._last_xbrl_candidates.append(url)
+                    return url
+
+            # Absolute last resort — use top-scored accessible URL without validation
+            for candidate in scored:
+                if self._validate_xbrl_url(candidate['url']):
+                    logger.warning(f"⚠️  All candidates failed validation; using top-scored accessible: "
+                                   f"{candidate['filename']}")
+                    self._last_xbrl_candidates = [candidate['url']]
+                    return candidate['url']
+
+            fallback = scored[0]['url']
+            logger.warning(f"⚠️  All candidates failed URL validation; using top-scored as last resort: "
+                           f"{scored[0]['filename']}")
+            self._last_xbrl_candidates = [fallback]
+            return fallback
+
         except Exception as e:
             logger.debug(f"Error discovering XBRL from directory: {e}")
-        
+
         return None
     
     def _discover_html_from_directory(self, directory_url: str, accession_number: str) -> Optional[str]:
@@ -506,21 +524,26 @@ class SECURLDetector:
                 score += 5
             return score
         
-        # Tier 1b: Modern .htm iXBRL files with ticker-date pattern (e.g., nflx-20241231.htm)
-        # This is the PRIMARY format for modern filings (2019+)
+        # Tier 1b: Modern iXBRL _htm.xml files (e.g., msft-20240930_htm.xml)
+        # This is the SEC-generated "EXTRACTED XBRL INSTANCE DOCUMENT" — the authoritative
+        # instance for modern iXBRL filings. Preferred over the raw .htm because some
+        # companies (e.g. Wells Fargo 10-K) embed financial facts only in an EX-13 exhibit
+        # while the main .htm is a narrative document sharing the same presentation linkbase.
+        # The _htm.xml always contains the complete, consolidated set of facts.
+        if filename_lower.endswith('_htm.xml'):
+            score = 125
+            # Bonus if matches accession number
+            if accession_number.replace('-', '') in filename:
+                score += 20
+            return score
+
+        # Tier 1c: Modern .htm iXBRL files with ticker-date pattern (e.g., nflx-20241231.htm)
+        # Used as fallback when _htm.xml is not present (e.g. very early iXBRL filings).
         if filename_lower.endswith('.htm') and re.search(r'[a-z]{2,5}-\d{8}\.htm$', filename_lower):
             score = 110
             # Small bonus for short ticker (more likely to be correct)
             if len(filename) < 25:
                 score += 5
-            return score
-        
-        # Tier 1c: Modern iXBRL _htm.xml files (e.g., msft-20240930_htm.xml)
-        if filename_lower.endswith('_htm.xml'):
-            score = 100
-            # Bonus if matches accession number
-            if accession_number.replace('-', '') in filename:
-                score += 20
             return score
         
         # Tier 2: Ticker-date XBRL pattern (e.g., msft-20141231.xml)

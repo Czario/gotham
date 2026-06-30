@@ -213,6 +213,12 @@ class FlexibleXBRLExtractor:
             if detected_urls and isinstance(detected_urls, dict):
                 xbrl_url = detected_urls.get('xbrl_url')
 
+                # Store the full ordered candidate list for fallback use in extract_financial_statements
+                self._xbrl_candidates = [
+                    u for u in detected_urls.get('xbrl_candidates', [])
+                    if isinstance(u, str)
+                ]
+
                 # If the detector resolved a real XBRL instance, use it directly.
                 if xbrl_url and isinstance(xbrl_url, str) and not self.url_detector.is_txt_fallback(detected_urls):
                     logger.info(f"✅ SECURLDetector found optimal XBRL file: {xbrl_url}")
@@ -278,16 +284,46 @@ class FlexibleXBRLExtractor:
                     'processing_time': time.time() - start_time
                 }
             
-            # Load XBRL document directly
-            logger.debug(f"Loading XBRL document from: {optimal_url}")
-            modelXbrl = self.model_manager.load(optimal_url)
-            
+            # Load XBRL document, trying each validated candidate in priority order
+            # until one produces actual facts.  Most filings need only the first try;
+            # the fallback handles cases like WFC 10-K where the primary .htm is a
+            # narrative document and the data lives in the _htm.xml extracted instance.
+            candidates_to_try = list(getattr(self, '_xbrl_candidates', []))
+            # Ensure the resolved optimal_url is always the first candidate tried
+            if optimal_url not in candidates_to_try:
+                candidates_to_try.insert(0, optimal_url)
+
+            modelXbrl = None
+            used_url = optimal_url
+            for attempt, candidate_url in enumerate(candidates_to_try):
+                logger.debug(f"Loading XBRL document (attempt {attempt + 1}/{len(candidates_to_try)}): {candidate_url}")
+                model = self.model_manager.load(candidate_url)
+                if not model:
+                    logger.warning(f"   Arelle failed to load: {candidate_url}")
+                    continue
+                fact_count = len(model.facts) if hasattr(model, 'facts') else -1
+                if fact_count == 0 and attempt < len(candidates_to_try) - 1:
+                    logger.warning(
+                        f"   ⚠️  {candidate_url.split('/')[-1]} loaded but has 0 facts — "
+                        f"trying next candidate..."
+                    )
+                    continue
+                modelXbrl = model
+                used_url = candidate_url
+                if attempt > 0:
+                    logger.info(f"   ✅ Fallback candidate succeeded: {candidate_url.split('/')[-1]} "
+                                f"({fact_count} facts)")
+                break
+
             if not modelXbrl:
-                raise Exception("Failed to load XBRL filing")
-            
+                raise Exception("Failed to load XBRL filing from any candidate")
+
+            if used_url != optimal_url:
+                logger.info(f"🔄 Using fallback XBRL source: {used_url}")
+
             # Store modelXbrl reference for use in dimensional extraction
             self.current_model = modelXbrl
-            
+
             # Reset dimensional enhancement cache for new filing
             if hasattr(self, '_dimensional_enhancement_completed'):
                 delattr(self, '_dimensional_enhancement_completed')
@@ -299,7 +335,7 @@ class FlexibleXBRLExtractor:
             
             # Extract filing information
             filing_info = self._extract_filing_info(modelXbrl)
-            filing_info['resolved_url'] = optimal_url  # Track which URL was actually used
+            filing_info['resolved_url'] = used_url     # Track which URL was actually used
             filing_info['original_url'] = filing_url   # Track original input URL
             
             # Extract dimensional analysis summary
