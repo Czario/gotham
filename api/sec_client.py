@@ -47,20 +47,10 @@ class SECAPIClient:
         self._load_ticker_mappings()
     
     def _load_ticker_mappings(self):
-        """Load ticker mappings from tickers.json for folder organization"""
+        """Load ticker mappings from SEC API (cached in memory for the process lifetime)."""
         try:
-            import json
-            from pathlib import Path
-            
-            tickers_file = Path("tickers.json")
-            if tickers_file.exists():
-                with open(tickers_file, 'r') as f:
-                    ticker_data = json.load(f)
-                # Create CIK to ticker mapping
-                ticker_to_cik = ticker_data.get('ticker_to_cik', {})
-                self.cik_to_ticker = {v: k for k, v in ticker_to_cik.items()}
-            else:
-                self.cik_to_ticker = {}
+            from utilities.helpers.ticker_resolver import get_cik_to_ticker
+            self.cik_to_ticker = get_cik_to_ticker()
         except Exception as e:
             logger.warning(f"Failed to load ticker mappings: {e}")
             self.cik_to_ticker = {}

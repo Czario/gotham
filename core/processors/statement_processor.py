@@ -47,14 +47,11 @@ class EnhancedFinancialStatementProcessor:
         self._load_ticker_mappings()
     
     def _load_ticker_mappings(self):
-        """Load ticker to CIK mappings from tickers.json"""
+        """Load ticker to CIK mappings from SEC API (cached in memory for the process lifetime)."""
         try:
-            tickers_path = Path("tickers.json")
-            if tickers_path.exists():
-                with open(tickers_path, 'r') as f:
-                    data = json.load(f)
-                self.ticker_to_cik = data.get('ticker_to_cik', {})
-                self.cik_to_ticker = {v: k for k, v in self.ticker_to_cik.items()}
+            from utilities.helpers.ticker_resolver import get_ticker_to_cik, get_cik_to_ticker
+            self.ticker_to_cik = get_ticker_to_cik()
+            self.cik_to_ticker = get_cik_to_ticker()
         except Exception as e:
             logger.warning(f"Could not load ticker mappings: {e}")
     

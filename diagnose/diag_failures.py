@@ -1,9 +1,9 @@
 """Find which accessions failed - query DB directly and run verbose on one."""
 import dotenv
 dotenv.load_dotenv()
-import json
 from database.config.mongodb_config import DatabaseConfig
 from api.sec_client import SECAPIClient
+from utilities.helpers.ticker_resolver import resolve_ticker, get_cik_to_name
 
 db = DatabaseConfig().get_database()
 assert db is not None, "Could not connect to MongoDB"
@@ -12,16 +12,13 @@ col = db['processed_accessions']
 processed = set(col.distinct('_id'))
 print(f"Processed accessions in DB: {len(processed)}")
 
-with open('tickers.json') as f:
-    tdata = json.load(f)
-
+cik_to_name = get_cik_to_name()
 client = SECAPIClient()
 for ticker in ['WFC', 'FDS']:
-    entry = next((v for v in tdata.values() if v.get('ticker') == ticker), None)
-    if not entry:
+    cik = resolve_ticker(ticker)
+    if not cik:
         print(f"No entry for {ticker}"); continue
-    cik = str(entry['cik_str']).zfill(10)
-    print(f"\n{ticker} (CIK {cik})")
+    print(f"\n{ticker} (CIK {cik}) — {cik_to_name.get(cik, '?')}")
 
     # Count processed for this CIK
     done = col.count_documents({'cik': cik})

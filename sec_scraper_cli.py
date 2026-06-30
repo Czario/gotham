@@ -377,44 +377,20 @@ def parse_sec_filing_url(url: str) -> Optional[Dict[str, str]]:
         return None
 
 def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optional[int] = None, verbose: bool = False) -> List[str]:
-    """Load company CIKs from tickers.json file"""
-    import json
-    from pathlib import Path
-    
-    tickers_path = Path(tickers_file)
-    if not tickers_path.exists():
-        print(f"❌ Tickers file not found: {tickers_file}")
-        return []
-    
+    """Load company CIKs from the live SEC company_tickers.json API (tickers_file arg is ignored)."""
     try:
-        with open(tickers_path, 'r') as f:
-            data = json.load(f)
-        
-        # Extract CIKs from ticker_to_cik mapping
-        ticker_to_cik = data.get('ticker_to_cik', {})
-        companies = list(ticker_to_cik.values())
-        
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_companies = []
-        for cik in companies:
-            if cik not in seen:
-                seen.add(cik)
-                unique_companies.append(cik)
-        
-        # Apply limit if specified
+        from utilities.helpers.ticker_resolver import get_ticker_to_cik
+        ticker_to_cik = get_ticker_to_cik()
+        companies = list(dict.fromkeys(ticker_to_cik.values()))  # deduplicated, order preserved
         if limit is not None and limit > 0:
-            unique_companies = unique_companies[:limit]
-        
+            companies = companies[:limit]
         if verbose:
-            print(f"📈 Loaded {len(unique_companies)} companies from {tickers_file}")
+            print(f"📈 Loaded {len(companies):,} companies from SEC API")
             if limit:
                 print(f"🎯 Limited to first {limit} companies")
-            
-        return unique_companies
-        
+        return companies
     except Exception as e:
-        print(f"❌ Error reading tickers file: {e}")
+        print(f"❌ Error loading companies from SEC API: {e}")
         return []
 
 class SECDataScraperApp:
@@ -2022,12 +1998,10 @@ def main():
         # Load companies
         companies = []
         if args.companies:
-            import json as _json
             import re as _re
             try:
-                with open('tickers.json', 'r') as _tf:
-                    _ticker_data = _json.load(_tf)
-                    _ticker_map = {k.upper(): v for k, v in _ticker_data.get('ticker_to_cik', {}).items()}
+                from utilities.helpers.ticker_resolver import get_ticker_to_cik as _get_ticker_to_cik
+                _ticker_map = {k.upper(): v for k, v in _get_ticker_to_cik().items()}
             except Exception:
                 _ticker_map = {}
 
@@ -2059,9 +2033,8 @@ def main():
 
                 # Load ticker -> CIK mapping once (case-insensitive keys)
                 try:
-                    with open('tickers.json', 'r') as tf:
-                        ticker_data = json.load(tf)
-                        ticker_map = {k.upper(): v for k, v in ticker_data.get('ticker_to_cik', {}).items()}
+                    from utilities.helpers.ticker_resolver import get_ticker_to_cik
+                    ticker_map = {k.upper(): v for k, v in get_ticker_to_cik().items()}
                 except Exception:
                     ticker_map = {}
 
