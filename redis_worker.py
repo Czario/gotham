@@ -1,16 +1,14 @@
 """Redis consumer: process 10-K / 10-Q filings published by admin_backend.
 
-Listens to the shared Redis queue, filters for 10-K and 10-Q messages,
-and runs the **exact same pipeline** as:
+Listens to the **dedicated** ``sec:filings:10kq`` queue (set via
+``REDIS_QUEUE_NAME`` env var, default ``sec:filings:10kq``).
+admin_backend publishes 10-K/10-Q messages here and 8-K messages to a
+separate queue consumed by the earning_scraping_agent worker.  Each worker
+only ever sees its own messages — no re-queue loops.
 
-    uv run sec-scraper --url <filing_url>
-
-The only difference from the CLI is the trigger source:
+Pipeline mirrors ``uv run sec-scraper --url <filing_url>`` exactly:
   CLI    → sec-scraper --url <url>  → parse CIK + accession → pipeline
   Worker → Redis message            → parse CIK + accession → same pipeline
-
-8-K messages are re-queued so the earning_scraping_agent worker can
-consume them without losing any messages.
 """
 from __future__ import annotations
 
@@ -31,7 +29,7 @@ from utilities.helpers.logger_config import LoggerConfig
 
 logger = logging.getLogger(__name__)
 
-# Form types handled by this worker. 8-K belongs to earning_scraping_agent.
+_DEFAULT_QUEUE = "sec:filings:10kq"
 _HANDLED_TYPES = frozenset({"10-K", "10-Q", "10-K/A", "10-Q/A"})
 
 
@@ -128,9 +126,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--redis-url",
                         default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
     parser.add_argument("--queue-name",
-                        default=os.getenv("REDIS_QUEUE_NAME", "sec:filings"))
+                        default=os.getenv("REDIS_QUEUE_NAME", _DEFAULT_QUEUE))
     parser.add_argument("--dead-letter-queue",
-                        default=os.getenv("REDIS_DEAD_LETTER_QUEUE", "sec:filings:dlq"))
+                        default=os.getenv("REDIS_DEAD_LETTER_QUEUE", "sec:filings:dlq:10kq"))
     parser.add_argument("--poll-timeout", type=int, default=5,
                         help="Seconds to block-wait for a Redis message.")
     parser.add_argument("--max-attempts", type=int,
@@ -180,13 +178,12 @@ def main(argv: list[str] | None = None) -> None:
                     break
                 continue
 
-            # Route by form type — only handle 10-K/10-Q; re-queue 8-K for
-            # the earning_scraping_agent worker so no messages are lost.
             form_type = (payload.get("filing_type") or payload.get("form_type") or "").upper()
 
-            if form_type and form_type not in _HANDLED_TYPES:
-                logger.debug("Re-queuing %s filing (handled by earning_scraping_agent)", form_type)
-                client.rpush(queue_name, raw_message)
+            if form_type not in _HANDLED_TYPES:
+                # Dedicated queue: only 10-K/10-Q messages should arrive here.
+                # Log and skip anything unexpected without re-queuing.
+                logger.warning("Unexpected form_type %r on 10-K/Q queue — skipping", form_type)
                 if args.once:
                     break
                 continue
