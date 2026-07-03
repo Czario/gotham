@@ -146,6 +146,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 
+def _make_client(redis_url: str, poll_timeout: int) -> Redis:
+    """Create a Redis client suitable for blocking blpop.
+
+    socket_timeout must be None (no socket-level deadline) so the blocking
+    BLPOP command can wait the full poll_timeout seconds without the socket
+    layer raising TimeoutError.  socket_connect_timeout is kept short so a
+    bad URL fails fast at startup.
+    """
+    return Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=None,  # no socket-level timeout — blpop controls waiting
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
@@ -156,14 +172,24 @@ def main(argv: list[str] | None = None) -> None:
 
     queue_name = normalize_queue_name(args.queue_name)
     dead_letter_queue = normalize_queue_name(args.dead_letter_queue)
-    client: Redis = get_redis_client(args.redis_url)
+    client: Redis = _make_client(args.redis_url, args.poll_timeout)
 
     app = _build_app()
     logger.info("sec-scraper-worker listening on Redis queue '%s'", queue_name)
 
     try:
         while True:
-            item = client.blpop(queue_name, timeout=args.poll_timeout)
+            try:
+                item = client.blpop(queue_name, timeout=args.poll_timeout)
+            except Exception as exc:
+                logger.warning("Redis blpop error (%s) — reconnecting in 5s", exc)
+                time.sleep(5)
+                try:
+                    client = _make_client(args.redis_url, args.poll_timeout)
+                except Exception:
+                    pass
+                continue
+
             if not item:
                 if args.once:
                     break

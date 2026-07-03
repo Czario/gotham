@@ -1,0 +1,46 @@
+# Standalone compose file for the 10-K / 10-Q XBRL extraction worker.
+# Runs independently — no dependency on admin_backend's compose stack.
+#
+# Usage:
+#   cp env.example .env          # fill in MONGODB_URI
+#   docker compose up -d
+#   docker compose logs -f worker-10kq
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  worker-10kq:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL:              redis://redis:6379/0
+      REDIS_QUEUE_NAME:       ${REDIS_QUEUE_NAME:-sec:filings:10kq}
+      MONGODB_URI:            ${MONGODB_URI:-mongodb://host.docker.internal:27017/}
+      DATABASE_NAME:          ${DATABASE_NAME:-normalize_data}
+      SEC_HTML_DOWNLOAD_PATH: ${SEC_HTML_DOWNLOAD_PATH:-/app/sec_html_filings}
+      PYTHONUNBUFFERED:       "1"
+    volumes:
+      - ${SEC_HTML_DOWNLOAD_PATH:-/Users/aijaz/sec_html_filings}:/app/sec_html_filings
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  redis-data:
