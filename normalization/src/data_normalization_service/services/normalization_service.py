@@ -1556,7 +1556,31 @@ class FinancialNormalizationService:
         
         # Filter out metadata axes to get meaningful dimensions
         meaningful_dimensions = {k: v for k, v in dimensions.items() if k != 'explicitMember'}
-        
+
+        # Skip aggregate/total-segment members that duplicate the consolidated value.
+        # e.g. nflx:ReportableSegmentMember, srt:OperatingSegmentsMember (alone),
+        # AllSegmentsMember.  These are "we only have one segment" or "sum of all segments"
+        # declarations that equal the parent line-item value exactly.
+        # Reconciling/elimination members (MaterialReconcilingItemsMember, EliminationsMember)
+        # are internal accounting adjustments, not real segment breakdowns.
+        _AGGREGATE_MEMBER_SUFFIXES = (
+            'reportablesegmentmember',      # *ReportableSegmentMember - total of all reportable segs
+            'reportablesegmentsmember',     # plural variant
+            'allsegmentsmember',            # *AllSegmentsMember - all segments combined
+            'operatingsegmentsmember',      # srt:OperatingSegmentsMember when used as sole member
+            'materialsreconcilingitemsmember',  # srt:MaterialReconcilingItemsMember
+            'materialreconcilingitemsmember',
+            'eliminationsmember',           # srt:EliminationsMember
+            'intersegmenteliminationmember',  # us-gaap:IntersegmentEliminationMember
+            'intersubsegmenteliminationsmember',
+        )
+        all_member_values = [v for v in meaningful_dimensions.values() if isinstance(v, str)]
+        if all_member_values and all(
+            any(v.lower().endswith(sfx) for sfx in _AGGREGATE_MEMBER_SUFFIXES)
+            for v in all_member_values
+        ):
+            return 'unknown', 'unknown'
+
         # Prioritized mapping of axis types based on actual data patterns
         segment_type = None
         concept = None

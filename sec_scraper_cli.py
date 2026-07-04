@@ -430,8 +430,14 @@ class SECDataScraperApp:
         _database_name = os.getenv('DATABASE_NAME')
         if not _database_name:
             raise RuntimeError("DATABASE_NAME environment variable is required. Set it in your .env file.")
-        self._processed_col = _MongoClient(_mongo_uri)[_database_name]['processed_accessions']
-        self._processed_col.create_index('cik')
+
+        # Dedup is derived from the actual concept_values collections — no separate tracker needed.
+        _norm_db = _MongoClient(_mongo_uri)['normalize_data']
+        self._cv_annual_col    = _norm_db['concept_values_annual']
+        self._cv_quarterly_col = _norm_db['concept_values_quarterly']
+        # Ensure the index that makes accession lookups fast exists (idempotent)
+        self._cv_annual_col.create_index('reporting_period.accession_number', background=True)
+        self._cv_quarterly_col.create_index('reporting_period.accession_number', background=True)
 
         # ---------------------------------------------------------------------------
         # Normalizer (merged pipeline) — writes directly to normalize_data
@@ -575,14 +581,21 @@ class SECDataScraperApp:
         return ObjectId(hashlib.md5(accession_number.encode()).hexdigest()[:24])
 
     def get_latest_filing_date(self, cik: str) -> Optional[str]:
-        """Get the latest processed filing date for a company from the tracker collection."""
+        """Get the most recent period end date already stored for a company."""
         try:
-            latest = self._processed_col.find_one(
-                {'cik': cik},
-                sort=[('processed_at', -1)]
-            )
-            if latest and 'processed_at' in latest:
-                return latest['processed_at'].strftime('%Y-%m-%d')
+            latest = None
+            for col in (self._cv_annual_col, self._cv_quarterly_col):
+                doc = col.find_one(
+                    {'company_cik': cik},
+                    sort=[('reporting_period.end_date', -1)],
+                    projection={'reporting_period.end_date': 1}
+                )
+                if doc:
+                    end_dt = doc.get('reporting_period', {}).get('end_date')
+                    if end_dt and (latest is None or end_dt > latest):
+                        latest = end_dt
+            if latest:
+                return latest.strftime('%Y-%m-%d') if hasattr(latest, 'strftime') else str(latest)[:10]
             return None
         except Exception as e:
             logger.error(f"Error getting latest filing date for CIK {cik}: {e}")
@@ -715,8 +728,12 @@ class SECDataScraperApp:
                     logger.warning(f"Skipping filing with missing accession number: {filing}")
                     continue
                 
-                # Check if filing already processed (via lightweight tracker)
-                existing_filing = self._processed_col.find_one({'_id': accession_number})
+                # Check if filing already processed by querying concept_values directly
+                _acc_filter = {'reporting_period.accession_number': accession_number}
+                existing_filing = (
+                    self._cv_annual_col.find_one(_acc_filter, projection={'_id': 1})
+                    or self._cv_quarterly_col.find_one(_acc_filter, projection={'_id': 1})
+                )
 
                 if existing_filing and not self.reload:
                     should_process = True
@@ -743,8 +760,10 @@ class SECDataScraperApp:
                         should_reload = self._should_process_filing_for_period(filing, company_data)
 
                     if should_reload:
-                        logger.info(f"🔄 RELOAD: Removing tracker entry for {accession_number}")
-                        self._processed_col.delete_one({'_id': accession_number})
+                        logger.info(f"🔄 RELOAD: Deleting existing values for {accession_number}")
+                        _acc_filter = {'reporting_period.accession_number': accession_number}
+                        self._cv_annual_col.delete_many(_acc_filter)
+                        self._cv_quarterly_col.delete_many(_acc_filter)
                     else:
                         logger.debug(f"📋 Filing {accession_number} outside reload period, skipping")
                         filings_skipped += 1
@@ -1217,13 +1236,6 @@ class SECDataScraperApp:
                         statements_processed += 1
                         statements_with_data += 1
                         logger.info(f"✅ Normalized {statement_type} statement into normalize_data")
-                        # Record this accession as processed (upsert — idempotent)
-                        self._processed_col.update_one(
-                            {'_id': accession_number},
-                            {'$set': {'cik': cik, 'form_type': filing_doc_for_norm['form_type'],
-                                      'processed_at': datetime.now()}},
-                            upsert=True
-                        )
                         # Accumulate slim copy for quarterly deaccumulation pass
                         self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
                         # Log period information
@@ -1524,12 +1536,31 @@ class SECDataScraperApp:
     def get_company_summary(self, cik: str) -> Dict[str, Any]:
         """Get comprehensive summary for a company"""
         try:
-            processed = list(self._processed_col.find({'cik': cik}).sort('processed_at', -1).limit(10))
+            accessions = sorted({
+                doc['reporting_period']['accession_number']
+                for col in (self._cv_annual_col, self._cv_quarterly_col)
+                for doc in col.find(
+                    {'company_cik': cik, 'reporting_period.accession_number': {'$exists': True}},
+                    projection={'reporting_period.accession_number': 1, 'reporting_period.end_date': 1}
+                )
+                if doc.get('reporting_period', {}).get('accession_number')
+            })
+            latest_end = None
+            for col in (self._cv_annual_col, self._cv_quarterly_col):
+                doc = col.find_one(
+                    {'company_cik': cik},
+                    sort=[('reporting_period.end_date', -1)],
+                    projection={'reporting_period.end_date': 1}
+                )
+                if doc:
+                    ed = doc.get('reporting_period', {}).get('end_date')
+                    if ed and (latest_end is None or ed > latest_end):
+                        latest_end = ed
             return {
                 'cik': cik,
-                'processed_filings': len(processed),
-                'recent_accessions': [p['_id'] for p in processed],
-                'last_updated': processed[0]['processed_at'] if processed else None,
+                'processed_filings': len(accessions),
+                'recent_accessions': list(accessions)[-10:],
+                'last_updated': latest_end.strftime('%Y-%m-%d') if latest_end and hasattr(latest_end, 'strftime') else (str(latest_end)[:10] if latest_end else None),
             }
         except Exception as e:
             logger.error(f"Error getting company summary for CIK {cik}: {e}")

@@ -1122,34 +1122,6 @@ class EnhancedFinancialStatementProcessor:
         
         return normalized
 
-    def _should_include_dimension_variation(self, dimensions: List[Dict]) -> bool:
-        """
-        Determine if a dimensional variation should be included based on business rules
-        
-        Args:
-            dimensions: List of dimension dictionaries
-            
-        Returns:
-            Boolean indicating whether to include this variation
-        """
-        
-        # Skip variations with certain patterns
-        skip_patterns = [
-            'consolidation',
-            'elimination', 
-            'intersegment',
-            'corporate',
-            'adjustments',
-            'other'
-        ]
-        
-        for dim in dimensions:
-            member = dim.get('member', '').lower()
-            if any(pattern in member for pattern in skip_patterns):
-                return False
-        
-        return True
-
     def _discover_xbrl_url(self, filing_info: Dict, company_cik: str) -> Optional[str]:
         """
         Discover the correct XBRL file URL using unified URL detector

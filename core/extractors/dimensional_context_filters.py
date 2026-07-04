@@ -38,6 +38,19 @@ class DimensionalContextFilter:
         'us-gaap:BudgetMember',
         'us-gaap:PlannedMember',
         'us-gaap:ProjectedMember',
+
+        # Aggregate/total-segment members — value equals consolidated total, not a real breakdown.
+        # Company-specific variants (e.g. nflx:ReportableSegmentMember) are caught by the
+        # 'reportable' EXCLUDED_KEYWORD; these cover the well-known srt qnames.
+        'srt:ReportableSegmentsMember',
+        'srt:OperatingSegmentsMember',
+        'srt:AllSegmentsMember',
+
+        # Reconciling/elimination members — internal accounting adjustments, not segment data.
+        'srt:MaterialReconcilingItemsMember',
+        'srt:EliminationsMember',
+        'us-gaap:IntersegmentEliminationMember',
+        'us-gaap:IntersubsegmentEliminationsMember',
     }
     
     # Dimensional axes that often contain unwanted data
@@ -54,10 +67,15 @@ class DimensionalContextFilter:
     # NOT as raw substrings. Substring matching previously caused false positives such as
     # 'change' matching 'ForeignExchangeContractMember' and 'life' matching
     # 'LifeInsuranceSegmentMember', silently dropping legitimate dimensional facts.
+    #
+    # 'reportable' is included to catch *ReportableSegmentMember variants, which always
+    # represent the aggregate of all reportable segments (= same value as consolidated),
+    # not a meaningful breakdown. These appear as duplicate children in the UI.
     EXCLUDED_KEYWORDS = {
         'forecast', 'scenario', 'estimate', 'adjustment', 'restatement',
         'error', 'correction', 'proforma', 'forma', 'budget', 'planned',
-        'projected', 'unspecified', 'change', 'useful'
+        'projected', 'unspecified', 'change', 'useful',
+        'reportable',  # *ReportableSegmentMember = aggregate total of all segments
     }
 
     @staticmethod
