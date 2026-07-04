@@ -600,6 +600,45 @@ class SECDataScraperApp:
         except Exception as e:
             logger.error(f"Error getting latest filing date for CIK {cik}: {e}")
             return None
+
+    def _get_latest_period_label(self, cik: str) -> Optional[str]:
+        """Return a human period label for the most recently stored filing.
+
+        Reads ``fiscal_year`` and ``quarter`` from concept_values — no
+        calculation by this code.  Examples: ``"FY2026 Q1"``, ``"FY2025 Annual"``.
+
+        Note: the normalization service strips ``period_type`` from stored docs,
+        so we detect annual vs quarterly by WHICH collection held the newest doc:
+        concept_values_annual → Annual,  concept_values_quarterly → Q{n}.
+        """
+        try:
+            best_end: Optional[object] = None
+            best_rp: dict = {}
+            best_col_type: str = "annual"
+            for col_type, col in [("annual", self._cv_annual_col), ("quarterly", self._cv_quarterly_col)]:
+                doc = col.find_one(
+                    {'company_cik': cik},
+                    sort=[('reporting_period.end_date', -1)],
+                    projection={'reporting_period': 1}
+                )
+                if doc:
+                    rp = doc.get('reporting_period', {})
+                    end_dt = rp.get('end_date')
+                    if end_dt and (best_end is None or end_dt > best_end):
+                        best_end = end_dt
+                        best_rp = rp
+                        best_col_type = col_type
+            if not best_rp:
+                return None
+            fy = best_rp.get('fiscal_year')
+            q  = best_rp.get('quarter')
+            if best_col_type == "quarterly" and q and fy:
+                return f"FY{fy} Q{q}"
+            if fy:
+                return f"FY{fy} Annual"
+            return None
+        except Exception:
+            return None
     
     def process_company(self, cik: str, summary: Optional['ProcessingSummary'] = None) -> Dict:
         company_start_time = time.time()
@@ -842,28 +881,29 @@ class SECDataScraperApp:
         """
         try:
             logger.info(f"Processing single filing: CIK {cik}, Accession {accession_number}")
-            
+
             # Fetch company data from SEC API
+            self.progress.set_status("fetching company data")
             company_data, filings_list = self.sec_client.get_company_submissions(cik)
             if not company_data:
                 logger.error(f"Failed to fetch company data for CIK: {cik}")
                 return False
-            
+
             # Store company data for use in financial processing
             self._thread_local.current_company_data = company_data
-            
+
             # Transform company doc for in-memory passing to normalization service
             company_doc = self.company_transformer.transform_company_data(company_data)
             self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
             logger.info(f"Company data ready for CIK: {cik}")
-            
+
             # Find the specific filing in the filings list
             target_filing = None
             for filing in filings_list:
                 if filing.get('accessionNumber') == accession_number:
                     target_filing = filing
                     break
-            
+
             if not target_filing:
                 # If not found in filings list, create a minimal filing info dict
                 logger.warning(f"Filing {accession_number} not found in company's filing list, creating minimal filing info")
@@ -874,14 +914,64 @@ class SECDataScraperApp:
                     'reportDate': None,
                     'company_cik': cik
                 }
-            
+
             # Get ticker for logging
             ticker = self.sec_client.get_ticker_from_cik(cik) or f"CIK_{cik}"
             company_name = company_data.get('name', 'Unknown')
-            
+            form_type_label = (target_filing or {}).get('form', 'filing')
+            # Store the resolved period so callers (e.g. worker_10kq) can use
+            # it in summary messages without needing a separate DB query.
+            self._last_report_date: str | None = (
+                (target_filing or {}).get('reportDate') or None
+            )
+            # Compute a human-readable fiscal period label: "FY 2026 Q1" or "FY 2026"
+            try:
+                from utilities.helpers.period_utils import FiscalYearCalculator as _FYC
+                from datetime import datetime as _dt2
+                _rd = self._last_report_date
+                _fy_end = company_data.get('fiscalYearEnd', '1231')
+                if _rd:
+                    _rd_date = _dt2.strptime(_rd, '%Y-%m-%d')
+                    _fy, _q = _FYC.calculate_fiscal_year_and_quarter(_rd_date, _fy_end)
+                    _form = (target_filing or {}).get('form', '')
+                    self._last_period_label: str | None = (
+                        f"FY {_fy}" if _form == '10-K' else f"FY {_fy} Q{_q}"
+                    )
+                else:
+                    self._last_period_label = None
+            except Exception:
+                self._last_period_label = None
+
+            # Guard: skip if this filing's period is already covered — same
+            # logic as --incremental in the CLI.
+            # Compare the filing's reportDate against the most recent
+            # reporting_period.end_date stored for this company.  If the
+            # filing's period is not NEWER, it is already in normalize_data
+            # (from a prior XBRL run or the reconciliation gap-fill).
+            if not self.reload:
+                report_date_str = target_filing.get('reportDate')
+                if report_date_str:
+                    latest_stored = self.get_latest_filing_date(cik)
+                    if latest_stored:
+                        from datetime import datetime as _dt
+                        report_dt  = _dt.strptime(report_date_str, '%Y-%m-%d')
+                        latest_dt  = _dt.strptime(latest_stored,   '%Y-%m-%d')
+                        if report_dt <= latest_dt:
+                            logger.info(
+                                f"Filing {accession_number} period {report_date_str} "
+                                f"already covered (latest stored: {latest_stored}) — skipping"
+                            )
+                            self.progress.status(
+                                f"  [skip]  period {report_date_str} already stored"
+                                f"  (latest: {latest_stored})"
+                            )
+                            return True
+
             logger.info(f"Processing filing {accession_number} for {company_name} ({ticker})")
-            
+            self.progress.status(f"  [company]  {company_name}  ({ticker})")
+
             # Process the filing
+            self.progress.set_status(f"parsing XBRL  {form_type_label}")
             success = self.process_filing_with_full_data(cik, target_filing)
 
             if success:
@@ -891,9 +981,17 @@ class SECDataScraperApp:
 
             # Deaccumulate quarterly deltas and fill extraction gaps, same as
             # the multi-filing path.
+            self.progress.set_status("quarterly deaccumulation")
             self._flush_quarterly_accumulator(cik)
+            self.progress.set_status("reconciliation")
             self._run_companyfacts_reconciliation(cik)
 
+            # Read period label from the DB (written by normalization service —
+            # no calculation here, just reading what was stored).
+            self._last_period_label: Optional[str] = self._get_latest_period_label(cik)
+
+            _result_icon = "\u2713 processed" if success else "\u2717 failed"
+            self.progress.status(f"  [result]  {_result_icon}  {accession_number}")
             return success
             
         except Exception as e:
@@ -1142,6 +1240,7 @@ class SECDataScraperApp:
                         logger.debug(f"Could not enrich company info with fiscal year for {accession_number}: {e}")
             
             # Process using unified financial processor
+            self.progress.set_status("downloading / parsing XBRL")
             statements_data = self.financial_processor.process_filing(
                 filing_info, cik, company_info_enriched, is_local=is_local
             )
@@ -1165,6 +1264,7 @@ class SECDataScraperApp:
                     # Extract line items from the statement hierarchy structure
                     # statement_data is a dict with {'hierarchy': [root_item], ...}
                     # We need to flatten the tree to a list for validation
+                    self.progress.set_status(f"normalizing  {statement_type}")
                     logger.info(f"📊 Processing {statement_type}...")
                     logger.debug(f"   statement_data type: {type(statement_data)}")
                     if isinstance(statement_data, dict):
@@ -1243,8 +1343,11 @@ class SECDataScraperApp:
                     except Exception as norm_err:
                         logger.warning(f"⚠️  Failed to normalize {statement_type}: {norm_err}", exc_info=True)
             
+            self.progress.status(
+                f"  [xbrl]  {statements_with_data} statement(s) normalized"
+            )
             return statements_with_data
-            
+
         except Exception as e:
             filing_type = "local" if is_local else "online"
             # Get full traceback for debugging

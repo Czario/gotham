@@ -24,13 +24,13 @@ dependencies = [
 
 [project.scripts]
 sec-scraper = "sec_scraper_cli:main"
-sec-scraper-worker = "redis_worker:main"
+sec-scraper-worker = "worker_10kq:main"
 
 [tool.uv]
 package = true
 
 [tool.setuptools]
-py-modules = ["sec_scraper_cli", "redis_worker", "redis_queue"]
+py-modules = ["sec_scraper_cli", "worker_10kq", "redis_queue"]
 
 [tool.uv.sources]
 data-normalization-service = { path = "./normalization", editable = true }

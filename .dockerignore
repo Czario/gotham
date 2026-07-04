@@ -1,0 +1,28 @@
+# Python byte-code — prevents __pycache__ changes from invalidating COPY
+**/__pycache__
+**/*.py[cod]
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Dev / test artefacts
+tests/
+logs/
+diagnose/
+*.egg-info/
+.venv/
+.env
+*.env
+
+# Git
+.git
+.gitignore
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Data files that don't belong in the image
+stocks_download.txt

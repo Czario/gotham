@@ -5,7 +5,9 @@
 #   Redis   — reaches admin_backend's Redis via host port 6379
 #
 # Usage:
-#   docker compose up -d
+#   docker compose up -d          # first time (or after dep / Dockerfile changes)
+#   docker compose up -d --build  # after pyproject.toml / uv.lock changes
+#   docker compose restart worker-10kq  # after any code change (no rebuild needed)
 #   docker compose logs -f worker-10kq
 
 services:
@@ -23,7 +25,19 @@ services:
       DATABASE_NAME:          normalize_data
       SEC_HTML_DOWNLOAD_PATH: /app/sec_html_filings
       PYTHONUNBUFFERED:       "1"
+      # Suppress uv hardlink warning when cache and target are on different
+      # filesystems (Docker volume vs container layer).
+      UV_LINK_MODE:           copy
     volumes:
+      # Mount source so code edits are reflected without rebuilding the image.
+      # uv sync installs the project in editable mode, so Python reads from
+      # this mount at runtime.  After editing, run:
+      #   docker compose restart worker-10kq
+      - .:/app
+      # Preserve the .venv built during the image build so the host mount
+      # above doesn't hide it.
+      - /app/.venv
+      # SEC HTML filing downloads (persistent across restarts)
       - /Users/aijaz/sec_html_filings:/app/sec_html_filings
     restart: unless-stopped
     networks:

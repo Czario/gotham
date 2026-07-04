@@ -30,6 +30,9 @@ from sec_scraper_cli import ProgressManager, SECDataScraperApp, parse_sec_filing
 from utilities.helpers.logger_config import LoggerConfig
 from worker_progress import WorkerHeartbeat, WorkerProgressPublisher
 
+# NOTE: logging is configured in main() AFTER all imports have run.
+# sec_scraper_cli resets the root logger to WARNING+NullHandler at import time;
+# any basicConfig() call here would be silently overridden.
 logger = logging.getLogger(__name__)
 
 _DEFAULT_QUEUE = "sec:filings:10kq"
@@ -155,6 +158,27 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
 
     pub = WorkerProgressPublisher(redis_url, ticker or cik, load_request_id)
 
+    # Guard (mirrors 8-K worker): skip filings for companies that have no prior
+    # data in normalize_data.  In "All Companies" polling mode the RSS feed
+    # publishes every 10-K/10-Q in the DB — this prevents the worker from
+    # blindly processing hundreds of filings for companies we haven't set up.
+    # Only applies when there is no explicit load_request_id (unmatched entries);
+    # explicit load requests always proceed regardless.
+    if not load_request_id and ticker:
+        from sec_scraper_cli import SECDataScraperApp as _App
+        _cv_q = app._cv_quarterly_col if hasattr(app, '_cv_quarterly_col') else None
+        _cv_a = app._cv_annual_col if hasattr(app, '_cv_annual_col') else None
+        has_data = False
+        for col in [c for c in [_cv_q, _cv_a] if c is not None]:
+            if col.count_documents({"company_cik": cik}, limit=1):
+                has_data = True
+                break
+        if not has_data:
+            pub.publish("skip", f"skipped — no existing normalize_data for {ticker}", kind="skip")
+            pub.close()
+            logger.info("10-K/Q skipped for %s (CIK %s) — no prior normalize_data", ticker, cik)
+            return True
+
     # Install a job-specific progress manager that forwards set_status/status
     # calls from inside the pipeline directly to Redis.  Restore the original
     # (silent tqdm) manager when the job finishes so the next job starts clean.
@@ -263,10 +287,25 @@ def _make_client(redis_url: str, poll_timeout: int) -> Redis:
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
+    # Re-apply logging AFTER all imports.  sec_scraper_cli resets the root
+    # logger to WARNING+NullHandler at import time, so we must override it here.
+    # Use INFO for our worker logger so startup/job/error lines are always
+    # visible in Docker logs — matches the 8-K worker behaviour.
+    # Suppress the noisy underlying CLI and normalisation loggers.
+    root = logging.getLogger()
+    root.handlers.clear()
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    root.addHandler(_handler)
+    root.setLevel(logging.WARNING)          # keep noisy libs quiet
+    logging.getLogger("worker_10kq").setLevel(logging.INFO)   # our messages
+
     if args.verbose:
-        LoggerConfig.setup_logging(level="INFO", detailed=True, console_output=True)
-    else:
-        LoggerConfig.setup_logging(level="WARNING", console_output=True)
+        # Verbose mode re-enables the underlying CLI loggers for deep debugging.
+        for _noisy in ("sec_scraper_cli", "data_normalization_service"):
+            logging.getLogger(_noisy).setLevel(logging.INFO)
 
     queue_name = normalize_queue_name(args.queue_name)
     dead_letter_queue = normalize_queue_name(args.dead_letter_queue)
@@ -345,7 +384,8 @@ def main(argv: list[str] | None = None) -> None:
                 _update_load_request_status(
                     payload,
                     "completed",
-                    period_of_report=getattr(app, '_last_report_date', None),
+                    period_of_report=getattr(app, '_last_period_label', None)
+                        or getattr(app, '_last_report_date', None),
                 )
             else:
                 payload["attempts"] = attempts + 1
