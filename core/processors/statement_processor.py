@@ -354,9 +354,9 @@ class EnhancedFinancialStatementProcessor:
         logger.debug(f"Processing {filing_form_type or 'unknown'} filing with dimensional filtering")
         
         # Map Arelle statement types to the three core stored types.
-        # equity_changes is folded into balance_sheet — equity is a section of
-        # the balance sheet and its concepts (dividends, buybacks, retained
-        # earnings roll-forward) are most naturally grouped there.
+        # equity_changes is intentionally excluded — its roll-forward activity items
+        # (dividends, buybacks, APIC changes) are NOT balance sheet line items; the
+        # ending equity balances already appear in the balance_sheet role itself.
         # comprehensive_income is intentionally excluded — its key metrics
         # (NetIncomeLoss, ComprehensiveIncomeNetOfTax) are already captured from
         # the income_statement, so storing it would only duplicate concepts.
@@ -364,7 +364,6 @@ class EnhancedFinancialStatementProcessor:
             'income_statement': 'income_statement',
             'balance_sheet': 'balance_sheet',
             'cash_flow': 'cash_flows',
-            'equity_changes': 'balance_sheet',
         }
         
         for arelle_type, expected_type in statement_mapping.items():
@@ -379,7 +378,7 @@ class EnhancedFinancialStatementProcessor:
                 )
                 if converted_data:
                     if expected_type in statements:
-                        # equity_changes maps to balance_sheet which may already exist — merge
+                        # Multiple source types map to the same target — merge, deduplicating by concept name
                         existing_concepts = {it.get('concept') for it in statements[expected_type]}
                         new_items = [it for it in converted_data if it.get('concept') not in existing_concepts]
                         statements[expected_type].extend(new_items)
@@ -659,23 +658,21 @@ class EnhancedFinancialStatementProcessor:
                 fact_dict['dimensional_facts'] = []
             
             # Add the main fact with all dimensional facts attached (single record approach)
-            # Include items that have values OR are important structural/hierarchy elements
-            should_include = False
+            # Only include actual line items: concepts with a real numeric value OR
+            # concepts whose only data exists as dimensional breakdowns (no consolidated total).
+            # Abstract header/grouping concepts with no value and no dimensional data are
+            # structural noise and must not be stored.
+            has_dimensional_data = bool(fact_dict.get('dimensional_facts'))
+            should_include = (
+                fact_dict['value'] is not None
+                or has_dimensional_data
+            )
             
-            # Always include items with actual values (this includes dimensional facts)
-            if fact_dict['value'] is not None:
-                should_include = True
-            
-            # For abstract items without values, only include if they provide meaningful hierarchy
-            elif fact_dict['abstract']:
-                # Skip purely structural/definitional abstract concepts
-                # Also check if this abstract concept has dimensional facts - if not, it's likely just hierarchy noise
-                has_dimensional_data = bool(fact_dict.get('dimensional_facts'))
-                if self._should_skip_irrelevant_concept(fact_dict['concept'], fact_dict['abstract'], has_dimensional_data):
-                    should_include = False
-                else:
-                    # Keep abstract concepts that provide meaningful hierarchy (like RevenueAbstract)
-                    should_include = True
+            # Always exclude non-financial taxonomy concepts even if they have a value
+            if should_include and self._should_skip_irrelevant_concept(
+                fact_dict['concept'], fact_dict['abstract'], has_dimensional_data
+            ):
+                should_include = False
                 
             if should_include:
                 flat_data.append(fact_dict)
@@ -1510,56 +1507,52 @@ class EnhancedFinancialStatementProcessor:
             True if the concept should be skipped, False if it should be included
         """
         
-        # If it's not abstract, never skip it (has actual data)
-        if not is_abstract:
-            return False
-        
-        # Define patterns for irrelevant abstract concepts that should be skipped
-        # These are structural elements that don't provide meaningful hierarchy
-        irrelevant_patterns = [
-            # Top-level statement abstracts (as specified by user)
+        # Always skip concepts from non-financial taxonomies (DEI cover-page metadata,
+        # SRT structural axes, country codes, investment taxonomy).  These are not
+        # financial statement line items regardless of whether they carry a value.
+        non_financial_prefixes = ('dei:', 'srt:', 'country:', 'invest:')
+        if concept_name.startswith(non_financial_prefixes):
+            return True
+
+        # Always skip well-known structural/header patterns regardless of the abstract flag.
+        # Some XBRL filings report a zero-value fact for abstract concepts, which causes
+        # is_effectively_concrete=True and abstract=False — the name check must run first.
+        always_skip_patterns = [
             'IncomeStatementAbstract',
-            'StatementOfFinancialPositionAbstract', 
+            'StatementOfFinancialPositionAbstract',
             'StatementOfCashFlowsAbstract',
             'StatementOfIncomeAndComprehensiveIncomeAbstract',
             'StatementOfStockholdersEquityAbstract',
             'StatementTable',
             'StatementLineItems',
-            
-            # Only skip Axis and Domain concepts (structural only, never have values)
-            'Axis',  # Will match any concept ending with 'Axis'
-            'Domain',  # Will match any concept ending with 'Domain'
-            
-            # Very generic abstract patterns that add no value
             'ComprehensiveIncomeNetOfTaxAbstract',
             'WeightedAverageNumberOfSharesOutstandingAbstract',
         ]
-        
-        # Member-specific patterns that should be skipped if they have no dimensional data
-        member_patterns = [
-            'Member'  # Will match any concept ending with 'Member'
-        ]
-        
-        # Check if concept name contains any irrelevant patterns
-        for pattern in irrelevant_patterns:
+        for pattern in always_skip_patterns:
             if pattern in concept_name:
-                # Special handling for Axis and Domain patterns - only skip if they end with these
-                if pattern in ['Axis', 'Domain']:
-                    if concept_name.endswith(pattern):
-                        return True
-                else:
-                    return True
-        
-        # Special handling for Member concepts - skip if they're abstract and have no dimensional data
-        for pattern in member_patterns:
-            if pattern in concept_name and concept_name.endswith(pattern):
-                # Skip Member concepts that are abstract and have no associated dimensional facts
-                if not has_dimensional_data:
-                    return True
-                # Keep Member concepts that have dimensional facts (they contain actual data)
-                else:
-                    return False
-        
+                return True
+
+        # Axis concepts are ALWAYS structural (pure metadata in XBRL, never carry values)
+        if concept_name.endswith('Axis'):
+            return True
+
+        # If it's not abstract, never skip it (has actual financial data)
+        if not is_abstract:
+            return False
+
+        # Any concept whose local name ends in 'Abstract' is a structural grouping header.
+        # Cover all remaining cases like AssetsAbstract, LiabilitiesAbstract, etc.
+        local_name = concept_name.split(':')[-1]
+        if local_name.endswith('Abstract'):
+            return True
+
+        # Domain concepts are structural (define axis range) — skip only when abstract
+        if local_name.endswith('Domain'):
+            return True
+
+        # Skip Member concepts that are abstract and have no dimensional data
+        if local_name.endswith('Member') and not has_dimensional_data:
+            return True
+
         # Keep all other abstract concepts (they provide important hierarchy)
-        # This includes abstract concepts that provide meaningful structure
         return False

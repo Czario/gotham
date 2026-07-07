@@ -792,6 +792,37 @@ class PeriodBasedFinancialCalculationService:
                         if period_date:
                             query['reporting_period.period_date'] = period_date
 
+                        # REDUNDANCY FIX: a calculated row is only worth storing when it
+                        # DIFFERS from the as-reported value.  Income statements (already
+                        # individual quarters) produce a calculated value identical to the
+                        # reported one — storing it just duplicates the row.
+                        #
+                        # CASH FLOW IS DELIBERATELY EXCLUDED: the deaccumulated cash-flow
+                        # series (Q1..Q4) must stay COMPLETE so downstream consumers can read
+                        # the full individual-quarter series via calculated=True.  Q1 cash flow
+                        # equals its reported value but must still be persisted as calculated
+                        # so the series has no gap.  Only Q2/Q3 differ, but we keep all of them.
+                        _is_cash_flow = str(statement_type).lower() in (
+                            'cash_flow', 'cashflow', 'cash_flows'
+                        )
+                        if is_calculated and not _is_cash_flow:
+                            reported_query = {
+                                'concept_id': concept_doc['_id'],
+                                'company_cik': company_cik,
+                                'reporting_period.fiscal_year': period_data.fiscal_year,
+                                'calculated': False,
+                            }
+                            if period_date:
+                                reported_query['reporting_period.period_date'] = period_date
+                            reported = self.quarterly_value_repo.collection.find_one(reported_query)
+                            if reported is not None and reported.get('value') == value:
+                                logger.debug(
+                                    f"Skipping redundant calculated value for {concept} on "
+                                    f"{period_date} (equals as-reported value)"
+                                )
+                                skipped_exists += 1
+                                break
+
                         existing = self.quarterly_value_repo.collection.find_one(query)
 
                         if not existing:

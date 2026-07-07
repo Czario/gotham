@@ -424,7 +424,36 @@ class FinancialNormalizationService:
         hierarchy_data = self.hierarchy_manager.build_hierarchy_data(statement.financial_data)
         concept_mapping: dict = {}
 
-        concrete_concepts = [item for item in hierarchy_data if not item.get('abstract', False)]
+        # Filter to concrete concepts (non-abstract).
+        # Also apply a name-pattern guard: some filings report a zero-value fact for
+        # abstract/structural concepts (e.g. StatementOfFinancialPositionAbstract),
+        # which causes them to arrive with abstract=False.  The concept name check
+        # catches those regardless of the abstract flag.
+        _NON_FIN_NS   = ('dei:', 'srt:', 'country:', 'invest:')
+        _ALWAYS_SKIP_CONTAINS  = (
+            'IncomeStatementAbstract', 'StatementOfFinancialPositionAbstract',
+            'StatementOfCashFlowsAbstract', 'StatementOfIncomeAndComprehensiveIncomeAbstract',
+            'StatementOfStockholdersEquityAbstract', 'StatementTable', 'StatementLineItems',
+            'ComprehensiveIncomeNetOfTaxAbstract', 'WeightedAverageNumberOfSharesOutstandingAbstract',
+        )
+
+        def _is_structural_concept(concept: str, is_abstract: bool) -> bool:
+            if concept.startswith(_NON_FIN_NS):
+                return True  # DEI / SRT / country / invest are not financial line items
+            if concept.endswith('Axis'):
+                return True  # Axis concepts never carry values
+            if any(p in concept for p in _ALWAYS_SKIP_CONTAINS):
+                return True
+            if is_abstract:
+                local = concept.split(':')[-1]
+                if local.endswith(('Abstract', 'Domain')):
+                    return True
+            return False
+
+        concrete_concepts = [
+            item for item in hierarchy_data
+            if not _is_structural_concept(item.get('concept', ''), item.get('abstract', False))
+        ]
         abstract_count = len(hierarchy_data) - len(concrete_concepts)
 
         concept_repo = self._get_concept_repo_by_form_type(filing.form_type)
@@ -665,7 +694,14 @@ class FinancialNormalizationService:
         # Add period information from the item if available
         if period_info:
             clean_reporting_period.update(period_info)
-        
+
+        # ACCURACY FIX: derive the period's fiscal_year / period_date / quarter from the
+        # VALUE's own period end date rather than inheriting the filing's fiscal year.
+        # A 10-K balance sheet carries a prior-year comparative column; that value's own
+        # end date is the prior year, so it must be tagged with the prior fiscal year —
+        # otherwise it collides with the current-year value under the same (concept, FY).
+        self._align_reporting_period_to_item(clean_reporting_period, item, filing.form_type)
+
         # Add accession_number from filing to reporting_period
         if filing.accession_number:
             clean_reporting_period['accession_number'] = filing.accession_number
@@ -1062,7 +1098,67 @@ class FinancialNormalizationService:
         
         # Fallback: return the original period if no date pattern found
         return period
-    
+
+    def _align_reporting_period_to_item(self, reporting_period: dict, item: dict, form_type: str) -> None:
+        """Align a value row's period fields to the VALUE's own period end date.
+
+        The primary current-period value's end date equals the filing period, so this is
+        a no-op for it.  For a comparative value (e.g. a 10-K's prior-year balance-sheet
+        column) the item's period end date is the prior year, so fiscal_year / period_date /
+        quarter are recomputed to match — preventing a same-(concept, fiscal_year) collision
+        and correctly preserving the comparative as its own fiscal year of history.
+
+        Mutates ``reporting_period`` in place.  Falls back to the existing (filing) values
+        when the item has no parseable period or no fiscal_year_end_code is available.
+        """
+        from datetime import datetime as _dt
+
+        item_period = item.get('period')
+        if not item_period:
+            return
+
+        end_key = self._extract_period_key_from_period_string(str(item_period))
+        if not end_key:
+            return
+
+        try:
+            item_end_date = _dt.strptime(end_key, '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return
+
+        # Only override when the value's own period end differs from the current period_date.
+        current_period_date = reporting_period.get('period_date')
+        if current_period_date and str(current_period_date)[:10] == end_key:
+            return  # value belongs to the filing period — nothing to change
+
+        fiscal_year_end_code = reporting_period.get('fiscal_year_end_code')
+        computed_fy = None
+        computed_q = None
+        if fiscal_year_end_code:
+            try:
+                from utilities.helpers.period_utils import FiscalYearCalculator
+                computed_fy, computed_q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                    item_end_date, fiscal_year_end_code
+                )
+            except Exception as e:
+                logger.debug(f"Could not compute fiscal year from item end date {end_key}: {e}")
+
+        # Fall back to the calendar year of the value's own end date if the calculator
+        # is unavailable — still strictly better than inheriting the filing's fiscal year.
+        if computed_fy is None:
+            computed_fy = item_end_date.year
+
+        reporting_period['fiscal_year'] = computed_fy
+        reporting_period['period_date'] = end_key
+        reporting_period['end_date'] = item_end_date
+
+        # Quarter only applies to quarterly filings; annual (10-K) never carries a quarter.
+        if form_type == '10-Q':
+            if computed_q is not None:
+                reporting_period['quarter'] = computed_q
+        elif 'quarter' in reporting_period:
+            del reporting_period['quarter']
+
     def process_quarterly_calculations(self) -> None:
         """Process quarterly financial calculations for all companies."""
         logger.info("Starting quarterly financial calculations...")
