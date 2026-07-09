@@ -695,17 +695,6 @@ class FinancialNormalizationService:
         if period_info:
             clean_reporting_period.update(period_info)
 
-        # Only store values that belong to the CURRENT filing's period.
-        # Prior-year comparative values are dropped — they will be captured when
-        # that period's own filing is processed.  The filing's accession number
-        # and period metadata are kept as-is (no re-tagging needed).
-        if self._is_comparative_value(item, clean_reporting_period, filing.form_type):
-            logger.debug(
-                f"Skipping comparative value for {item.get('concept', '?')} "
-                f"(item period differs from filing period)"
-            )
-            return
-
         # Add accession_number from filing to reporting_period
         if filing.accession_number:
             clean_reporting_period['accession_number'] = filing.accession_number
@@ -1102,73 +1091,6 @@ class FinancialNormalizationService:
         
         # Fallback: return the original period if no date pattern found
         return period
-
-    def _is_comparative_value(self, item: dict, reporting_period: dict, form_type: str) -> bool:
-        """Return True if this item's period belongs to a DIFFERENT fiscal period than the filing.
-
-        A comparative value (prior-year balance-sheet column, prior-quarter comparison)
-        must be dropped so each filing only stores data for its own reporting period.
-        The filing's accession number, period_date, and fiscal_year are kept intact on
-        every value that passes this gate — no re-tagging is needed.
-
-        Handles 52/53-week fiscal calendar edge cases where the XBRL instant date for
-        the balance sheet can be 1-2 days off from the SEC Submissions reportDate but
-        still belongs to the same fiscal quarter.
-        """
-        from datetime import datetime as _dt
-
-        item_period = item.get('period')
-        if not item_period:
-            return False  # no period info — assume current, store it
-
-        end_key = self._extract_period_key_from_period_string(str(item_period))
-        if not end_key:
-            return False
-
-        try:
-            item_end_date = _dt.strptime(end_key, '%Y-%m-%d')
-        except (ValueError, TypeError):
-            return False
-
-        # Guard 1: exact date match against the filing's authoritative report date.
-        # filing_report_date comes directly from the SEC Submissions API reportDate.
-        authoritative_date = (
-            reporting_period.get('filing_report_date')
-            or reporting_period.get('period_date')
-        )
-        if authoritative_date and str(authoritative_date)[:10] == end_key:
-            return False  # exact match → current period
-
-        # Compute the item's own fiscal year and quarter.
-        fye = reporting_period.get('fiscal_year_end_code')
-        computed_fy = computed_q = None
-        if fye:
-            try:
-                from utilities.helpers.period_utils import FiscalYearCalculator
-                computed_fy, computed_q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                    item_end_date, fye
-                )
-            except Exception as e:
-                logger.debug(f"Could not compute fiscal year from item end date {end_key}: {e}")
-        if computed_fy is None:
-            computed_fy = item_end_date.year  # calendar-year fallback
-
-        # Guard 2: same fiscal year AND quarter → current period (handles 52/53-week
-        # 1-2 day mismatch between balance-sheet instant date and income-statement end).
-        # Safety valve: if current_q is None we can't distinguish quarters, treat
-        # same-fiscal-year as sufficient (conservative — avoids false positives).
-        current_fy = reporting_period.get('fiscal_year')
-        current_q  = reporting_period.get('quarter')
-        same_fy = (computed_fy == current_fy)
-        same_q  = (
-            form_type != '10-Q'      # annual filings: no quarter distinction
-            or current_q is None     # no quarter info → be conservative
-            or computed_q == current_q
-        )
-        if same_fy and same_q:
-            return False  # same fiscal period, minor calendar-day diff → current
-
-        return True  # different fiscal period → comparative, drop it
 
     def process_quarterly_calculations(self) -> None:
         """Process quarterly financial calculations for all companies."""
