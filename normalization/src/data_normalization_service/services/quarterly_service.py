@@ -812,7 +812,14 @@ class PeriodBasedFinancialCalculationService:
                                 'reporting_period.fiscal_year': period_data.fiscal_year,
                                 'calculated': False,
                             }
-                            if period_date:
+                            # Match by quarter rather than period_date to avoid 1-day
+                            # off-by-one mismatches in 52/53-week fiscal calendars
+                            # (e.g. LEVI Q1 FY2026: reported row has 2026-03-02,
+                            # quarterly-service PeriodData has 2026-03-01).
+                            _q = period_data.reporting_period.get('quarter')
+                            if _q is not None:
+                                reported_query['reporting_period.quarter'] = _q
+                            elif period_date:
                                 reported_query['reporting_period.period_date'] = period_date
                             reported = self.quarterly_value_repo.collection.find_one(reported_query)
                             if reported is not None and reported.get('value') == value:

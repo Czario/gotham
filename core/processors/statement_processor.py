@@ -8,9 +8,6 @@ import re
 import requests
 import os
 import json
-import zipfile
-import tempfile
-import shutil
 import logging
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -31,41 +28,25 @@ logger = logging.getLogger(__name__)
 class EnhancedFinancialStatementProcessor:
     """Process financial statements from XBRL data with dimensions support using Arelle"""
     
-    def __init__(self, current_period_only: bool = True, max_periods: int = 3, include_dimensions: bool = True, local_xbrl_directory: Optional[str] = None, company_repo = None):
+    def __init__(self, current_period_only: bool = True, max_periods: int = 3, include_dimensions: bool = True, company_repo = None):
         self.current_period_only = current_period_only
         self.max_periods = max_periods
         self.include_dimensions = include_dimensions
-        self.local_xbrl_directory = local_xbrl_directory or os.getenv('XBRL_ZIP_CACHE_PATH', '')
         self.company_repo = company_repo
         
         # Initialize unified URL detector
         self.url_detector = SECURLDetector()
         
-        # Load ticker mappings for local processing
-        self.ticker_to_cik = {}
-        self.cik_to_ticker = {}
-        self._load_ticker_mappings()
-    
-    def _load_ticker_mappings(self):
-        """Load ticker to CIK mappings from SEC API (cached in memory for the process lifetime)."""
-        try:
-            from utilities.helpers.ticker_resolver import get_ticker_to_cik, get_cik_to_ticker
-            self.ticker_to_cik = get_ticker_to_cik()
-            self.cik_to_ticker = get_cik_to_ticker()
-        except Exception as e:
-            logger.warning(f"Could not load ticker mappings: {e}")
-    
-    def process_filing(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict] = None, filing_url: Optional[str] = None, is_local: bool = False) -> Optional[Dict]:
+    def process_filing(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict] = None, filing_url: Optional[str] = None) -> Optional[Dict]:
         """
-        Process a single filing to extract financial statements with dimensions using Arelle
-        
+        Process a single online SEC filing to extract financial statements with dimensions.
+
         Args:
-            filing_info: Filing information from SEC API or local file info
+            filing_info: Filing information from SEC API
             company_cik: Company CIK identifier
             company_info: Optional company information from SEC API (contains fiscal year-end)
-            filing_url: Optional direct XBRL filing URL (if not provided, will try to construct from filing_info)
-            is_local: Whether to process local XBRL files instead of downloading from SEC
-            
+            filing_url: Optional direct XBRL filing URL (discovered automatically when absent)
+
         Returns:
             Processed financial data with dimensions or None
         """
@@ -73,14 +54,7 @@ class EnhancedFinancialStatementProcessor:
             # Reset period filtering state for new filing to avoid output spam
             if hasattr(self, '_period_filtering_state'):
                 delattr(self, '_period_filtering_state')
-                
-            if is_local:
-                # Process local XBRL file
-                return self._process_local_filing(filing_info, company_cik, company_info)
-            else:
-                # Process online SEC filing
-                return self._process_online_filing(filing_info, company_cik, company_info, filing_url)
-                
+            return self._process_online_filing(filing_info, company_cik, company_info, filing_url)
         except Exception as e:
             logger.error(f"Error processing filing {filing_info.get('accessionNumber', 'unknown')}: {e}")
             return None
@@ -163,183 +137,6 @@ class EnhancedFinancialStatementProcessor:
             logger.error(f"❌ XBRL Extraction Exception for filing {accession_number}: {str(e)}")
             return None
     
-    def _process_local_filing(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict] = None) -> Optional[Dict]:
-        """Process local XBRL zip file - extract file URLs and use EXACTLY the same logic as online processing"""
-        
-        accession_number = filing_info.get('accessionNumber', filing_info.get('accession_number', 'unknown'))
-        
-        # Step 1: Extract XBRL files and get the best file URL
-        try:
-            local_xbrl_url = self._get_local_xbrl_url(filing_info)
-            if not local_xbrl_url:
-                logger.error(f"❌ Local XBRL File Not Found for filing {accession_number}: Could not extract or locate XBRL file from zip")
-                return None
-        except Exception as e:
-            logger.error(f"❌ Local XBRL Extraction Error for filing {accession_number}: {str(e)}")
-            return None
-        
-        # Step 2: Use FlexibleXBRLExtractor to extract financial statements and filing info (SAME as online)
-        logger.debug(f"Processing local XBRL filing with enhanced dimensions: {self.include_dimensions}")
-        
-        # Extract filing form type for period filtering
-        filing_form_type = filing_info.get('form_type') or filing_info.get('form') or 'unknown'
-        
-        # CRITICAL FIX: Calculate fiscal year and quarter BEFORE parsing (same as online processing)
-        enhanced_company_info = (company_info or {}).copy()
-        if not enhanced_company_info.get('fiscal_year'):
-            report_date = filing_info.get('reportDate') or filing_info.get('report_date')
-            fiscal_year_end_code = enhanced_company_info.get('fiscalYearEnd') or enhanced_company_info.get('fiscal_year_end')
-            
-            # If fiscal year end not in company_info, retrieve from database
-            if not fiscal_year_end_code and hasattr(self, 'company_repo') and self.company_repo:
-                db_company = self.company_repo.get_company(company_cik)
-                if db_company:
-                    fiscal_year_end_code = db_company.get('corporate_info', {}).get('fiscal_year_end')
-                    if fiscal_year_end_code:
-                        logger.debug(f"Retrieved fiscal year end {fiscal_year_end_code} from database for local filing CIK {company_cik}")
-            
-            if report_date and fiscal_year_end_code:
-                try:
-                    if isinstance(report_date, str):
-                        end_date = datetime.strptime(report_date, '%Y-%m-%d')
-                    else:
-                        end_date = report_date
-                    fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                        end_date, fiscal_year_end_code
-                    )
-                    enhanced_company_info['fiscal_year'] = fiscal_year
-                    enhanced_company_info['fiscal_quarter'] = quarter
-                    enhanced_company_info['fiscal_year_end_code'] = fiscal_year_end_code
-                    logger.debug(f"Pre-calculated fiscal year {fiscal_year} Q{quarter} for local fact selection")
-                except Exception as e:
-                    logger.warning(f"Could not pre-calculate fiscal year for local file: {e}")
-        
-        try:
-            with FlexibleXBRLExtractor(enable_enhanced_dimensions=self.include_dimensions, company_info=enhanced_company_info, filing_form_type=filing_form_type) as extractor:
-                financial_data = extractor.extract_financial_statements(local_xbrl_url)
-                
-                if not financial_data:
-                    logger.error(f"❌ Local XBRL Extraction Failed for filing {accession_number}: FlexibleXBRLExtractor returned None")
-                    return None
-                
-                if not financial_data.get('statements'):
-                    logger.error(f"❌ No Statements Found in Local XBRL for filing {accession_number}: XBRL parsed but no financial statements identified")
-                    return None
-        except Exception as e:
-            logger.error(f"❌ Local XBRL Extraction Exception for filing {accession_number}: {str(e)}")
-            return None
-        
-        # Step 3: Extract period info from XBRL data and create normalized filing_info
-        xbrl_filing_info = financial_data.get('filing_info', {})
-        extracted_entity_info = xbrl_filing_info.get('entity_info', {})
-        extracted_period_info = xbrl_filing_info.get('primary_period_info', {})
-        
-        # Create normalized filing_info using extracted XBRL data (SAME format as online)
-        normalized_filing_info, normalized_company_info = self._normalize_local_filing_info_with_xbrl_data(
-            filing_info, company_cik, company_info, extracted_entity_info, extracted_period_info
-        )
-        
-        # Use EXACTLY the same period extraction as online
-        reporting_period = extract_period_info_from_sec_api(normalized_filing_info, normalized_company_info)
-        
-        # Mark as local source and ensure database compatibility
-        reporting_period['data_source'] = 'local_xbrl'
-        self._ensure_database_compatibility(reporting_period)
-        
-        # Use EXACTLY the same conversion method as online
-        return self._convert_arelle_data_to_result(financial_data, normalized_filing_info, company_cik, reporting_period)
-    
-    def _get_local_xbrl_url(self, filing_info: Dict) -> Optional[str]:
-        """Extract local XBRL file and return best file URL - clean, focused method"""
-        zip_file_path = filing_info.get('zip_file_path')
-        if not zip_file_path or not os.path.exists(zip_file_path):
-            logger.error(f"Local XBRL file not found: {zip_file_path}")
-            return None
-        
-        # Extract and find best XBRL file
-        xbrl_file_paths = self._extract_xbrl_from_zip(zip_file_path)
-        if not xbrl_file_paths:
-            logger.warning(f"Could not extract any XBRL files from {zip_file_path}")
-            return None
-        
-        # Return the best file as file:// URL (first in list is highest scored)
-        best_file = xbrl_file_paths[0]
-        return f"file://{best_file}"
-    
-    def _normalize_local_filing_info(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict]) -> tuple:
-        """Normalize local filing info to match SEC API format - exactly what online processing expects"""
-        ticker = self.cik_to_ticker.get(company_cik, 'UNKNOWN')
-        
-        normalized_filing_info = {
-            'accessionNumber': filing_info.get('accession_number', 'local'),
-            'reportDate': None,  # Will be extracted by period processing
-            'form': filing_info.get('form_type', 'unknown'),
-            'filingDate': None,  # Not available for local files
-        }
-        
-        normalized_company_info = company_info or {
-            'fiscalYearEnd': filing_info.get('fiscal_year_end_code', '1231'),
-            'cik': company_cik,
-            'name': f'{ticker} Company'
-        }
-        
-        return normalized_filing_info, normalized_company_info
-    
-    def _normalize_local_filing_info_with_xbrl_data(self, filing_info: Dict, company_cik: str, company_info: Optional[Dict], 
-                                                   extracted_entity_info: Dict, extracted_period_info: Dict) -> tuple:
-        """Normalize local filing info using extracted XBRL data to match SEC API format exactly"""
-        ticker = self.cik_to_ticker.get(company_cik, 'UNKNOWN')
-
-        # SEC API reportDate is authoritative; XBRL extraction is only a fallback.
-        # Old XBRL filings (pre-2012) sometimes produce garbage values for
-        # document_period_end (numeric share counts, etc.), so always prefer the
-        # reportDate already present in filing_info when it is available.
-        report_date = filing_info.get('reportDate')
-        if not report_date:
-            _raw = (extracted_period_info.get('document_period_end') or
-                    extracted_entity_info.get('document_period_end'))
-            if _raw and re.match(r'^\d{4}-\d{2}-\d{2}$', str(_raw).strip()):
-                report_date = _raw
-            elif _raw:
-                logger.warning(
-                    f"Ignoring invalid document_period_end from XBRL for "
-                    f"{filing_info.get('accession_number', 'unknown')}: {_raw!r}"
-                )
-        form_type = extracted_entity_info.get('document_type') or filing_info.get('form_type', 'unknown')
-        
-        normalized_filing_info = {
-            'accessionNumber': filing_info.get('accession_number', 'local'),
-            'reportDate': report_date,  # Use extracted period from XBRL
-            'form': form_type,
-            'filingDate': None,  # Not available for local files
-        }
-        
-        normalized_company_info = company_info or {
-            'fiscalYearEnd': extracted_entity_info.get('fiscal_year', filing_info.get('fiscal_year_end_code', '1231')),
-            'cik': company_cik,
-            'name': extracted_entity_info.get('entity_name') or f'{ticker} Company'
-        }
-        
-        return normalized_filing_info, normalized_company_info
-    
-    def _ensure_database_compatibility(self, reporting_period: Dict) -> None:
-        """Ensure reporting period has all required fields for database storage - clean fix"""
-        # Ensure end_date is a proper datetime object for database validation
-        if reporting_period.get('end_date') is None and reporting_period.get('period_date'):
-            try:
-                period_date = reporting_period['period_date']
-                # Handle both string and datetime inputs
-                if isinstance(period_date, str):
-                    reporting_period['end_date'] = datetime.strptime(period_date, '%Y-%m-%d')
-                elif isinstance(period_date, datetime):
-                    reporting_period['end_date'] = period_date
-                else:
-                    reporting_period['end_date'] = datetime(2023, 1, 1)  # Fallback date
-            except:
-                reporting_period['end_date'] = datetime(2023, 1, 1)  # Fallback date
-        elif reporting_period.get('end_date') is None:
-            reporting_period['end_date'] = datetime(2023, 1, 1)  # Fallback date
-    
     def _convert_arelle_data_to_result(self, financial_data: Dict, filing_info: Dict, company_cik: str, reporting_period: Dict) -> Dict:
         """Convert Arelle data format to expected result format"""
         # Convert Arelle data format to expected format
@@ -403,165 +200,6 @@ class EnhancedFinancialStatementProcessor:
         }
         
         return result
-    
-    def _extract_xbrl_from_zip(self, zip_file_path: str) -> List[str]:
-        """
-        Extract XBRL files from zip archive and return paths to potential instance files
-        
-        Args:
-            zip_file_path: Path to XBRL zip file
-            
-        Returns:
-            List of paths to potential XBRL instance files
-        """
-        candidate_files = []
-        
-        try:
-            # Create temporary directory
-            temp_dir = tempfile.mkdtemp()
-            
-            with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
-                # Extract all files
-                zip_ref.extractall(temp_dir)
-                
-                # Collect all potential XBRL files with scoring
-                potential_files = []
-                
-                for root, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        if file.endswith(('.xml', '.xbrl', '.htm')):
-                            file_path = os.path.join(root, file)
-                            
-                            # Score each file based on likelihood of being instance document
-                            score = self._score_xbrl_file(file_path, file)
-                            if score > 0:
-                                potential_files.append((file_path, score, file))
-                
-                # Sort by score (highest first) and return paths
-                potential_files.sort(key=lambda x: x[1], reverse=True)
-                candidate_files = [item[0] for item in potential_files]
-                
-                if candidate_files:
-                    logger.debug(f"Found {len(candidate_files)} potential XBRL files in {os.path.basename(zip_file_path)}")
-                    for i, (file_path, score, filename) in enumerate(potential_files[:5], 1):  # Show top 5
-                        logger.debug(f"  {i}. {filename} (score: {score})")
-                
-        except Exception as e:
-            logger.error(f"Error extracting XBRL files from {zip_file_path}: {e}")
-            return []
-        
-        return candidate_files
-    
-    def _score_xbrl_file(self, file_path: str, filename: str) -> int:
-        """
-        Score XBRL files based on likelihood of being an instance document
-        Higher score = more likely to be the main instance document
-        """
-        score = 0
-        
-        try:
-            filename_lower = filename.lower()
-            
-            # Heavy penalty first for schema/taxonomy files and linkbase files
-            # This MUST be checked before any bonuses
-            schema_indicators = [
-                'schema',
-                'taxonomy', 
-                'linkbase',
-                'label',
-                'calculation',
-                'presentation',
-                'definition',
-                'reference',
-                '_lab.xml',
-                '_cal.xml', 
-                '_pre.xml',
-                '_def.xml',
-                '_ref.xml'
-            ]
-            
-            # Check for linkbase file patterns first
-            for indicator in schema_indicators:
-                if indicator in filename_lower:
-                    return 0  # Immediately return 0 for any linkbase files
-            
-            # Bonus for being the main instance document (without suffixes)
-            base_name = filename_lower.replace('.xml', '').replace('.xbrl', '')
-            if not any(suffix in base_name for suffix in ['_lab', '_cal', '_pre', '_def', '_ref']):
-                score += 50  # High bonus for being the main instance document
-            
-            # File extension patterns
-            if filename_lower.endswith('.xml'):
-                score += 20
-            elif filename_lower.endswith('.xbrl'):
-                score += 18
-            elif filename_lower.endswith('.htm'):
-                score += 10
-            
-            # Instance document indicators in filename
-            instance_indicators = [
-                'instance',
-                'document', 
-                'filing',
-                # Company-specific patterns
-                'aapl-', 'tsla-', 'msft-', 'amzn-', 'googl-', 'meta-'
-            ]
-            
-            for indicator in instance_indicators:
-                if indicator in filename_lower:
-                    score += 15
-            
-            # Check file content for instance document indicators
-            if score > 0:  # Only check content if filename looks promising
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read(2000)  # Read first 2KB
-                        content_lower = content.lower()
-                    
-                    # Instance document content indicators
-                    content_indicators = [
-                        'xbrli:xbrl',
-                        'context',
-                        'entity',
-                        'period',
-                        'us-gaap:',
-                        'dei:'
-                    ]
-                    
-                    for indicator in content_indicators:
-                        if indicator in content_lower:
-                            score += 5
-                    
-                    # Penalty for schema indicators in content
-                    schema_content_indicators = [
-                        'xs:schema',
-                        'targetnamespace',
-                        'elementformdefault',
-                        'import namespace',
-                        'xs:element'
-                    ]
-                    
-                    for indicator in schema_content_indicators:
-                        if indicator in content_lower:
-                            score -= 10
-                    
-                    # Bonus for having actual financial data
-                    financial_indicators = [
-                        'revenue', 'assets', 'liabilities', 'equity', 'income',
-                        'cashflow', 'comprehensive', 'stockholder'
-                    ]
-                    
-                    for indicator in financial_indicators:
-                        if indicator in content_lower:
-                            score += 2
-                
-                except Exception:
-                    pass  # Ignore file reading errors
-            
-            return max(0, score)  # Don't return negative scores
-            
-        except Exception:
-            return 0
     
     def _convert_arelle_hierarchy_to_flat_list(self, hierarchy: List, statement_type: str, filing_form_type: Optional[str] = None, filing_info: Optional[Dict] = None) -> List[Dict]:
         """

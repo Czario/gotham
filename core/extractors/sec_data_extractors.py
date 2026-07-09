@@ -83,7 +83,13 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
         "period_date": report_date,
         "period_type": period_type,
         "form_type": form_type,
-        
+
+        # Authoritative filing period from SEC Submissions API.
+        # Stored separately so downstream alignment logic always has
+        # an unambiguous anchor, even when period_date is later
+        # overridden by XBRL-derived calculations (e.g. local files).
+        "filing_report_date": report_date,
+
         # Raw SEC API company data
         "fiscal_year_end_code": fiscal_year_end_code,
         

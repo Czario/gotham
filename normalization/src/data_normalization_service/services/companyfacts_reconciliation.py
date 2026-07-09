@@ -274,10 +274,28 @@ class CompanyFactsReconciliationService:
                                           "concept_values_quarterly")
             form_type = "10-Q"
 
+        # Retrieve fiscal_year_end_code so the reporting_period can include quarter.
+        fiscal_year_end_code: Optional[str] = None
+        try:
+            company_doc = self.db.companies.find_one(
+                {"cik": str(cik)}, {"corporate_info.fiscal_year_end": 1}
+            )
+            if company_doc:
+                fiscal_year_end_code = (
+                    company_doc.get("corporate_info", {}).get("fiscal_year_end")
+                )
+        except Exception:
+            pass
+
         gaps, concept_index = self._find_interpolation_gaps(
             cik, concepts_coll, values_coll, include_edge=include_edge)
         if target_period_end is not None:
             gaps = [g for g in gaps if g["period_end"] == target_period_end]
+
+        # Stamp fiscal_year_end_code on every gap so _build_reporting_period can compute quarter.
+        if fiscal_year_end_code:
+            for g in gaps:
+                g["fiscal_year_end_code"] = fiscal_year_end_code
         stats = {"gaps": len(gaps), "filled": 0,
                  "skipped_absent": 0, "skipped_exists": 0}
         if not gaps:
@@ -354,16 +372,41 @@ class CompanyFactsReconciliationService:
         cik: str, gap: Dict[str, Any], match: Dict[str, Any], form_type: str
     ) -> Dict[str, Any]:
         end_dt = gap["period_end"]
+        fiscal_year = match.get("fy") or end_dt.year
         rp: Dict[str, Any] = {
             "end_date": end_dt,
             "period_date": gap["period_str"],
             "form_type": form_type,
-            "fiscal_year": match.get("fy") or end_dt.year,
+            "fiscal_year": fiscal_year,
             "data_source": "sec_companyfacts_reconciliation",
             "company_cik": cik,
             "unit": match.get("unit"),
-            "accession_number": match.get("accession"),
+            # accession_number intentionally omitted: gap-fill rows are sourced
+            # from the SEC companyfacts API and do not belong to any single filing.
+            # The companyfacts API returns the accession of whichever filing most
+            # recently included a value (often a comparative from a later filing),
+            # which would corrupt the skip-detection logic that queries by
+            # accession + fiscal_year.
         }
+        # Derive fiscal_year and quarter from the VALUE's own period end date.
+        # The SEC companyfacts API tags comparative values (prior-year column) with
+        # the FILING's fiscal year (e.g. fy=2026 for a balance-sheet date of
+        # 2025-03-02 that appeared in LEVI's Q1 FY2026 10-Q).  Using the API's fy
+        # for comparatives is wrong; we must recompute from the period end date so
+        # the comparative correctly lands in the prior fiscal year.
+        fye = gap.get("fiscal_year_end_code") or ""
+        if fye:
+            try:
+                from utilities.helpers.period_utils import FiscalYearCalculator
+                computed_fy, computed_q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                    end_dt, fye
+                )
+                if computed_fy:
+                    rp["fiscal_year"] = computed_fy   # override API fy
+                if computed_q is not None and form_type == "10-Q":
+                    rp["quarter"] = computed_q
+            except Exception:
+                pass  # non-fatal; fall back to API fy and no quarter
         if match.get("start"):
             rp["item_period"] = f"{match['start']} to {match['end']}"
         return rp

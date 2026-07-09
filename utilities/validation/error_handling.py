@@ -129,25 +129,19 @@ def create_period_description(reporting_period: Dict) -> str:
     else:
         return "Unknown period"
 
-def format_filing_log_message(statement_type: str, reporting_period: Dict, is_local: bool = False) -> str:
+def format_filing_log_message(statement_type: str, reporting_period: Dict) -> str:
     """
     Format standardized filing log message
-    
+
     Args:
         statement_type: Type of financial statement
         reporting_period: Period information
-        is_local: Whether this is a local filing
-        
+
     Returns:
         str: Formatted log message
     """
     period_desc = create_period_description(reporting_period)
     form_type = reporting_period.get("form_type", "")
     fiscal_year_end_code = reporting_period.get("fiscal_year_end_code", "")
-    
-    if is_local:
-        data_source = reporting_period.get('data_source', 'local_xbrl')
-    else:
-        data_source = reporting_period.get('data_source', 'sec_api')
-    
+    data_source = reporting_period.get('data_source', 'sec_api')
     return f"📅 {statement_type} for period {period_desc} ({form_type}) - FYE: {fiscal_year_end_code} - Source: {data_source}"

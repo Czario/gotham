@@ -767,8 +767,15 @@ class SECDataScraperApp:
                     logger.warning(f"Skipping filing with missing accession number: {filing}")
                     continue
                 
-                # Check if filing already processed by querying concept_values directly
+                # Check if filing already processed by querying concept_values directly.
+                # When --fiscal-year is active, also require that at least one row for
+                # the TARGET fiscal year exists under this accession.  Prior-year
+                # comparative rows (e.g. FY2025 rows that reference a FY2026 accession
+                # number) must not satisfy this check — otherwise deleting FY2026 rows
+                # and re-running would still show as "already processed".
                 _acc_filter = {'reporting_period.accession_number': accession_number}
+                if self.target_fiscal_year:
+                    _acc_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
                 existing_filing = (
                     self._cv_annual_col.find_one(_acc_filter, projection={'_id': 1})
                     or self._cv_quarterly_col.find_one(_acc_filter, projection={'_id': 1})
@@ -800,9 +807,11 @@ class SECDataScraperApp:
 
                     if should_reload:
                         logger.info(f"🔄 RELOAD: Deleting existing values for {accession_number}")
-                        _acc_filter = {'reporting_period.accession_number': accession_number}
-                        self._cv_annual_col.delete_many(_acc_filter)
-                        self._cv_quarterly_col.delete_many(_acc_filter)
+                        _del_filter = {'reporting_period.accession_number': accession_number}
+                        if self.target_fiscal_year:
+                            _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+                        self._cv_annual_col.delete_many(_del_filter)
+                        self._cv_quarterly_col.delete_many(_del_filter)
                     else:
                         logger.debug(f"📋 Filing {accession_number} outside reload period, skipping")
                         filings_skipped += 1
@@ -1162,7 +1171,7 @@ class SECDataScraperApp:
         filing_id = self._make_filing_id(accession_number)
 
         # Process financial statements (online only)
-        statements_processed = self.process_financial_statements_enhanced(cik, accession_number, filing_id, filing_info, is_local=False)
+        statements_processed = self.process_financial_statements_enhanced(cik, accession_number, filing_id, filing_info)
 
         url_info = f" - URL: {sec_url}" if sec_url else ""
 
@@ -1197,22 +1206,19 @@ class SECDataScraperApp:
                 pass  # failure_logger disabled
             return False
     
-    def process_financial_statements_enhanced(self, cik: str, accession_number: str, filing_id, filing_info: Dict, is_local: bool = False) -> int:
+    def process_financial_statements_enhanced(self, cik: str, accession_number: str, filing_id, filing_info: Dict) -> int:
         """
-        Process financial statements for a filing (unified method for online and local)
-        
+        Process financial statements for an online SEC filing.
+
         Args:
             cik: Company CIK identifier
             accession_number: SEC accession number
             filing_id: MongoDB ObjectId of the filing document
             filing_info: Complete filing information
-            is_local: Whether this is a local filing or online SEC filing
-            
+
         Returns:
             int: Number of statements processed (0 if failed)
         """
-        filing_type = "local" if is_local else "online"
-        
         try:
             # Enrich company info with fiscal year information for this specific filing
             company_info_enriched = getattr(self._thread_local, 'current_company_data', None) or {}
@@ -1242,15 +1248,15 @@ class SECDataScraperApp:
             # Process using unified financial processor
             self.progress.set_status("downloading / parsing XBRL")
             statements_data = self.financial_processor.process_filing(
-                filing_info, cik, company_info_enriched, is_local=is_local
+                filing_info, cik, company_info_enriched
             )
             
             if not statements_data:
-                logger.warning(f"Financial processor returned None for {filing_type} filing {accession_number}")
+                logger.warning(f"Financial processor returned None for online filing {accession_number}")
                 return 0
             
             if 'statements' not in statements_data:
-                logger.warning(f"No 'statements' key in processed data for {filing_type} filing {accession_number}")
+                logger.warning(f"No 'statements' key in processed data for online filing {accession_number}")
                 return 0
             
             # Process statements using shared logic
@@ -1339,7 +1345,7 @@ class SECDataScraperApp:
                         # Accumulate slim copy for quarterly deaccumulation pass
                         self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
                         # Log period information
-                        self._log_period_information(statement_type, reporting_period, is_local)
+                        self._log_period_information(statement_type, reporting_period)
                     except Exception as norm_err:
                         logger.warning(f"⚠️  Failed to normalize {statement_type}: {norm_err}", exc_info=True)
             
@@ -1349,11 +1355,9 @@ class SECDataScraperApp:
             return statements_with_data
 
         except Exception as e:
-            filing_type = "local" if is_local else "online"
-            # Get full traceback for debugging
             import traceback
             traceback_str = traceback.format_exc()
-            logger.error(f"Error processing financial statements for {filing_type} filing {accession_number}: {e}\n{traceback_str}")
+            logger.error(f"Error processing financial statements for online filing {accession_number}: {e}\n{traceback_str}")
             return 0
 
     def _extract_primary_period_string(self, statements_data: Dict, statement_data: List) -> Optional[str]:
@@ -1377,9 +1381,9 @@ class SECDataScraperApp:
         
         return primary_period_string
 
-    def _log_period_information(self, statement_type: str, reporting_period: Dict, is_local: bool = False):
+    def _log_period_information(self, statement_type: str, reporting_period: Dict):
         """Log period information for processed statements"""
-        log_message = format_filing_log_message(statement_type, reporting_period, is_local)
+        log_message = format_filing_log_message(statement_type, reporting_period)
         logger.info(log_message)
     
     def _extract_line_items_from_hierarchy(self, statement_data) -> List[Dict]:

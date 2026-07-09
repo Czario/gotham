@@ -695,12 +695,16 @@ class FinancialNormalizationService:
         if period_info:
             clean_reporting_period.update(period_info)
 
-        # ACCURACY FIX: derive the period's fiscal_year / period_date / quarter from the
-        # VALUE's own period end date rather than inheriting the filing's fiscal year.
-        # A 10-K balance sheet carries a prior-year comparative column; that value's own
-        # end date is the prior year, so it must be tagged with the prior fiscal year —
-        # otherwise it collides with the current-year value under the same (concept, FY).
-        self._align_reporting_period_to_item(clean_reporting_period, item, filing.form_type)
+        # Only store values that belong to the CURRENT filing's period.
+        # Prior-year comparative values are dropped — they will be captured when
+        # that period's own filing is processed.  The filing's accession number
+        # and period metadata are kept as-is (no re-tagging needed).
+        if self._is_comparative_value(item, clean_reporting_period, filing.form_type):
+            logger.debug(
+                f"Skipping comparative value for {item.get('concept', '?')} "
+                f"(item period differs from filing period)"
+            )
+            return
 
         # Add accession_number from filing to reporting_period
         if filing.accession_number:
@@ -1099,65 +1103,72 @@ class FinancialNormalizationService:
         # Fallback: return the original period if no date pattern found
         return period
 
-    def _align_reporting_period_to_item(self, reporting_period: dict, item: dict, form_type: str) -> None:
-        """Align a value row's period fields to the VALUE's own period end date.
+    def _is_comparative_value(self, item: dict, reporting_period: dict, form_type: str) -> bool:
+        """Return True if this item's period belongs to a DIFFERENT fiscal period than the filing.
 
-        The primary current-period value's end date equals the filing period, so this is
-        a no-op for it.  For a comparative value (e.g. a 10-K's prior-year balance-sheet
-        column) the item's period end date is the prior year, so fiscal_year / period_date /
-        quarter are recomputed to match — preventing a same-(concept, fiscal_year) collision
-        and correctly preserving the comparative as its own fiscal year of history.
+        A comparative value (prior-year balance-sheet column, prior-quarter comparison)
+        must be dropped so each filing only stores data for its own reporting period.
+        The filing's accession number, period_date, and fiscal_year are kept intact on
+        every value that passes this gate — no re-tagging is needed.
 
-        Mutates ``reporting_period`` in place.  Falls back to the existing (filing) values
-        when the item has no parseable period or no fiscal_year_end_code is available.
+        Handles 52/53-week fiscal calendar edge cases where the XBRL instant date for
+        the balance sheet can be 1-2 days off from the SEC Submissions reportDate but
+        still belongs to the same fiscal quarter.
         """
         from datetime import datetime as _dt
 
         item_period = item.get('period')
         if not item_period:
-            return
+            return False  # no period info — assume current, store it
 
         end_key = self._extract_period_key_from_period_string(str(item_period))
         if not end_key:
-            return
+            return False
 
         try:
             item_end_date = _dt.strptime(end_key, '%Y-%m-%d')
         except (ValueError, TypeError):
-            return
+            return False
 
-        # Only override when the value's own period end differs from the current period_date.
-        current_period_date = reporting_period.get('period_date')
-        if current_period_date and str(current_period_date)[:10] == end_key:
-            return  # value belongs to the filing period — nothing to change
+        # Guard 1: exact date match against the filing's authoritative report date.
+        # filing_report_date comes directly from the SEC Submissions API reportDate.
+        authoritative_date = (
+            reporting_period.get('filing_report_date')
+            or reporting_period.get('period_date')
+        )
+        if authoritative_date and str(authoritative_date)[:10] == end_key:
+            return False  # exact match → current period
 
-        fiscal_year_end_code = reporting_period.get('fiscal_year_end_code')
-        computed_fy = None
-        computed_q = None
-        if fiscal_year_end_code:
+        # Compute the item's own fiscal year and quarter.
+        fye = reporting_period.get('fiscal_year_end_code')
+        computed_fy = computed_q = None
+        if fye:
             try:
                 from utilities.helpers.period_utils import FiscalYearCalculator
                 computed_fy, computed_q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                    item_end_date, fiscal_year_end_code
+                    item_end_date, fye
                 )
             except Exception as e:
                 logger.debug(f"Could not compute fiscal year from item end date {end_key}: {e}")
-
-        # Fall back to the calendar year of the value's own end date if the calculator
-        # is unavailable — still strictly better than inheriting the filing's fiscal year.
         if computed_fy is None:
-            computed_fy = item_end_date.year
+            computed_fy = item_end_date.year  # calendar-year fallback
 
-        reporting_period['fiscal_year'] = computed_fy
-        reporting_period['period_date'] = end_key
-        reporting_period['end_date'] = item_end_date
+        # Guard 2: same fiscal year AND quarter → current period (handles 52/53-week
+        # 1-2 day mismatch between balance-sheet instant date and income-statement end).
+        # Safety valve: if current_q is None we can't distinguish quarters, treat
+        # same-fiscal-year as sufficient (conservative — avoids false positives).
+        current_fy = reporting_period.get('fiscal_year')
+        current_q  = reporting_period.get('quarter')
+        same_fy = (computed_fy == current_fy)
+        same_q  = (
+            form_type != '10-Q'      # annual filings: no quarter distinction
+            or current_q is None     # no quarter info → be conservative
+            or computed_q == current_q
+        )
+        if same_fy and same_q:
+            return False  # same fiscal period, minor calendar-day diff → current
 
-        # Quarter only applies to quarterly filings; annual (10-K) never carries a quarter.
-        if form_type == '10-Q':
-            if computed_q is not None:
-                reporting_period['quarter'] = computed_q
-        elif 'quarter' in reporting_period:
-            del reporting_period['quarter']
+        return True  # different fiscal period → comparative, drop it
 
     def process_quarterly_calculations(self) -> None:
         """Process quarterly financial calculations for all companies."""
