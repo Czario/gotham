@@ -23,6 +23,7 @@ sys.path.insert(0, str(project_root / "src"))
 
 from bson import ObjectId
 from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 from data_normalization_service.core.config import AppConfig
 
 COMPANY_CIK = "0002120882"
@@ -272,19 +273,10 @@ def upsert_concepts(collection, form_type: str, now: datetime) -> dict:
 
 
 def upsert_value(collection, concept_id, form_type, reporting_period, value, now) -> bool:
-    query: dict = {
-        "concept_id": concept_id,
-        "company_cik": COMPANY_CIK,
-        "statement_type": STATEMENT_TYPE,
-        "form_type": form_type,
-        "reporting_period.fiscal_year": reporting_period["fiscal_year"],
-        "reporting_period.period_date": reporting_period["period_date"],
-    }
-    if "quarter" in reporting_period:
-        query["reporting_period.quarter"] = reporting_period["quarter"]
-    if collection.find_one(query):
-        return False
-    collection.insert_one({
+    # FIX: dropped reporting_period.period_date from the unique-key query (caused
+    # off-by-one-day duplicates); insert is now atomic via DuplicateKeyError instead
+    # of non-atomic find_one() + insert_one().
+    doc = {
         "concept_id": concept_id,
         "company_cik": COMPANY_CIK,
         "statement_type": STATEMENT_TYPE,
@@ -295,8 +287,12 @@ def upsert_value(collection, concept_id, form_type, reporting_period, value, now
         "decimals": "-6",
         "source": "manual_euroland_f1",
         "created_at": now,
-    })
-    return True
+    }
+    try:
+        collection.insert_one(doc)
+        return True
+    except DuplicateKeyError:
+        return False
 
 
 # ---------------------------------------------------------------------------

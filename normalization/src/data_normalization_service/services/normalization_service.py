@@ -4,6 +4,7 @@ Business logic services for financial data normalization.
 from typing import Dict, Set, Optional, NamedTuple, Any, List
 from bson import ObjectId
 import logging
+from pymongo.errors import DuplicateKeyError
 
 from ..core.models import ConceptKey, ConceptDocument, ValueDocument, Company, FinancialStatement
 from ..database import (
@@ -702,40 +703,9 @@ class FinancialNormalizationService:
         # Get the appropriate value repository based on form type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
         
-        # Check if value already exists to implement sync behavior (only insert new data)
-        existing_query = {
-            'concept_id': concept_id,
-            'company_cik': statement.company_cik,
-            'statement_type': statement.statement_type,
-            'form_type': filing.form_type,
-            'calculated': is_calculated
-        }
-        
-        # Add reporting period fields to query for precise matching
-        if 'fiscal_year' in clean_reporting_period:
-            existing_query['reporting_period.fiscal_year'] = clean_reporting_period['fiscal_year']
-        if 'period_date' in clean_reporting_period:
-            existing_query['reporting_period.period_date'] = clean_reporting_period['period_date']
-        if 'quarter' in clean_reporting_period:
-            existing_query['reporting_period.quarter'] = clean_reporting_period['quarter']
-        
-        existing_value = value_repo.collection.find_one(existing_query)
-        
-        if existing_value:
-            # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
-                logger.debug(f"Updating existing value with missing accession_number for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']},
-                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
-                )
-            else:
-                logger.debug(f"Value already exists for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}, skipping insertion")
-            return
-        
         # Extract metadata from metadata-only dimensional facts
         metadata_from_dimensional_facts = self._extract_metadata_from_dimensional_facts(item)
-        
+
         value_doc = ValueDocument(
             concept_id=concept_id,
             company_cik=statement.company_cik,
@@ -744,17 +714,42 @@ class FinancialNormalizationService:
             reporting_period=clean_reporting_period,
             value=value,
             created_at=statement.created_at,
-            fact_id=item.get('fact_id'),  # Preserve fact_id for auditing
-            decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals')  # Preserve decimals from item or dimensional facts
+            fact_id=item.get('fact_id'),
+            decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals')
         )
-        
-        # Add calculated field to distinguish direct vs derived data
+
         value_doc_dict = value_doc.to_dict()
         value_doc_dict['calculated'] = is_calculated
-        
-        # Insert the value (only new data)
-        value_repo.collection.insert_one(value_doc_dict)
-        logger.debug(f"Inserted new value for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
+        value_doc_dict.pop('_id', None)  # let MongoDB assign _id
+
+        # FIX: Use insert_one + catch DuplicateKeyError for atomic idempotency.
+        # The unique index on {company_cik, concept_id, fiscal_year, quarter} is the
+        # single source of truth — no period_date in the guard (avoids 1-day off-by-one
+        # duplicates in 52/53-week fiscal calendars).
+        unique_filter = {
+            'concept_id': concept_id,
+            'company_cik': statement.company_cik,
+            'reporting_period.fiscal_year': clean_reporting_period.get('fiscal_year'),
+            'calculated': is_calculated,
+        }
+        if clean_reporting_period.get('quarter') is not None:
+            unique_filter['reporting_period.quarter'] = clean_reporting_period['quarter']
+
+        try:
+            value_repo.collection.insert_one(value_doc_dict)
+            logger.debug(f"Inserted new value for concept {concept_id}, "
+                         f"FY{clean_reporting_period.get('fiscal_year')} "
+                         f"Q{clean_reporting_period.get('quarter', 'N/A')}")
+        except DuplicateKeyError:
+            # Already exists — blocked by unique index. Backfill accession_number if missing.
+            logger.debug(f"Value already exists for concept {concept_id} "
+                         f"FY{clean_reporting_period.get('fiscal_year')} "
+                         f"Q{clean_reporting_period.get('quarter', 'N/A')}, skipping")
+            if filing.accession_number:
+                value_repo.collection.update_one(
+                    {**unique_filter, 'reporting_period.accession_number': {'$exists': False}},
+                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
+                )
         
         # Validate critical data preservation
         if item.get('fact_id') and not value_doc.fact_id:
@@ -1289,7 +1284,6 @@ class FinancialNormalizationService:
         existing_value = value_repo.collection.find_one(existing_query)
         
         if existing_value:
-            # If value exists but is missing accession_number, update it
             if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
                 logger.debug(f"Updating existing normalized cashflow value with missing accession_number for concept {concept_id}, Q{quarter} {fiscal_year}")
                 value_repo.collection.update_one(
@@ -1313,13 +1307,25 @@ class FinancialNormalizationService:
             created_at=datetime.now()
         )
         
-        # Add calculated field to distinguish normalized data
         value_doc_dict = value_doc.to_dict()
         value_doc_dict['calculated'] = is_calculated
-        
-        # Insert the normalized value using the appropriate repository based on form_type
-        value_repo.collection.insert_one(value_doc_dict)
-        logger.debug(f"Inserted new normalized cashflow Q{quarter} {fiscal_year}: {concept_id}")
+        value_doc_dict.pop('_id', None)
+
+        # FIX: Atomic insert guarded by unique index {company_cik, concept_id, fiscal_year, quarter}
+        try:
+            value_repo.collection.insert_one(value_doc_dict)
+            logger.debug(f"Inserted new normalized cashflow Q{quarter} {fiscal_year}: {concept_id}")
+        except DuplicateKeyError:
+            logger.debug(f"Normalized cashflow value already exists for concept {concept_id}, Q{quarter} {fiscal_year}, skipping (DuplicateKeyError)")
+            if filing.accession_number:
+                value_repo.collection.update_one(
+                    {'concept_id': concept_id, 'company_cik': statement.company_cik,
+                     'reporting_period.fiscal_year': fiscal_year,
+                     'reporting_period.quarter': quarter,
+                     'calculated': is_calculated,
+                     'reporting_period.accession_number': {'$exists': False}},
+                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
+                )
 
     def _get_quarter_start_date(self, fiscal_year: int, quarter: int):
         """Get start date for a quarter."""
@@ -1987,7 +1993,14 @@ class FinancialNormalizationService:
             decimals=dimension_data.get('decimals')  # Preserve decimals for precision
         )
         
-        value_repo.insert(dimensional_value_doc)
+        # FIX: find_dimensional_existing_value now checks fiscal_year+quarter (not the
+        # full reporting_period subdocument), so the guard above is reliable. Still wrap
+        # the insert in DuplicateKeyError as the final atomic safety net.
+        try:
+            value_repo.insert(dimensional_value_doc)
+        except DuplicateKeyError:
+            logger.debug(f"Dimensional value already exists for dimensional_concept_id {dimensional_concept_id} "
+                        f"(DuplicateKeyError), skipping")
         
         # Validate critical data preservation
         if dimension_data.get('fact_id') and not dimensional_value_doc.fact_id:

@@ -441,26 +441,48 @@ class ValueRepository:
             self._collection = self.db_connection.target_db[self.collection_name]
         return self._collection
 
-    def find_existing_value(self, concept_id: ObjectId, reporting_period: Dict[str, Any], dimension_value: bool = False, dimensional_concept_id: Optional[ObjectId] = None) -> Optional[Dict[str, Any]]:
-        """Find existing value to prevent duplicates."""
-        query = {
+    def find_existing_value(self, concept_id: ObjectId, reporting_period: Dict[str, Any], dimension_value: bool = False, dimensional_concept_id: Optional[ObjectId] = None, company_cik: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Find existing value to prevent duplicates.
+
+        FIX: previously matched the entire `reporting_period` subdocument
+        (`"reporting_period": reporting_period`), which requires byte-for-byte
+        equality on every field (accession_number, company_name, note, etc).
+        Any drift in those metadata fields between calls made this match fail
+        and always fall through to a fresh insert, silently creating duplicates.
+        Now matches only on the true unique key: concept_id (+ company_cik) +
+        fiscal_year + quarter — the same fields as the DB unique index.
+        """
+        query: Dict[str, Any] = {
             "concept_id": concept_id,
-            "reporting_period": reporting_period,
-            "dimension_value": dimension_value
+            "dimension_value": dimension_value,
         }
-        
+        if company_cik is not None:
+            query["company_cik"] = company_cik
+        if reporting_period.get("fiscal_year") is not None:
+            query["reporting_period.fiscal_year"] = reporting_period["fiscal_year"]
+        if reporting_period.get("quarter") is not None:
+            query["reporting_period.quarter"] = reporting_period["quarter"]
+
         if dimension_value and dimensional_concept_id is not None:
             query["dimensional_concept_id"] = dimensional_concept_id
-        
+
         return self.collection.find_one(query)
 
     def find_dimensional_existing_value(self, dimensional_concept_id: ObjectId, reporting_period: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Find existing dimensional value to prevent duplicates."""
-        return self.collection.find_one({
+        """Find existing dimensional value to prevent duplicates.
+
+        FIX: same full-subdocument-match bug as find_existing_value above —
+        now matches on fiscal_year + quarter only.
+        """
+        query: Dict[str, Any] = {
             "dimensional_concept_id": dimensional_concept_id,
-            "reporting_period": reporting_period,
-            "dimension_value": True
-        })
+            "dimension_value": True,
+        }
+        if reporting_period.get("fiscal_year") is not None:
+            query["reporting_period.fiscal_year"] = reporting_period["fiscal_year"]
+        if reporting_period.get("quarter") is not None:
+            query["reporting_period.quarter"] = reporting_period["quarter"]
+        return self.collection.find_one(query)
 
     def find_by_concept_id(self, concept_id: ObjectId, dimension_value: bool = False) -> Iterator[Dict[str, Any]]:
         """Find all values for a concept."""
@@ -476,7 +498,9 @@ class ValueRepository:
 
     def insert(self, value_doc: ValueDocument) -> ObjectId:
         """Insert new value document."""
-        result = self.collection.insert_one(value_doc.to_dict())
+        doc = value_doc.to_dict()
+        doc.pop("_id", None)
+        result = self.collection.insert_one(doc)
         return result.inserted_id
 
 

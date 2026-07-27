@@ -21,6 +21,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from collections import defaultdict
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from ..core.config import AppConfig
 from ..core.logging_config import get_status_logger
@@ -780,17 +781,23 @@ class PeriodBasedFinancialCalculationService:
 
                         value_doc_dict = value_doc.to_dict()
                         value_doc_dict['calculated'] = is_calculated
+                        value_doc_dict.pop('_id', None)
 
+                        # FIX: unique-key query no longer includes period_date (caused
+                        # 1-day off-by-one duplicates in 52/53-week fiscal calendars) and
+                        # now includes quarter (was previously missing, causing wrong-quarter
+                        # matches / skipped inserts).
                         query = {
                             'concept_id': concept_doc['_id'],
                             'company_cik': company_cik,
                             'reporting_period.fiscal_year': period_data.fiscal_year,
                             'calculated': is_calculated
                         }
+                        _query_quarter = period_data.reporting_period.get('quarter')
+                        if _query_quarter is not None:
+                            query['reporting_period.quarter'] = _query_quarter
 
                         period_date = period_data.reporting_period.get('period_date')
-                        if period_date:
-                            query['reporting_period.period_date'] = period_date
 
                         # REDUNDANCY FIX: a calculated row is only worth storing when it
                         # DIFFERS from the as-reported value.  Income statements (already
@@ -830,22 +837,23 @@ class PeriodBasedFinancialCalculationService:
                                 skipped_exists += 1
                                 break
 
-                        existing = self.quarterly_value_repo.collection.find_one(query)
-
-                        if not existing:
+                        # FIX: atomic insert + DuplicateKeyError catch instead of
+                        # non-atomic find_one() then insert_one() (race condition source).
+                        try:
                             self.quarterly_value_repo.collection.insert_one(value_doc_dict)
                             saved_count += 1
                             logger.debug(f"Saved {'calculated' if is_calculated else 'original'} value for {concept}")
-                        else:
-                            # If value exists but is missing accession_number, update it
-                            if filing_doc and filing_doc.accession_number and not existing.get('reporting_period', {}).get('accession_number'):
+                        except DuplicateKeyError:
+                            existing = self.quarterly_value_repo.collection.find_one(query)
+                            if (filing_doc and filing_doc.accession_number and existing
+                                    and not existing.get('reporting_period', {}).get('accession_number')):
                                 logger.debug(f"Updating existing quarterly value with missing accession_number for {concept} on {period_date}")
                                 self.quarterly_value_repo.collection.update_one(
                                     {'_id': existing['_id']},
                                     {'$set': {'reporting_period.accession_number': filing_doc.accession_number}}
                                 )
                             else:
-                                logger.debug(f"Value already exists for {concept} on {period_date}, skipping")
+                                logger.debug(f"Value already exists for {concept} on {period_date}, skipping (DuplicateKeyError)")
                             skipped_exists += 1
 
                         break  # Exit retry loop on success
@@ -921,7 +929,15 @@ class PeriodBasedFinancialCalculationService:
         }
     
     def cleanup_original_cumulative_values(self, company_cik: Optional[str] = None) -> None:
-        """Remove original cumulative values from target database, keeping only deaccumulated values."""
+        """Remove original cumulative values from target database, keeping only deaccumulated values.
+
+        WARNING: This performs a bulk delete_many() and is NOT safe to run concurrently
+        with active ingestion for the same company — a concept saved by another process
+        after count_documents() but before delete_many() completes will still match the
+        query and be deleted, and if that same process re-saves afterwards you can end up
+        with the row missing until the next full run. Only run this as an offline/maintenance
+        step when no ingestion is in progress for the target company_cik.
+        """
         query: Dict[str, Any] = {'calculated': False}
         if company_cik:
             query['company_cik'] = company_cik

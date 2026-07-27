@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 
 from ..core.concept_canonicalization import canonical_concept, equivalence_class
 from ..core.models import ValueDocument
@@ -334,9 +335,21 @@ class CompanyFactsReconciliationService:
             reporting_period = self._build_reporting_period(
                 cik, gap, match, form_type)
 
-            if vcoll.find_one({"concept_id": concept_id,
-                               "reporting_period.end_date": gap["period_end"],
-                               "dimension_value": False}):
+            # FIX: was checking reporting_period.end_date (a datetime) which misses
+            # matches whenever there's a timezone offset between the existing stored
+            # value and the freshly-built gap-fill value. Check on the unique key
+            # {concept_id, fiscal_year, quarter} instead — same fields as the DB's
+            # unique index — so this pre-check and the index agree.
+            exists_filter = {
+                "concept_id": concept_id,
+                "company_cik": cik,
+                "reporting_period.fiscal_year": reporting_period.get("fiscal_year"),
+                "dimension_value": False,
+                "calculated": False,  # reconciliation always inserts calculated=False
+            }
+            if reporting_period.get("quarter") is not None:
+                exists_filter["reporting_period.quarter"] = reporting_period["quarter"]
+            if vcoll.find_one(exists_filter):
                 stats["skipped_exists"] += 1
                 continue
 
@@ -362,8 +375,16 @@ class CompanyFactsReconciliationService:
             )
             doc = value_doc.to_dict()
             doc["calculated"] = False
-            vcoll.insert_one(doc)
-            stats["filled"] += 1
+            doc.pop("_id", None)
+
+            # FIX: atomic insert + DuplicateKeyError catch as the final safety net
+            # (the pre-check above closes the common case, the unique index closes
+            # the race-condition case).
+            try:
+                vcoll.insert_one(doc)
+                stats["filled"] += 1
+            except DuplicateKeyError:
+                stats["skipped_exists"] += 1
 
         return stats
 
