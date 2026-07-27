@@ -18,12 +18,6 @@ uv run main --file stocks_download.txt --year 2015 --end-year 2026 --reload
 uv run main --companies 0000320193 0000789019
 ```
 
-### Process top N companies from tickers.json
-
-```bash
-uv run main --tickers --limit 10
-```
-
 ### Process a single filing by URL
 
 ```bash

@@ -376,23 +376,6 @@ def parse_sec_filing_url(url: str) -> Optional[Dict[str, str]]:
         logger.error(f"Error parsing SEC filing URL: {e}")
         return None
 
-def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optional[int] = None, verbose: bool = False) -> List[str]:
-    """Load company CIKs from the live SEC company_tickers.json API (tickers_file arg is ignored)."""
-    try:
-        from utilities.helpers.ticker_resolver import get_ticker_to_cik
-        ticker_to_cik = get_ticker_to_cik()
-        companies = list(dict.fromkeys(ticker_to_cik.values()))  # deduplicated, order preserved
-        if limit is not None and limit > 0:
-            companies = companies[:limit]
-        if verbose:
-            print(f"📈 Loaded {len(companies):,} companies from SEC API")
-            if limit:
-                print(f"🎯 Limited to first {limit} companies")
-        return companies
-    except Exception as e:
-        print(f"❌ Error loading companies from SEC API: {e}")
-        return []
-
 class SECDataScraperApp:
     
     def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, latest: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
@@ -1923,12 +1906,6 @@ def main():
         '--file', metavar='FILE',
         help='Path to a plain-text file containing one CIK or ticker per line.')
     src.add_argument(
-        '--tickers', action='store_true',
-        help='Use the bundled tickers.json as the company source. Combined with --limit.')
-    src.add_argument(
-        '--limit', type=int, default=10, metavar='N',
-        help='Max companies to process when using --tickers (default: 10).')
-    src.add_argument(
         '--url', metavar='URL',
         help='Process a single SEC filing directly from its URL. '
              'Accepts EDGAR archives URLs or the viewer URL with cik= and accession_number= params.')
@@ -2050,14 +2027,10 @@ def main():
         print(f"❌ --end-year ({args.end_year}) cannot be earlier than --year ({args.year})")
         sys.exit(1)
     
-    if args.limit and not args.tickers and not args.companies and not args.file and not args.url:
-        # Default behavior: use tickers with limit
-        args.tickers = True
-    
     # Validate conflicting options for --url
     if args.url:
-        if args.companies or args.file or args.tickers:
-            print("❌ --url cannot be used with --companies, --file, or --tickers")
+        if args.companies or args.file:
+            print("❌ --url cannot be used with --companies or --file")
             sys.exit(1)
         if args.only_download_files:
             print("❌ --url cannot be used with --only-download-files")
@@ -2247,16 +2220,13 @@ def main():
                 tqdm.write(f"❌ Companies file not found: {args.file}")
                 sys.exit(1)
         else:
-            # Default behavior: use tickers.json
-            companies = load_companies_from_tickers(limit=args.limit, verbose=args.verbose)
-            if not companies:
-                print("❌ No companies loaded from tickers.json")
-                print("💡 Try: python sec_scraper_cli.py --companies 0000320193 0000789019")
-                sys.exit(1)
+            print("❌ No companies specified")
+            print("💡 Use --companies CIK_OR_TICKER [...] or --file FILE")
+            sys.exit(1)
         
         if not companies:
             print("❌ No companies to process")
-            print("📝 Use --companies with CIK list or --tickers with --limit")
+            print("📝 Use --companies CIK_OR_TICKER [...] or --file FILE")
             sys.exit(1)
         
         # Initialize and run scraper
