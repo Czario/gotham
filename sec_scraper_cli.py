@@ -395,7 +395,7 @@ def load_companies_from_tickers(tickers_file: str = "tickers.json", limit: Optio
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, incremental: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, latest: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -415,7 +415,7 @@ class SECDataScraperApp:
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = target_fiscal_quarter
         self.reload = reload
-        self.incremental = incremental
+        self.latest = latest
         self.html_download_path = html_download_path or os.getenv('SEC_HTML_DOWNLOAD_PATH')
         if not self.html_download_path:
             raise RuntimeError(
@@ -550,27 +550,28 @@ class SECDataScraperApp:
         # No raw collections (filings, financial_statements) should be created here
         return True
     
-    def filter_incremental_filings(self, filings_list: List[Dict], cik: str, latest_date: str) -> List[Dict]:
-        """Filter filings to only include those newer than the latest date in database"""
+    def filter_latest_filings(self, filings_list: List[Dict], cik: str, latest_date: str) -> List[Dict]:
+        """Filter filings to only include those with reporting periods newer than the latest in database"""
         try:
             latest_dt = datetime.strptime(latest_date, '%Y-%m-%d')
             
             filtered_filings = []
             for filing in filings_list:
-                filing_date_str = filing.get('filingDate') or filing.get('reportDate')
+                # Use reportDate (reporting period end date) for comparison
+                filing_date_str = filing.get('reportDate') or filing.get('filingDate')
                 if not filing_date_str:
                     continue
                     
                 filing_dt = datetime.strptime(filing_date_str, '%Y-%m-%d')
-                # Only include filings that are newer than our latest date
+                # Only include filings that have a newer reporting period
                 if filing_dt > latest_dt:
                     filtered_filings.append(filing)
             
-            logger.info(f"📊 Incremental filtering: {len(filtered_filings)} new filings found after {latest_date}")
+            logger.info(f"📊 Latest filtering: {len(filtered_filings)} new filings found after {latest_date}")
             return filtered_filings
             
         except Exception as e:
-            logger.error(f"Error filtering incremental filings: {e}")
+            logger.error(f"Error filtering latest filings: {e}")
             return filings_list
 
     @staticmethod
@@ -645,15 +646,15 @@ class SECDataScraperApp:
         
         try:
             # Determine the start date for processing
-            if self.incremental:
+            if self.latest:
                 latest_date = self.get_latest_filing_date(cik)
                 if latest_date:
-                    logger.info(f"📅 INCREMENTAL MODE: Processing company CIK: {cik} from {latest_date} onwards")
+                    logger.info(f"📅 LATEST MODE: Processing company CIK: {cik} from {latest_date} onwards")
                     # Use the latest date as start year
                     latest_year = datetime.strptime(latest_date, '%Y-%m-%d').year
                     effective_start_year = latest_year
                 else:
-                    logger.info(f"📅 INCREMENTAL MODE: No existing data found for CIK: {cik}, processing from {self.start_year}")
+                    logger.info(f"📅 LATEST MODE: No existing data found for CIK: {cik}, processing from {self.start_year}")
                     effective_start_year = self.start_year
             else:
                 range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
@@ -684,11 +685,11 @@ class SECDataScraperApp:
                 filings_list = self._filter_filings_by_fiscal_period(filings_list, company_data)
                 logger.info(f"After fiscal year/quarter filtering: {len(filings_list)} filings")
             
-            # Apply incremental filtering if enabled
-            if self.incremental:
+            # Apply latest filtering if enabled
+            if self.latest:
                 latest_date = self.get_latest_filing_date(cik)
                 if latest_date:
-                    filings_list = self.filter_incremental_filings(filings_list, cik, latest_date)
+                    filings_list = self.filter_latest_filings(filings_list, cik, latest_date)
                     if not filings_list:
                         logger.info(f"✅ No new filings found for company {cik} after {latest_date}")
                         return True
@@ -762,10 +763,29 @@ class SECDataScraperApp:
                 filing_date = filing.get('filingDate')
                 acceptance_datetime = filing.get('acceptanceDateTime')
                 
-                # Skip if accession number is missing
-                if not accession_number:
-                    logger.warning(f"Skipping filing with missing accession number: {filing}")
-                    continue
+                # Build filter for checking/deleting existing filings
+                # Use accession_number if available, otherwise use reporting period fields
+                _use_accession = bool(accession_number)
+                if _use_accession:
+                    _acc_filter = {'reporting_period.accession_number': accession_number}
+                else:
+                    # No accession number - build filter from reporting period fields
+                    _acc_filter = {'company_cik': cik}
+                    if self.target_fiscal_year:
+                        _acc_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+                    if self.target_fiscal_quarter:
+                        # Extract quarter number from string like "Q2"
+                        try:
+                            quarter_num = int(self.target_fiscal_quarter.replace('Q', ''))
+                            _acc_filter['reporting_period.quarter'] = quarter_num
+                        except (ValueError, AttributeError):
+                            pass
+                    # Add form_type to narrow down to this specific filing type
+                    if form_type:
+                        _acc_filter['form_type'] = form_type
+                    # If we have a filing date, use it to identify the specific period
+                    if filing_date:
+                        _acc_filter['reporting_period.period_date'] = filing_date
                 
                 # Check if filing already processed by querying concept_values directly.
                 # When --fiscal-year is active, also require that at least one row for
@@ -773,9 +793,6 @@ class SECDataScraperApp:
                 # comparative rows (e.g. FY2025 rows that reference a FY2026 accession
                 # number) must not satisfy this check — otherwise deleting FY2026 rows
                 # and re-running would still show as "already processed".
-                _acc_filter = {'reporting_period.accession_number': accession_number}
-                if self.target_fiscal_year:
-                    _acc_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
                 existing_filing = (
                     self._cv_annual_col.find_one(_acc_filter, projection={'_id': 1})
                     or self._cv_quarterly_col.find_one(_acc_filter, projection={'_id': 1})
@@ -787,17 +804,23 @@ class SECDataScraperApp:
                         should_process = self._should_process_filing_for_period(filing, company_data)
 
                     if should_process:
-                        logger.debug(f"📋 Filing {accession_number} already processed, skipping")
-                        if self.html_download_path:
+                        if _use_accession:
+                            logger.debug(f"📋 Filing {accession_number} already processed, skipping")
+                        else:
+                            logger.debug(f"📋 Filing for {cik} FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''} already processed, skipping")
+                        if self.html_download_path and accession_number:
                             self.sec_client.download_html_filing(cik, accession_number, filing_date or '2010-01-01', self.html_download_path, ticker)
                         filings_skipped += 1
-                        if summary:
+                        if summary and accession_number:
                             summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
                         continue
                     else:
-                        logger.debug(f"📋 Filing {accession_number} exists but outside target period, skipping")
+                        if _use_accession:
+                            logger.debug(f"📋 Filing {accession_number} exists but outside target period, skipping")
+                        else:
+                            logger.debug(f"📋 Filing for {cik} exists but outside target period, skipping")
                         filings_skipped += 1
-                        if summary:
+                        if summary and accession_number:
                             summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
                         continue
                 elif existing_filing and self.reload:
@@ -806,14 +829,33 @@ class SECDataScraperApp:
                         should_reload = self._should_process_filing_for_period(filing, company_data)
 
                     if should_reload:
-                        logger.info(f"🔄 RELOAD: Deleting existing values for {accession_number}")
-                        _del_filter = {'reporting_period.accession_number': accession_number}
-                        if self.target_fiscal_year:
-                            _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+                        if _use_accession:
+                            logger.info(f"🔄 RELOAD: Deleting existing values for {accession_number}")
+                            _del_filter = {'reporting_period.accession_number': accession_number}
+                            if self.target_fiscal_year:
+                                _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+                        else:
+                            logger.info(f"🔄 RELOAD: Deleting existing values for {cik} FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}")
+                            _del_filter = {'company_cik': cik}
+                            if self.target_fiscal_year:
+                                _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+                            if self.target_fiscal_quarter:
+                                try:
+                                    quarter_num = int(self.target_fiscal_quarter.replace('Q', ''))
+                                    _del_filter['reporting_period.quarter'] = quarter_num
+                                except (ValueError, AttributeError):
+                                    pass
+                            if form_type:
+                                _del_filter['form_type'] = form_type
+                            if filing_date:
+                                _del_filter['reporting_period.period_date'] = filing_date
                         self._cv_annual_col.delete_many(_del_filter)
                         self._cv_quarterly_col.delete_many(_del_filter)
                     else:
-                        logger.debug(f"📋 Filing {accession_number} outside reload period, skipping")
+                        if _use_accession:
+                            logger.debug(f"📋 Filing {accession_number} outside reload period, skipping")
+                        else:
+                            logger.debug(f"📋 Filing for {cik} outside reload period, skipping")
                         filings_skipped += 1
                         continue
                 
@@ -952,7 +994,7 @@ class SECDataScraperApp:
                 self._last_period_label = None
 
             # Guard: skip if this filing's period is already covered — same
-            # logic as --incremental in the CLI.
+            # logic as --latest in the CLI.
             # Compare the filing's reportDate against the most recent
             # reporting_period.end_date stored for this company.  If the
             # filing's period is not NEWER, it is already in normalize_data
@@ -1888,15 +1930,15 @@ def main():
     
     # Set up argument parser
     parser = argparse.ArgumentParser(
-        prog='sec-scraper',
+        prog='main',
         description=(
             'SEC EDGAR Data Scraper — downloads and normalises 10-K/10-Q XBRL '
             'filings from the SEC API into MongoDB.\n\n'
             'Quickstart examples:\n'
-            '  sec-scraper --file tickers.txt\n'
-            '  sec-scraper --companies 0000320193 0001065280 --year 2015 --end-year 2026\n'
-            '  sec-scraper --companies AAPL NFLX --reload --fiscal-year 2023\n'
-            '  sec-scraper --url https://www.sec.gov/Archives/edgar/data/1065280/.../nflx-20230930.htm'
+            '  main --file tickers.txt\n'
+            '  main --companies 0000320193 0001065280 --year 2015 --end-year 2026\n'
+            '  main --companies AAPL NFLX --reload --fiscal-year 2023\n'
+            '  main --url https://www.sec.gov/Archives/edgar/data/1065280/.../nflx-20230930.htm'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1948,8 +1990,8 @@ def main():
              'Scope with --year / --end-year or --fiscal-year / --fiscal-quarter '
              'to reload only a specific range.')
     proc.add_argument(
-        '--incremental', action='store_true',
-        help='Process only filings filed after the most recent filing already '
+        '--latest', action='store_true',
+        help='Process only filings newer than the most recent filing already '
              'stored for each company. Useful for routine updates.')
     proc.add_argument(
         '--no-dimensions', action='store_true',
@@ -2102,7 +2144,7 @@ def main():
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=args.fiscal_quarter,
                 reload=args.reload,
-                incremental=False,  # Not applicable for single filing
+                latest=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
                 enable_reconciliation=not args.no_reconciliation,
                 progress=progress,
@@ -2316,7 +2358,7 @@ def main():
             target_fiscal_year=args.fiscal_year,
             target_fiscal_quarter=args.fiscal_quarter,
             reload=args.reload,
-            incremental=args.incremental,
+            latest=args.latest,
             html_download_path=html_download_path,
             enable_reconciliation=not args.no_reconciliation,
             progress=progress,

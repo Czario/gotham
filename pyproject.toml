@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sec-scraper = "sec_scraper_cli:main"
+main = "sec_scraper_cli:main"
 sec-scraper-worker = "worker_10kq:main"
 
 [tool.uv]

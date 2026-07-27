@@ -81,7 +81,7 @@ Three primary collections defined with JSON Schema validators in `database/confi
 ## Key Conventions
 
 - **CIKs** are always zero-padded 10-digit strings (e.g., `"0000320193"` for Apple).
-- **Incremental processing**: the `--incremental` flag (and default behavior) skips already-processed filings. Use `--reload` to force reprocessing.
+- **Latest processing**: the `--latest` flag processes only new filings since the last update. Use `--reload` to force reprocessing.
 - **Arelle warnings suppressed intentionally**: `invalidTransformation`, `unrecognized transformation namespace`, `resourceIdDuplication`, and `xmlSchema:syntax` warnings are filtered out in `core/extractors/xbrl_parser.py` — they are harmless artifacts of old SEC filings.
 - **Logging**: configured via `utilities/helpers/logger_config.py` (`LoggerConfig`). Each module uses `get_module_logger(__name__)`. Log output goes to `logs/`.
 - **Error handling**: use helpers from `utilities/helpers/error_handling.py` (`safe_processing_operation`, `validate_required_fields`, `log_operation_result`) rather than bare try/except in pipeline code.

@@ -6,8 +6,8 @@ admin_backend publishes 10-K/10-Q messages here and 8-K messages to a
 separate queue consumed by the earning_scraping_agent worker.  Each worker
 only ever sees its own messages — no re-queue loops.
 
-Pipeline mirrors ``uv run sec-scraper --url <filing_url>`` exactly:
-  CLI    → sec-scraper --url <url>  → parse CIK + accession → pipeline
+Pipeline mirrors ``uv run main --url <filing_url>`` exactly:
+  CLI    → main --url <url>  → parse CIK + accession → pipeline
   Worker → Redis message            → parse CIK + accession → same pipeline
 """
 from __future__ import annotations
@@ -115,7 +115,7 @@ def _build_app() -> SECDataScraperApp:
         target_fiscal_year=None,
         target_fiscal_quarter=None,
         reload=False,
-        incremental=False,
+        latest=False,
         html_download_path=os.getenv("SEC_HTML_DOWNLOAD_PATH"),
         enable_reconciliation=True,
         progress=progress,
@@ -131,7 +131,7 @@ def _build_app() -> SECDataScraperApp:
 def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
     """Process one 10-K/10-Q filing message using the same pipeline as the CLI.
 
-    Mirrors exactly what ``uv run sec-scraper --url <filing_url>`` does:
+    Mirrors exactly what ``uv run main --url <filing_url>`` does:
       1. Parse the filing URL to extract CIK and accession number.
       2. Call app.process_single_filing_from_url(cik, accession_number).
 
