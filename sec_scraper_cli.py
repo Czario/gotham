@@ -646,20 +646,11 @@ class SECDataScraperApp:
         
         try:
             # Determine the start date for processing
-            if self.latest:
-                latest_date = self.get_latest_filing_date(cik)
-                if latest_date:
-                    logger.info(f"📅 LATEST MODE: Processing company CIK: {cik} from {latest_date} onwards")
-                    # Use the latest date as start year
-                    latest_year = datetime.strptime(latest_date, '%Y-%m-%d').year
-                    effective_start_year = latest_year
-                else:
-                    logger.info(f"📅 LATEST MODE: No existing data found for CIK: {cik}, processing from {self.start_year}")
-                    effective_start_year = self.start_year
-            else:
-                range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
-                logger.info(f"Processing company CIK: {cik} (filings {range_desc})")
-                effective_start_year = self.start_year
+            # --latest mode: fetch from start_year, then pick only the most recent 10-K/10-Q
+            # Normal mode: fetch from start_year onwards
+            range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
+            logger.info(f"Processing company CIK: {cik} (filings {range_desc})")
+            effective_start_year = self.start_year
             
             # Step 1: Fetch company information from SEC API
             # Show 'fetching' in the progress bar during the network call (can take several seconds)
@@ -685,37 +676,6 @@ class SECDataScraperApp:
                 filings_list = self._filter_filings_by_fiscal_period(filings_list, company_data)
                 logger.info(f"After fiscal year/quarter filtering: {len(filings_list)} filings")
             
-            # Apply latest filtering if enabled
-            if self.latest:
-                latest_date = self.get_latest_filing_date(cik)
-                if latest_date:
-                    filings_list = self.filter_latest_filings(filings_list, cik, latest_date)
-                    if not filings_list:
-                        logger.info(f"✅ No new filings found for company {cik} after {latest_date}")
-                        return True
-            
-            # Log date range of filings
-            if filings_list:
-                filing_dates = [f.get('filingDate', '') for f in filings_list if f.get('filingDate')]
-                if filing_dates:
-                    earliest_date = min(filing_dates)
-                    latest_date = max(filing_dates)
-                    logger.info(f"Filing date range: {earliest_date} to {latest_date}")
-                    
-                    # Count by form type
-                    form_counts = {}
-                    for filing in filings_list:
-                        form_type = filing.get('form', 'Unknown')
-                        form_counts[form_type] = form_counts.get(form_type, 0) + 1
-                    
-                    form_summary = ", ".join([f"{form}: {count}" for form, count in form_counts.items()])
-                    logger.info(f"Form types found: {form_summary}")
-            else:
-                company_label = company_data.get('name', 'Unknown')
-                _no_range = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
-                logger.info(f"No filings found for company {company_label} {_no_range}")
-                self.progress.status(f"  ⓘ {company_label}: no filings {_no_range}")
-            
             # Update company name for logging
             company_name = company_data.get('name', 'Unknown')
             
@@ -732,6 +692,17 @@ class SECDataScraperApp:
             
             # Filter filings to only target forms for progress bar
             target_filings = [f for f in filings_list if f.get('form') in target_forms]
+            
+            # If --latest mode, keep only the most recent 10-K or 10-Q filing
+            # This looks at EDGAR submissions, not MongoDB
+            if self.latest and target_filings:
+                # Sort by filing date descending, then take the first one
+                target_filings.sort(key=lambda f: f.get('filingDate', ''), reverse=True)
+                latest_filing = target_filings[0]
+                form_type = latest_filing.get('form', '')
+                filing_date = latest_filing.get('filingDate', '')
+                logger.info(f"📅 LATEST MODE: Selected most recent {form_type} filed {filing_date}")
+                target_filings = [latest_filing]
             
             # Get ticker for logging
             ticker = self.sec_client.get_ticker_from_cik(cik)
