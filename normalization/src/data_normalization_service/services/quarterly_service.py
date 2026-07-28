@@ -79,6 +79,11 @@ class PeriodBasedFinancialCalculationService:
         self.annual_value_repo = ValueRepository(self.db_connection, 'concept_values_annual')
         self.quarterly_value_repo = ValueRepository(self.db_connection, 'concept_values_quarterly')
         self.value_repo = self.annual_value_repo
+        
+        # Cache for canonical period_dates to ensure consistency across filings
+        # Key: (company_cik, statement_type, fiscal_year, quarter)
+        # Value: canonical period_date string
+        self._canonical_period_date_cache: Dict[tuple, str] = {}
     
     def _get_concept_repo_by_form_type(self, form_type: str) -> ConceptRepository:
         """Get the appropriate concept repository based on form type."""
@@ -716,6 +721,76 @@ class PeriodBasedFinancialCalculationService:
         logger.info(f"Successfully converted {len(sorted_periods)} periods to individual deaccumulative values")
         return individual_periods
 
+    def _get_or_set_canonical_period_date(
+        self,
+        company_cik: str,
+        statement_type: str,
+        fiscal_year: int,
+        quarter: int,
+        default_period_date: str
+    ) -> str:
+        """
+        Get or set a canonical period_date for a given (company, statement_type, fiscal_year, quarter).
+        
+        This ensures all concept values for the same fiscal period have the same period_date,
+        even if they come from different filings (e.g., 10-Q + 10-Q/A amendment).
+        
+        The canonical period_date is determined by:
+        1. If cache has a value for this fiscal period, use it
+        2. Otherwise, query existing values in DB for this fiscal period
+        3. Use the most common period_date from existing data
+        4. If no existing data, use the default (current filing's report_date)
+        5. Cache the result for future use
+        
+        Args:
+            company_cik: Company CIK number
+            statement_type: Financial statement type (income_statement, balance_sheet, etc.)
+            fiscal_year: Fiscal year
+            quarter: Quarter number (1-4)
+            default_period_date: Default period_date from current filing
+            
+        Returns:
+            Canonical period_date string (YYYY-MM-DD format)
+        """
+        cache_key = (company_cik, statement_type, fiscal_year, quarter)
+        
+        # Check cache first
+        if cache_key in self._canonical_period_date_cache:
+            return self._canonical_period_date_cache[cache_key]
+        
+        # Query existing values for this fiscal period
+        existing_values = list(self.quarterly_value_repo.collection.find(
+            {
+                'company_cik': company_cik,
+                'statement_type': statement_type,
+                'reporting_period.fiscal_year': fiscal_year,
+                'reporting_period.quarter': quarter
+            },
+            {'reporting_period.period_date': 1}
+        ).limit(100))  # Limit to avoid loading too much data
+        
+        if not existing_values:
+            # No existing data, use the default (current filing's report_date)
+            canonical_date = default_period_date
+        else:
+            # Find the most common period_date
+            period_date_counts: Dict[str, int] = {}
+            for val in existing_values:
+                pd = val.get('reporting_period', {}).get('period_date')
+                if pd:
+                    period_date_counts[pd] = period_date_counts.get(pd, 0) + 1
+            
+            if not period_date_counts:
+                canonical_date = default_period_date
+            else:
+                # Return the most common period_date
+                canonical_date = max(period_date_counts.items(), key=lambda x: x[1])[0]
+        
+        # Cache the result
+        self._canonical_period_date_cache[cache_key] = canonical_date
+        
+        return canonical_date
+
     def _save_period_data(self, period_data: PeriodData, is_calculated: bool = False) -> None:
         """Save period data to the normalized database with retries."""
         try:
@@ -762,7 +837,22 @@ class PeriodBasedFinancialCalculationService:
                         # Get filing information for accession_number.
                         # Prefer accession_number already embedded in reporting_period (merged pipeline).
                         # Fall back to _memory_filing_map, then skip (never read source_db).
+                        # Normalize period_date to ensure consistency for the same fiscal period
+                        # This prevents duplicate period columns when the same fiscal period has slightly different dates
                         clean_reporting_period = period_data.reporting_period.copy() if hasattr(period_data.reporting_period, 'copy') else dict(period_data.reporting_period)
+                        
+                        # Normalize period_date to canonical value for this fiscal period
+                        quarter = clean_reporting_period.get('quarter')
+                        if quarter is not None:
+                            canonical_period_date = self._get_or_set_canonical_period_date(
+                                company_cik=company_cik,
+                                statement_type=statement_type,
+                                fiscal_year=period_data.fiscal_year,
+                                quarter=quarter,
+                                default_period_date=clean_reporting_period.get('period_date', period_data.period_date)
+                            )
+                            clean_reporting_period['period_date'] = canonical_period_date
+                        
                         filing_doc = None
                         if 'accession_number' not in clean_reporting_period or not clean_reporting_period.get('accession_number'):
                             filing_doc = getattr(self, '_memory_filing_map', {}).get(str(period_data.statement_id))

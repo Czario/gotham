@@ -79,6 +79,11 @@ class FinancialNormalizationService:
         # Key is (ConceptKey, form_type) to separate annual and quarterly concepts
         self.concept_cache: Dict[tuple, ObjectId] = {}
         
+        # Cache for canonical period_dates to ensure consistency across filings
+        # Key: (company_cik, statement_type, fiscal_year, quarter)
+        # Value: canonical period_date string
+        self._canonical_period_date_cache: Dict[tuple, str] = {}
+        
         # Taxonomy label fixing is not supported; taxonomy_manager is always None.
         self.taxonomy_manager = None
 
@@ -92,6 +97,72 @@ class FinancialNormalizationService:
             # Default to annual for unknown form types
             logger.warning(f"Unknown form type: {form_type}, defaulting to annual repository")
             return self.annual_concept_repo
+
+    def _get_canonical_period_date(
+        self,
+        company_cik: str,
+        statement_type: str,
+        fiscal_year: int,
+        quarter: int,
+        period_date: str
+    ) -> str:
+        """
+        Get or set a canonical period_date for a given (company, statement_type, fiscal_year, quarter).
+        
+        This ensures all concept values for the same fiscal period have the same period_date,
+        even if they come from different filings or have slightly different dates due to
+        52/53-week fiscal calendars (like Apple).
+        
+        Args:
+            company_cik: Company CIK identifier
+            statement_type: Type of financial statement
+            fiscal_year: Fiscal year
+            quarter: Quarter number (1-4)
+            period_date: Default period date to use if no canonical date exists
+            
+        Returns:
+            Canonical period date string (format: YYYY-MM-DD)
+        """
+        cache_key = (company_cik, statement_type, fiscal_year, quarter)
+        
+        if cache_key in self._canonical_period_date_cache:
+            return self._canonical_period_date_cache[cache_key]
+        
+        # Get the appropriate value repository (use quarterly for quarterly data)
+        value_repo = self.quarterly_value_repo
+        
+        # Query existing values for this fiscal period to find the most common period_date
+        query = {
+            'company_cik': company_cik,
+            'statement_type': statement_type,
+            'reporting_period.fiscal_year': fiscal_year,
+            'reporting_period.quarter': quarter,
+            'reporting_period.period_date': {'$exists': True}
+        }
+        
+        existing_values = list(value_repo.collection.find(query, {'reporting_period.period_date': 1}).limit(100))
+        
+        if not existing_values:
+            # No existing data, use the provided period_date as canonical
+            canonical_date = period_date
+        else:
+            # Find the most common period_date
+            period_date_counts: Dict[str, int] = {}
+            for val in existing_values:
+                pd = val.get('reporting_period', {}).get('period_date')
+                if pd:
+                    period_date_counts[pd] = period_date_counts.get(pd, 0) + 1
+            
+            if not period_date_counts:
+                canonical_date = period_date
+            else:
+                # Return the most common period_date
+                canonical_date = max(period_date_counts.items(), key=lambda x: x[1])[0]
+        
+        # Cache the result
+        self._canonical_period_date_cache[cache_key] = canonical_date
+        
+        return canonical_date
 
     def _get_value_repo_by_form_type(self, form_type: str) -> ValueRepository:
         """Get the appropriate value repository based on form type."""
@@ -695,6 +766,25 @@ class FinancialNormalizationService:
         # Add period information from the item if available
         if period_info:
             clean_reporting_period.update(period_info)
+
+        # Normalize period_date to canonical value for this fiscal period
+        # This prevents duplicate period columns when the same fiscal period has slightly different dates
+        quarter = clean_reporting_period.get('quarter')
+        fiscal_year = clean_reporting_period.get('fiscal_year')
+        if quarter is not None and fiscal_year is not None:
+            period_date = clean_reporting_period.get('period_date')
+            if period_date:
+                # For quarterly data, normalize period_date to ensure consistency
+                # Use the fiscal year and quarter as the canonical key
+                # This handles 52/53-week fiscal calendars where period_date can vary by ±1 day
+                canonical_period_date = self._get_canonical_period_date(
+                    company_cik=statement.company_cik,
+                    statement_type=statement.statement_type,
+                    fiscal_year=fiscal_year,
+                    quarter=quarter,
+                    period_date=period_date
+                )
+                clean_reporting_period['period_date'] = canonical_period_date
 
         # Add accession_number from filing to reporting_period
         if filing.accession_number:
@@ -1952,6 +2042,23 @@ class FinancialNormalizationService:
                 del clean_reporting_period['period_type']
             if filing.form_type == '10-K' and 'quarter' in clean_reporting_period:
                 del clean_reporting_period['quarter']
+        
+        # Normalize period_date to canonical value for this fiscal period
+        # This prevents duplicate period columns when the same fiscal period has slightly different dates
+        quarter = clean_reporting_period.get('quarter')
+        fiscal_year = clean_reporting_period.get('fiscal_year')
+        if quarter is not None and fiscal_year is not None:
+            period_date = clean_reporting_period.get('period_date')
+            if period_date:
+                # For quarterly data, normalize period_date to ensure consistency
+                canonical_period_date = self._get_canonical_period_date(
+                    company_cik=statement.company_cik,
+                    statement_type=statement.statement_type,
+                    fiscal_year=fiscal_year,
+                    quarter=quarter,
+                    period_date=period_date
+                )
+                clean_reporting_period['period_date'] = canonical_period_date
         
         # Add accession_number from filing to reporting_period
         if filing.accession_number:
