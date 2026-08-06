@@ -216,13 +216,13 @@ CONCEPTS = [
 ]
 
 COMPANY_CIK = "0001181412"
-STATEMENT_TYPE = "income_statement"
+STATEMENT_TYPE = "income"
 
 
 def build_document(concept_def: dict, form_type: str, now: datetime) -> dict:
     """Build a full concept document matching the normalized_concepts schema."""
     return {
-        "company_cik": COMPANY_CIK,
+        "cik": COMPANY_CIK,
         "statement_type": STATEMENT_TYPE,
         "concept": concept_def["concept"],
         "form_type": form_type,
@@ -253,7 +253,7 @@ def upsert_concepts(collection, form_type: str, now: datetime) -> tuple[int, int
     for concept_def in CONCEPTS:
         doc = build_document(concept_def, form_type, now)
         filter_key = {
-            "company_cik": COMPANY_CIK,
+            "cik": COMPANY_CIK,
             "statement_type": STATEMENT_TYPE,
             "concept": concept_def["concept"],
             "form_type": form_type,

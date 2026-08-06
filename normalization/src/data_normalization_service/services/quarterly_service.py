@@ -111,7 +111,7 @@ class PeriodBasedFinancialCalculationService:
         """Find concept in either annual or quarterly collections."""
         # First try quarterly collection (most likely for quarterly calculations)
         concept_doc = self.quarterly_concept_repo.collection.find_one({
-            'company_cik': company_cik,
+            'cik': company_cik,
             'statement_type': statement_type,
             'concept': concept
         })
@@ -122,7 +122,7 @@ class PeriodBasedFinancialCalculationService:
             
         # If not found in quarterly, try annual collection
         concept_doc = self.annual_concept_repo.collection.find_one({
-            'company_cik': company_cik,
+            'cik': company_cik,
             'statement_type': statement_type,
             'concept': concept
         })
@@ -177,7 +177,7 @@ class PeriodBasedFinancialCalculationService:
         else:
             # Fallback to processing all companies (original behavior)
             source_db = self.db_connection.source_db
-            companies = source_db['financial_statements'].distinct('company_cik')
+            companies = source_db['financial_statements'].distinct('cik')
             
             logger.info(f"Found {len(companies)} companies to process (no tracker)")
             
@@ -208,7 +208,7 @@ class PeriodBasedFinancialCalculationService:
         source_db = self.db_connection.source_db
         
         # Get all statements for this company
-        statements = list(source_db['financial_statements'].find({'company_cik': company_cik}))
+        statements = list(source_db['financial_statements'].find({'cik': company_cik}))
         
         # Filter to only process unprocessed statements
         statements_to_process = [stmt for stmt in statements if stmt['_id'] in unprocessed_statements]
@@ -229,9 +229,9 @@ class PeriodBasedFinancialCalculationService:
         
         for statement_type, statements in statements_by_type.items():
             try:
-                if statement_type.lower() in ['cash_flow', 'cashflow', 'cash_flows']:
+                if statement_type.lower() in ['cash_flow', 'cashflow', 'cashflow']:
                     self._process_cash_flow_statement(company_cik, statement_type)
-                elif statement_type.lower() not in ['balance_sheet', 'balance_sheets']:
+                elif statement_type.lower() not in ['balancesheet', 'balance_sheets']:
                     # Process income statements and other statement types
                     self._process_income_statement(company_cik, statement_type)
                 # Balance sheets are skipped (point-in-time snapshots)
@@ -246,14 +246,14 @@ class PeriodBasedFinancialCalculationService:
         # Get statement types for this company
         source_db = self.db_connection.source_db
         statement_types = source_db['financial_statements'].distinct(
-            'statement_type', {'company_cik': company_cik}
+            'statement_type', {'cik': company_cik}
         )
         
         for statement_type in statement_types:
             try:
-                if statement_type.lower() in ['cash_flow', 'cashflow', 'cash_flows']:
+                if statement_type.lower() in ['cash_flow', 'cashflow', 'cashflow']:
                     self._process_cash_flow_statement(company_cik, statement_type)
-                elif statement_type.lower() not in ['balance_sheet', 'balance_sheets']:
+                elif statement_type.lower() not in ['balancesheet', 'balance_sheets']:
                     # Process income statements and other statement types
                     self._process_income_statement(company_cik, statement_type)
                 # Balance sheets are skipped (point-in-time snapshots)
@@ -290,9 +290,9 @@ class PeriodBasedFinancialCalculationService:
 
         for statement_type, stmts in by_type.items():
             try:
-                if statement_type.lower() in ('cash_flow', 'cashflow', 'cash_flows'):
+                if statement_type.lower() in ('cash_flow', 'cashflow', 'cashflow'):
                     self._process_cash_flow_from_memory(company_cik, statement_type, stmts)
-                elif statement_type.lower() not in ('balance_sheet', 'balance_sheets'):
+                elif statement_type.lower() not in ('balancesheet', 'balance_sheets'):
                     self._process_income_from_memory(company_cik, statement_type, stmts)
             except Exception as e:
                 logger.error(f"Error in quarterly deaccumulation for {company_cik} {statement_type}: {e}", exc_info=True)
@@ -318,7 +318,7 @@ class PeriodBasedFinancialCalculationService:
             # Embed cik + statement_type + accession_number into reporting_period
             # so _save_period_data can use them without touching source_db
             enriched_period = dict(reporting_period)
-            enriched_period['_company_cik'] = company_cik
+            enriched_period['_cik'] = company_cik
             enriched_period['_statement_type'] = statement_type
             enriched_period['accession_number'] = filing_doc.get('accession_number',
                                                                   filing_doc.get('accessionNumber', ''))
@@ -466,7 +466,7 @@ class PeriodBasedFinancialCalculationService:
         
         # Get statements with filing information
         pipeline = [
-            {'$match': {'company_cik': company_cik, 'statement_type': statement_type}},
+            {'$match': {'cik': company_cik, 'statement_type': statement_type}},
             {'$lookup': {'from': 'filings', 'localField': 'filing_id', 'foreignField': '_id', 'as': 'filing_info'}},
             {'$unwind': '$filing_info'},
             {'$match': {'filing_info.form_type': {'$in': ['10-Q', '10-K']}}},
@@ -797,7 +797,7 @@ class PeriodBasedFinancialCalculationService:
             # Prefer values embedded by _build_period_data_from_memory (merged pipeline),
             # otherwise fall back to source-DB reads (legacy standalone runs).
             rp = period_data.reporting_period or {}
-            company_cik = rp.get('_company_cik') or self._extract_cik_from_period_data(period_data)
+            company_cik = rp.get('_cik') or self._extract_cik_from_period_data(period_data)
             statement_type = rp.get('_statement_type') or self._extract_statement_type_from_period_data(period_data)
 
             if not company_cik or not statement_type:
@@ -879,7 +879,7 @@ class PeriodBasedFinancialCalculationService:
                         # matches / skipped inserts).
                         query = {
                             'concept_id': concept_doc['_id'],
-                            'company_cik': company_cik,
+                            'cik': company_cik,
                             'reporting_period.fiscal_year': period_data.fiscal_year,
                             'calculated': is_calculated
                         }
@@ -900,12 +900,12 @@ class PeriodBasedFinancialCalculationService:
                         # equals its reported value but must still be persisted as calculated
                         # so the series has no gap.  Only Q2/Q3 differ, but we keep all of them.
                         _is_cash_flow = str(statement_type).lower() in (
-                            'cash_flow', 'cashflow', 'cash_flows'
+                            'cash_flow', 'cashflow', 'cashflow'
                         )
                         if is_calculated and not _is_cash_flow:
                             reported_query = {
                                 'concept_id': concept_doc['_id'],
-                                'company_cik': company_cik,
+                                'cik': company_cik,
                                 'reporting_period.fiscal_year': period_data.fiscal_year,
                                 'calculated': False,
                             }
@@ -978,7 +978,7 @@ class PeriodBasedFinancialCalculationService:
         """Extract company CIK from period data."""
         source_db = self.db_connection.source_db
         statement = source_db['financial_statements'].find_one({'_id': period_data.statement_id})
-        return statement.get('company_cik') if statement else None
+        return statement.get('cik') if statement else None
     
     def _extract_statement_type_from_period_data(self, period_data: PeriodData) -> Optional[str]:
         """Extract statement type from period data."""
@@ -1013,7 +1013,7 @@ class PeriodBasedFinancialCalculationService:
     def generate_period_report(self, company_cik: str, fiscal_year: int) -> Dict[str, Any]:
         """Generate a report showing period data calculations for a company."""
         return {
-            'company_cik': company_cik,
+            'cik': company_cik,
             'fiscal_year': fiscal_year,
             'status': 'Report generation not implemented in lean version'
         }
@@ -1030,7 +1030,7 @@ class PeriodBasedFinancialCalculationService:
         """
         query: Dict[str, Any] = {'calculated': False}
         if company_cik:
-            query['company_cik'] = company_cik
+            query['cik'] = company_cik
 
         # Clean up from quarterly repository (where quarterly calculations are stored)
         original_count = self.quarterly_value_repo.collection.count_documents(query)

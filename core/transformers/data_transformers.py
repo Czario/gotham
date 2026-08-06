@@ -63,7 +63,7 @@ class FilingDataTransformer:
                     acceptance_datetime = None
         
         return {
-            "company_cik": str(company_cik),
+            "cik": str(company_cik),
             "accession_number": filing_info['accessionNumber'],
             "form_type": filing_info['form'],
             "filing_date": datetime.strptime(filing_info['filingDate'], '%Y-%m-%d'),

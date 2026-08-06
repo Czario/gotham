@@ -10,7 +10,7 @@ cik = '0000094845'
 
 print("=== FY2026 rows with pre-2026 period_date ===")
 for v in db.concept_values_quarterly.find({
-    'company_cik': cik,
+    'cik': cik,
     'reporting_period.fiscal_year': 2026,
     'reporting_period.period_date': {'$lt': '2026-01-01'}
 }):
@@ -22,7 +22,7 @@ for v in db.concept_values_quarterly.find({
 
 print("\n=== Delete these rows and count ===")
 result = db.concept_values_quarterly.delete_many({
-    'company_cik': cik,
+    'cik': cik,
     'reporting_period.fiscal_year': 2026,
     'reporting_period.period_date': {'$lt': '2026-01-01'}
 })
@@ -32,7 +32,7 @@ print("\n=== Remaining FY2026 period_dates ===")
 from collections import Counter
 dates = Counter()
 for v in db.concept_values_quarterly.find(
-    {'company_cik': cik, 'reporting_period.fiscal_year': 2026},
+    {'cik': cik, 'reporting_period.fiscal_year': 2026},
     {'reporting_period.period_date': 1, 'reporting_period.quarter': 1}
 ):
     rp = v.get('reporting_period', {})

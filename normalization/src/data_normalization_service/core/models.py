@@ -52,7 +52,7 @@ class ConceptDocument:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for MongoDB insertion."""
         result = {
-            "company_cik": self.company_cik,
+            "cik": self.company_cik,
             "statement_type": self.statement_type,
             "concept": self.concept,
             "form_type": self.form_type,
@@ -126,11 +126,12 @@ class ValueDocument:
         """Convert to dictionary for MongoDB insertion."""
         result = {
             "concept_id": self.concept_id,
-            "company_cik": self.company_cik,
+            "cik": self.company_cik,
             "statement_type": self.statement_type,
             "form_type": self.form_type,
             "reporting_period": self.reporting_period,
             "value": self.value,
+            "earning_data": True,
             "created_at": self.created_at,
             "dimension_value": self.dimension_value
         }
@@ -142,15 +143,7 @@ class ValueDocument:
         # Add dimensional-specific fields if this is a dimensional value
         if self.dimension_value and self.dimensional_concept_id is not None:
             result["dimensional_concept_id"] = self.dimensional_concept_id
-        
-        # Add critical metadata fields if they have values
-        if self.fact_id is not None:
-            result["fact_id"] = self.fact_id
-        if self.decimals is not None:
-            result["decimals"] = self.decimals
-        if self.source is not None:
-            result["source"] = self.source
-        
+
         return result
 
 
@@ -216,7 +209,7 @@ class FinancialStatement:
         """Create instance from dictionary."""
         return cls(
             id=data['_id'],
-            company_cik=data['company_cik'],
+            company_cik=data['cik'],
             filing_id=data['filing_id'],
             statement_type=data['statement_type'],
             reporting_period=data['reporting_period'],

@@ -43,7 +43,7 @@ for ticker, cik in CIKS.items():
         nc_coll = f'normalized_concepts_{period}'
         cv_coll = f'concept_values_{period}'
 
-        all_docs = list(db[nc_coll].find({'company_cik': cik, 'statement_type': 'income_statement'}))
+        all_docs = list(db[nc_coll].find({'cik': cik, 'statement_type': 'income'}))
         if not all_docs:
             continue
 
@@ -176,8 +176,8 @@ for ticker, cik in CIKS.items():
 
         # All income statement concepts for this company
         inc_concepts = list(db[nc_coll].find({
-            'company_cik': cik,
-            'statement_type': 'income_statement'
+            'cik': cik,
+            'statement_type': 'income'
         }))
 
         if not inc_concepts:

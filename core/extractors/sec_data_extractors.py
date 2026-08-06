@@ -98,7 +98,7 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
         
         # Metadata
         "data_source": "sec_api_with_fiscal_calculations",
-        "company_cik": company_info.get('cik'),
+        "cik": company_info.get('cik'),
         "company_name": company_info.get('name'),
     }
     

@@ -47,8 +47,8 @@ def audit_company(ticker: str, cik: str):
         nc_coll = f'normalized_concepts_{period}'
         cv_coll = f'concept_values_{period}'
 
-        nc_docs = list(db[nc_coll].find({'company_cik': cik}))
-        cv_docs = list(db[cv_coll].find({'company_cik': cik}))
+        nc_docs = list(db[nc_coll].find({'cik': cik}))
+        cv_docs = list(db[cv_coll].find({'cik': cik}))
 
         if not nc_docs and not cv_docs:
             print(f"\n  [{period}]  No documents found in either collection")

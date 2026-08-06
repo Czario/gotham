@@ -480,7 +480,7 @@ class FiscalYearCalculator:
 def create_period_query_filter(cik: str, statement_type: str, period_type: Optional[str] = None) -> Dict[str, Any]:
     """Create MongoDB query filter for financial statements"""
     query_filter = {
-        'company_cik': str(cik),
+        'cik': str(cik),
         'statement_type': statement_type
     }
     

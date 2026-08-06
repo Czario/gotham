@@ -65,7 +65,7 @@ class DuplicatePreventionManager:
         
         # Get all concepts for this company/statement combination
         concepts = list(self.concept_repo.collection.find({
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type
         }))
         
@@ -132,7 +132,7 @@ class DuplicatePreventionManager:
         
         # Check if this path-order combination already exists
         existing = self.concept_repo.collection.find_one({
-            "company_cik": concept_doc.company_cik,
+            "cik": concept_doc.company_cik,
             "statement_type": concept_doc.statement_type,
             "path": concept_doc.path,
             "order_key": concept_doc.order_key
@@ -305,7 +305,7 @@ class DuplicatePreventionManager:
         """
         # Get all existing order_keys for this path
         existing_concepts = list(self.concept_repo.collection.find({
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type,
             "path": path
         }, {"order_key": 1}).sort("order_key", 1))
@@ -355,34 +355,10 @@ class DuplicatePreventionManager:
         """
         Create database indexes to prevent duplicates at the database level.
         """
-        try:
-            # Create compound unique index on company_cik, statement_type, path, order_key
-            self.concept_repo.collection.create_index([
-                ("company_cik", 1),
-                ("statement_type", 1),
-                ("path", 1),
-                ("order_key", 1)
-            ], unique=True, background=True, name="unique_path_order")
-            
-            # Create index on company_cik, statement_type, concept (for existing lookups)
-            self.concept_repo.collection.create_index([
-                ("company_cik", 1),
-                ("statement_type", 1),
-                ("concept", 1)
-            ], background=True, name="concept_lookup")
-            
-            # Create index for path-based queries
-            self.concept_repo.collection.create_index([
-                ("company_cik", 1),
-                ("statement_type", 1),
-                ("path", 1)
-            ], background=True, name="path_lookup")
-            
-            logger.info("Database indexes created successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to create database indexes: {e}")
-    
+        # Indexes are managed by create-indexes.js in admin_backend
+        # No auto-creation here.
+        pass
+
     def close(self):
         """Close database connections."""
         self.db_connection.close()

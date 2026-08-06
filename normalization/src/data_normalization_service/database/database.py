@@ -118,7 +118,7 @@ class ConceptRepository:
         """Find existing concept (regular or dimensional)."""
         logger.debug(f"Querying concept: company_cik={company_cik}, statement_type={statement_type}, concept={concept}, dimension_concept={dimension_concept}")
         result = self.collection.find_one({
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type,
             "concept": concept,
             "dimension_concept": dimension_concept
@@ -154,7 +154,7 @@ class ConceptRepository:
                 "path": {"$exists": True, "$ne": None},
                 "order_key": {"$exists": True, "$ne": None}
             },
-            {"path": 1, "order_key": 1, "company_cik": 1, "_id": 0}
+            {"path": 1, "order_key": 1, "cik": 1, "_id": 0}
         )
         
         # Collect all references
@@ -167,7 +167,7 @@ class ConceptRepository:
         if len(references) == 1:
             # Single reference - use it directly
             result = references[0]
-            logger.debug(f"Found single reference from company {result.get('company_cik')}: path={result.get('path')}, order_key={result.get('order_key')}")
+            logger.debug(f"Found single reference from company {result.get('cik')}: path={result.get('path')}, order_key={result.get('order_key')}")
             return result
         
         # Multiple references - find the most common path and order_key
@@ -186,20 +186,20 @@ class ConceptRepository:
         reference_company = None
         for ref in references:
             if ref['path'] == most_common_path and ref['order_key'] == most_common_order_key:
-                reference_company = ref['company_cik']
+                reference_company = ref['cik']
                 break
         
         # If no exact match, use first company with most common path
         if not reference_company:
             for ref in references:
                 if ref['path'] == most_common_path:
-                    reference_company = ref['company_cik']
+                    reference_company = ref['cik']
                     break
         
         result = {
             'path': most_common_path,
             'order_key': most_common_order_key,
-            'company_cik': reference_company or references[0]['company_cik']
+            'cik': reference_company or references[0]['cik']
         }
         
         logger.info(f"Selected most common hierarchy for {concept}: path={most_common_path} ({path_counts[most_common_path]}/{len(references)} companies), order_key={most_common_order_key} ({order_key_counts[most_common_order_key]}/{len(references)} companies)")
@@ -212,7 +212,7 @@ class ConceptRepository:
         
         # Build query to find dimensional concept
         query = {
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type,
             "concept": concept,
             "dimension_concept": True
@@ -243,7 +243,7 @@ class ConceptRepository:
     def find_by_path(self, company_cik: str, statement_type: str, path: str, dimension_concept: bool = False) -> Optional[Dict[str, Any]]:
         """Find concept by path."""
         return self.collection.find_one({
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type,
             "path": path,
             "dimension_concept": dimension_concept
@@ -263,7 +263,7 @@ class ConceptRepository:
         # Find concepts whose path starts with parent_path followed by a dot
         pattern = f"^{parent_path}\\."
         cursor = self.collection.find({
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type,
             "path": {"$regex": pattern},
             "dimension_concept": dimension_concept
@@ -296,7 +296,7 @@ class ConceptRepository:
             pattern = "^[^.]+$"  # Root level items only
         
         cursor = self.collection.find({
-            "company_cik": company_cik,
+            "cik": company_cik,
             "statement_type": statement_type,
             "path": {"$regex": pattern},
             "dimension_concept": dimension_concept
@@ -397,7 +397,7 @@ class ConceptRepository:
         if concept_doc.path and concept_doc.order_key:
             # Build duplicate check query
             duplicate_query = {
-                "company_cik": concept_doc.company_cik,
+                "cik": concept_doc.company_cik,
                 "statement_type": concept_doc.statement_type,
                 "path": concept_doc.path,
                 "order_key": concept_doc.order_key,

@@ -158,9 +158,9 @@ class EnhancedFinancialStatementProcessor:
         # (NetIncomeLoss, ComprehensiveIncomeNetOfTax) are already captured from
         # the income_statement, so storing it would only duplicate concepts.
         statement_mapping = {
-            'income_statement': 'income_statement',
-            'balance_sheet': 'balance_sheet',
-            'cash_flow': 'cash_flows',
+            'income_statement': 'income',
+            'balance_sheet': 'balancesheet',
+            'cash_flow': 'cashflow',
         }
         
         for arelle_type, expected_type in statement_mapping.items():
@@ -192,7 +192,7 @@ class EnhancedFinancialStatementProcessor:
 
         result = {
             'filing_info': filing_info,
-            'company_cik': str(company_cik),
+            'cik': str(company_cik),
             'statements': statements,
             'reporting_period': reporting_period,
             'processed_at': datetime.now(),

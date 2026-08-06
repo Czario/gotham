@@ -38,7 +38,6 @@ class DatabaseManager:
                 collection = db[collection_name]
                 for index_spec, options in config['indexes']:
                     try:
-                        collection.create_index(index_spec, **options)
                     except Exception as e:
                         print(f"Index creation warning for {collection_name}: {e}")
             
@@ -113,7 +112,7 @@ class FilingRepository:
         """Save filing and return its ID"""
         result = self.collection.update_one(
             {
-                'company_cik': filing_data['company_cik'],
+                'cik': filing_data['cik'],
                 'accession_number': filing_data['accession_number']
             },
             {'$set': filing_data},
@@ -125,7 +124,7 @@ class FilingRepository:
         else:
             # Find the existing document
             doc = self.collection.find_one({
-                'company_cik': filing_data['company_cik'],
+                'cik': filing_data['cik'],
                 'accession_number': filing_data['accession_number']
             })
             return doc['_id'] if doc else None
@@ -138,7 +137,7 @@ class FilingRepository:
         """Get recent filings for a company"""
         try:
             cursor = self.collection.find(
-                {'company_cik': str(cik)},
+                {'cik': str(cik)},
                 sort=[('filing_date', -1)],
                 limit=limit
             )
@@ -162,7 +161,7 @@ class FinancialStatementRepository:
     def save_statement(self, statement_data: Dict) -> bool:
         """Save financial statement with enhanced duplicate prevention"""
         # Create unique identifier
-        unique_id = f"{statement_data['company_cik']}_{statement_data['filing_id']}_{statement_data['statement_type']}"
+        unique_id = f"{statement_data['cik']}_{statement_data['filing_id']}_{statement_data['statement_type']}"
         
         # Enhanced duplicate checking: use end_date as the primary period identifier
         reporting_period = statement_data.get('reporting_period', {})
@@ -174,7 +173,7 @@ class FinancialStatementRepository:
         # Check if we already have a statement for this exact period
         # Use end_date as the primary identifier since it's unique for each period
         existing_query = {
-            'company_cik': statement_data['company_cik'],
+            'cik': statement_data['cik'],
             'statement_type': statement_data['statement_type'],
             'reporting_period.end_date': end_date
         }
@@ -182,7 +181,7 @@ class FinancialStatementRepository:
         # Fallback to fiscal_year + quarter only if end_date is not available AND fiscal_year exists
         if end_date is None and fiscal_year is not None:
             existing_query = {
-                'company_cik': statement_data['company_cik'],
+                'cik': statement_data['cik'],
                 'statement_type': statement_data['statement_type'],
                 'reporting_period.fiscal_year': fiscal_year,
                 'reporting_period.period_type': period_type
@@ -193,7 +192,7 @@ class FinancialStatementRepository:
         elif end_date is None and fiscal_year is None:
             # Final fallback: use filing_id as unique identifier if no period info available
             existing_query = {
-                'company_cik': statement_data['company_cik'],
+                'cik': statement_data['cik'],
                 'statement_type': statement_data['statement_type'],
                 'filing_id': statement_data.get('filing_id')
             }
@@ -213,7 +212,7 @@ class FinancialStatementRepository:
             else:
                 period_desc = f"filing {current_filing_id}"
             
-            logger.warning(f"Found existing statement for {statement_data['company_cik']} {statement_data['statement_type']} "
+            logger.warning(f"Found existing statement for {statement_data['cik']} {statement_data['statement_type']} "
                          f"period {period_desc}")
             logger.info(f"   Existing filing: {existing_filing_id}")
             logger.info(f"   Current filing:  {current_filing_id}")
@@ -234,7 +233,7 @@ class FinancialStatementRepository:
             # No existing statement for this period, safe to insert
             self.collection.update_one(
                 {
-                    'company_cik': statement_data['company_cik'],
+                    'cik': statement_data['cik'],
                     'filing_id': statement_data['filing_id'],
                     'statement_type': statement_data['statement_type']
                 },
@@ -247,7 +246,7 @@ class FinancialStatementRepository:
     def get_latest_statement(self, cik: str, statement_type: str) -> Optional[Dict]:
         """Get latest statement of a specific type"""
         return self.collection.find_one(
-            {'company_cik': str(cik), 'statement_type': statement_type},
+            {'cik': str(cik), 'statement_type': statement_type},
             sort=[('reporting_period.end_date', -1)]
         )
     
@@ -255,7 +254,7 @@ class FinancialStatementRepository:
         """Get recent financial statements for a company"""
         try:
             cursor = self.collection.find(
-                {'company_cik': str(cik)},
+                {'cik': str(cik)},
                 sort=[('reporting_period.end_date', -1)],
                 limit=limit
             )
@@ -272,14 +271,14 @@ class FinancialStatementRepository:
             
             # Match specific company if provided
             if company_cik:
-                pipeline.append({"$match": {"company_cik": company_cik}})
+                pipeline.append({"$match": {"cik": company_cik}})
             
             # Group by company, statement type, and reporting period
             pipeline.extend([
                 {
                     "$group": {
                         "_id": {
-                            "company_cik": "$company_cik",
+                            "cik": "$cik",
                             "statement_type": "$statement_type",
                             "fiscal_year": "$reporting_period.fiscal_year",
                             "quarter": "$reporting_period.quarter",
@@ -326,7 +325,7 @@ class FinancialStatementRepository:
                 group_info = duplicate_group["_id"]
                 documents = duplicate_group["documents"]
                 
-                print(f"\n📋 Duplicate group: {group_info['company_cik']} {group_info['statement_type']} "
+                print(f"\n📋 Duplicate group: {group_info['cik']} {group_info['statement_type']} "
                       f"FY{group_info['fiscal_year']} Q{group_info['quarter'] or 'N/A'}")
                 
                 # Sort by created_at to keep the most recent

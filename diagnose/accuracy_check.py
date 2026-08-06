@@ -33,8 +33,8 @@ for ticker, cik in CIKS.items():
         nc = f'normalized_concepts_{period}'
         cv = f'concept_values_{period}'
 
-        nc_docs = list(db[nc].find({'company_cik': cik}))
-        cv_docs = list(db[cv].find({'company_cik': cik}))
+        nc_docs = list(db[nc].find({'cik': cik}))
+        cv_docs = list(db[cv].find({'cik': cik}))
         id_to_nc = {str(d['_id']): d for d in nc_docs}
 
         # ── Check 1: duplicate NON-dimensional value rows for same concept+period+statement
@@ -80,7 +80,7 @@ for ticker, cik in CIKS.items():
 # ── Check 2 & 5: revenue breakdown accuracy for the latest period, HAL only (has clean segments)
 print(f"\n\n{'='*72}\n  DEEP CHECK: HAL latest-period revenue segment reconciliation\n{'='*72}")
 cik = CIKS['HAL']
-nc_docs = list(db['normalized_concepts_annual'].find({'company_cik': cik, 'statement_type': 'income_statement'}))
+nc_docs = list(db['normalized_concepts_annual'].find({'cik': cik, 'statement_type': 'income'}))
 id_to_nc = {str(d['_id']): d for d in nc_docs}
 
 # Find the RevenueFromContractWithCustomer parent

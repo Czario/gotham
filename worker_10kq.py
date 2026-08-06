@@ -170,7 +170,7 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
         _cv_a = app._cv_annual_col if hasattr(app, '_cv_annual_col') else None
         has_data = False
         for col in [c for c in [_cv_q, _cv_a] if c is not None]:
-            if col.count_documents({"company_cik": cik}, limit=1):
+            if col.count_documents({"cik": cik}, limit=1):
                 has_data = True
                 break
         if not has_data:

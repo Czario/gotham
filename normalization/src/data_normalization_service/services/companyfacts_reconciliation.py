@@ -80,7 +80,7 @@ class CompanyFactsReconciliationService:
         concept_index maps (statement_type, concept_name) -> concept_id so the
         recovered value can be attached to the right concept document.
         """
-        concepts = list(self.db[concepts_coll].find({"company_cik": cik}))
+        concepts = list(self.db[concepts_coll].find({"cik": cik}))
         concept_index: Dict[Tuple[str, str], ObjectId] = {}
         # group_concepts[(stype, canonical)] = list of concept_ids
         group_concepts: Dict[Tuple[str, str], List[ObjectId]] = defaultdict(list)
@@ -400,7 +400,7 @@ class CompanyFactsReconciliationService:
             "form_type": form_type,
             "fiscal_year": fiscal_year,
             "data_source": "sec_companyfacts_reconciliation",
-            "company_cik": cik,
+            "cik": cik,
             "unit": match.get("unit"),
             # accession_number intentionally omitted: gap-fill rows are sourced
             # from the SEC companyfacts API and do not belong to any single filing.

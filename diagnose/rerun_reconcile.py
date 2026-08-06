@@ -21,7 +21,7 @@ print(f"Stats: {stats}")
 print("\nFY2026 period_dates after reconciliation:")
 dates = Counter()
 for v in db.concept_values_quarterly.find(
-    {'company_cik': '0000094845', 'reporting_period.fiscal_year': 2026},
+    {'cik': '0000094845', 'reporting_period.fiscal_year': 2026},
     {'reporting_period.period_date': 1, 'reporting_period.quarter': 1}
 ):
     rp = v.get('reporting_period', {})
@@ -32,7 +32,7 @@ for k, cnt in sorted(dates.items()):
 
 print("\nFY2025 Q1 rows inserted by reconciliation (should now include the 13):")
 cnt_2025 = db.concept_values_quarterly.count_documents({
-    'company_cik': '0000094845',
+    'cik': '0000094845',
     'reporting_period.fiscal_year': 2025,
     'reporting_period.quarter': 1,
     'reporting_period.data_source': 'sec_companyfacts_reconciliation'

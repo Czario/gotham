@@ -4,7 +4,6 @@ Business logic services for financial data normalization.
 from typing import Dict, Set, Optional, NamedTuple, Any, List
 from bson import ObjectId
 import logging
-from pymongo.errors import DuplicateKeyError
 
 from ..core.models import ConceptKey, ConceptDocument, ValueDocument, Company, FinancialStatement
 from ..database import (
@@ -79,11 +78,6 @@ class FinancialNormalizationService:
         # Key is (ConceptKey, form_type) to separate annual and quarterly concepts
         self.concept_cache: Dict[tuple, ObjectId] = {}
         
-        # Cache for canonical period_dates to ensure consistency across filings
-        # Key: (company_cik, statement_type, fiscal_year, quarter)
-        # Value: canonical period_date string
-        self._canonical_period_date_cache: Dict[tuple, str] = {}
-        
         # Taxonomy label fixing is not supported; taxonomy_manager is always None.
         self.taxonomy_manager = None
 
@@ -97,72 +91,6 @@ class FinancialNormalizationService:
             # Default to annual for unknown form types
             logger.warning(f"Unknown form type: {form_type}, defaulting to annual repository")
             return self.annual_concept_repo
-
-    def _get_canonical_period_date(
-        self,
-        company_cik: str,
-        statement_type: str,
-        fiscal_year: int,
-        quarter: int,
-        period_date: str
-    ) -> str:
-        """
-        Get or set a canonical period_date for a given (company, statement_type, fiscal_year, quarter).
-        
-        This ensures all concept values for the same fiscal period have the same period_date,
-        even if they come from different filings or have slightly different dates due to
-        52/53-week fiscal calendars (like Apple).
-        
-        Args:
-            company_cik: Company CIK identifier
-            statement_type: Type of financial statement
-            fiscal_year: Fiscal year
-            quarter: Quarter number (1-4)
-            period_date: Default period date to use if no canonical date exists
-            
-        Returns:
-            Canonical period date string (format: YYYY-MM-DD)
-        """
-        cache_key = (company_cik, statement_type, fiscal_year, quarter)
-        
-        if cache_key in self._canonical_period_date_cache:
-            return self._canonical_period_date_cache[cache_key]
-        
-        # Get the appropriate value repository (use quarterly for quarterly data)
-        value_repo = self.quarterly_value_repo
-        
-        # Query existing values for this fiscal period to find the most common period_date
-        query = {
-            'company_cik': company_cik,
-            'statement_type': statement_type,
-            'reporting_period.fiscal_year': fiscal_year,
-            'reporting_period.quarter': quarter,
-            'reporting_period.period_date': {'$exists': True}
-        }
-        
-        existing_values = list(value_repo.collection.find(query, {'reporting_period.period_date': 1}).limit(100))
-        
-        if not existing_values:
-            # No existing data, use the provided period_date as canonical
-            canonical_date = period_date
-        else:
-            # Find the most common period_date
-            period_date_counts: Dict[str, int] = {}
-            for val in existing_values:
-                pd = val.get('reporting_period', {}).get('period_date')
-                if pd:
-                    period_date_counts[pd] = period_date_counts.get(pd, 0) + 1
-            
-            if not period_date_counts:
-                canonical_date = period_date
-            else:
-                # Return the most common period_date
-                canonical_date = max(period_date_counts.items(), key=lambda x: x[1])[0]
-        
-        # Cache the result
-        self._canonical_period_date_cache[cache_key] = canonical_date
-        
-        return canonical_date
 
     def _get_value_repo_by_form_type(self, form_type: str) -> ValueRepository:
         """Get the appropriate value repository based on form type."""
@@ -462,7 +390,7 @@ class FinancialNormalizationService:
 
         statement = _FS(
             id=statement_doc.get('_id', _ObjectId()),
-            company_cik=statement_doc['company_cik'],
+            company_cik=statement_doc['cik'],
             filing_id=filing.id,
             statement_type=statement_doc['statement_type'],
             reporting_period=statement_doc.get('reporting_period', {}),
@@ -473,7 +401,7 @@ class FinancialNormalizationService:
         # Core statements plus equity_changes (share buybacks, dividends, retained earnings).
         # comprehensive_income is intentionally excluded — its key metrics (NetIncomeLoss,
         # ComprehensiveIncomeNetOfTax) are already captured from the income_statement.
-        _ALLOWED_STATEMENT_TYPES = {'income_statement', 'balance_sheet', 'cash_flows'}
+        _ALLOWED_STATEMENT_TYPES = {'income', 'balancesheet', 'cashflow'}
         if statement.statement_type not in _ALLOWED_STATEMENT_TYPES:
             logger.debug(f"Skipping statement_type='{statement.statement_type}' (not in allowed set)")
             return
@@ -752,50 +680,60 @@ class FinancialNormalizationService:
         # Extract period information from the item
         period_info = self._extract_period_info_from_item(item)
         
-        # Clean reporting_period to remove redundant period_type and quarter (for 10-K)
-        clean_reporting_period = statement.reporting_period.copy() if hasattr(statement.reporting_period, 'copy') else dict(statement.reporting_period)
-        if isinstance(clean_reporting_period, dict):
-            # Remove period_type as it's redundant with form_type
-            if 'period_type' in clean_reporting_period:
-                del clean_reporting_period['period_type']
-            
-            # Remove quarter field for annual filings (10-K) since it's always None
-            if filing.form_type == '10-K' and 'quarter' in clean_reporting_period:
-                del clean_reporting_period['quarter']
-        
-        # Add period information from the item if available
+        # Clean reporting_period — keep only canonical fields
+        _ALLOWED_RP_KEYS = {
+            'end_date', 'period_date', 'fiscal_year', 'fiscal_year_end_code',
+            'data_source', 'unit', 'quarter', 'start_date',
+            'context_id', 'item_period', 'note', 'filing_report_date',
+        }
+        clean_reporting_period = {
+            k: v for k, v in (statement.reporting_period or {}).items()
+            if k in _ALLOWED_RP_KEYS
+        }
+        # Remove quarter for annual filings (10-K)
+        if filing.form_type == '10-K':
+            clean_reporting_period.pop('quarter', None)
+        # Add period info from item
         if period_info:
             clean_reporting_period.update(period_info)
 
-        # Normalize period_date to canonical value for this fiscal period
-        # This prevents duplicate period columns when the same fiscal period has slightly different dates
-        quarter = clean_reporting_period.get('quarter')
-        fiscal_year = clean_reporting_period.get('fiscal_year')
-        if quarter is not None and fiscal_year is not None:
-            period_date = clean_reporting_period.get('period_date')
-            if period_date:
-                # For quarterly data, normalize period_date to ensure consistency
-                # Use the fiscal year and quarter as the canonical key
-                # This handles 52/53-week fiscal calendars where period_date can vary by ±1 day
-                canonical_period_date = self._get_canonical_period_date(
-                    company_cik=statement.company_cik,
-                    statement_type=statement.statement_type,
-                    fiscal_year=fiscal_year,
-                    quarter=quarter,
-                    period_date=period_date
-                )
-                clean_reporting_period['period_date'] = canonical_period_date
-
-        # Add accession_number from filing to reporting_period
-        if filing.accession_number:
-            clean_reporting_period['accession_number'] = filing.accession_number
-        
         # Get the appropriate value repository based on form type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
         
+        # Check if value already exists to implement sync behavior (only insert new data)
+        existing_query = {
+            'concept_id': concept_id,
+            'cik': statement.company_cik,
+            'statement_type': statement.statement_type,
+            'form_type': filing.form_type,
+            'calculated': is_calculated
+        }
+        
+        # Add reporting period fields to query for precise matching
+        if 'fiscal_year' in clean_reporting_period:
+            existing_query['reporting_period.fiscal_year'] = clean_reporting_period['fiscal_year']
+        if 'period_date' in clean_reporting_period:
+            existing_query['reporting_period.period_date'] = clean_reporting_period['period_date']
+        if 'quarter' in clean_reporting_period:
+            existing_query['reporting_period.quarter'] = clean_reporting_period['quarter']
+        
+        existing_value = value_repo.collection.find_one(existing_query)
+        
+        if existing_value:
+            # If value exists but is missing accession_number, update it
+            if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
+                logger.debug(f"Updating existing value with missing accession_number for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
+                value_repo.collection.update_one(
+                    {'_id': existing_value['_id']},
+                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
+                )
+            else:
+                logger.debug(f"Value already exists for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}, skipping insertion")
+            return
+        
         # Extract metadata from metadata-only dimensional facts
         metadata_from_dimensional_facts = self._extract_metadata_from_dimensional_facts(item)
-
+        
         value_doc = ValueDocument(
             concept_id=concept_id,
             company_cik=statement.company_cik,
@@ -804,42 +742,19 @@ class FinancialNormalizationService:
             reporting_period=clean_reporting_period,
             value=value,
             created_at=statement.created_at,
-            fact_id=item.get('fact_id'),
-            decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals')
+            fact_id=item.get('fact_id'),  # Preserve fact_id for auditing
+            decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals')  # Preserve decimals from item or dimensional facts
         )
-
+        
+        # Add calculated field to distinguish direct vs derived data
         value_doc_dict = value_doc.to_dict()
         value_doc_dict['calculated'] = is_calculated
-        value_doc_dict.pop('_id', None)  # let MongoDB assign _id
-
-        # FIX: Use insert_one + catch DuplicateKeyError for atomic idempotency.
-        # The unique index on {company_cik, concept_id, fiscal_year, quarter} is the
-        # single source of truth — no period_date in the guard (avoids 1-day off-by-one
-        # duplicates in 52/53-week fiscal calendars).
-        unique_filter = {
-            'concept_id': concept_id,
-            'company_cik': statement.company_cik,
-            'reporting_period.fiscal_year': clean_reporting_period.get('fiscal_year'),
-            'calculated': is_calculated,
-        }
-        if clean_reporting_period.get('quarter') is not None:
-            unique_filter['reporting_period.quarter'] = clean_reporting_period['quarter']
-
-        try:
-            value_repo.collection.insert_one(value_doc_dict)
-            logger.debug(f"Inserted new value for concept {concept_id}, "
-                         f"FY{clean_reporting_period.get('fiscal_year')} "
-                         f"Q{clean_reporting_period.get('quarter', 'N/A')}")
-        except DuplicateKeyError:
-            # Already exists — blocked by unique index. Backfill accession_number if missing.
-            logger.debug(f"Value already exists for concept {concept_id} "
-                         f"FY{clean_reporting_period.get('fiscal_year')} "
-                         f"Q{clean_reporting_period.get('quarter', 'N/A')}, skipping")
-            if filing.accession_number:
-                value_repo.collection.update_one(
-                    {**unique_filter, 'reporting_period.accession_number': {'$exists': False}},
-                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
-                )
+        if filing.accession_number:
+            value_doc_dict['accession_number'] = filing.accession_number
+        
+        # Insert the value (only new data)
+        value_repo.collection.insert_one(value_doc_dict)
+        logger.debug(f"Inserted new value for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
         
         # Validate critical data preservation
         if item.get('fact_id') and not value_doc.fact_id:
@@ -1049,7 +964,7 @@ class FinancialNormalizationService:
             ]:
                 # Find values missing accession_number
                 missing_accession_query = {
-                    'company_cik': company_cik,
+                    'cik': company_cik,
                     'reporting_period.accession_number': {'$exists': False}
                 }
                 
@@ -1064,7 +979,7 @@ class FinancialNormalizationService:
                 
                 # Get all financial statements for this company to create the mapping
                 source_statements = self.financial_repo.collection.find({
-                    'company_cik': company_cik
+                    'cik': company_cik
                 })
                 
                 for stmt in source_statements:
@@ -1352,18 +1267,14 @@ class FinancialNormalizationService:
             'start_date': self._get_quarter_start_date(fiscal_year, quarter),
             'end_date': self._get_quarter_end_date(fiscal_year, quarter)
         }
-        
-        # Add accession_number from filing to reporting_period
-        if filing.accession_number:
-            reporting_period['accession_number'] = filing.accession_number
-        
+
         # Get the appropriate value repository based on form_type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
         
         # Check if value already exists to implement sync behavior (only insert new data)
         existing_query = {
             'concept_id': concept_id,
-            'company_cik': statement.company_cik,
+            'cik': statement.company_cik,
             'statement_type': statement.statement_type,
             'form_type': filing.form_type,
             'reporting_period.fiscal_year': fiscal_year,
@@ -1374,6 +1285,7 @@ class FinancialNormalizationService:
         existing_value = value_repo.collection.find_one(existing_query)
         
         if existing_value:
+            # If value exists but is missing accession_number, update it
             if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
                 logger.debug(f"Updating existing normalized cashflow value with missing accession_number for concept {concept_id}, Q{quarter} {fiscal_year}")
                 value_repo.collection.update_one(
@@ -1397,25 +1309,15 @@ class FinancialNormalizationService:
             created_at=datetime.now()
         )
         
+        # Add calculated field to distinguish normalized data
         value_doc_dict = value_doc.to_dict()
         value_doc_dict['calculated'] = is_calculated
-        value_doc_dict.pop('_id', None)
-
-        # FIX: Atomic insert guarded by unique index {company_cik, concept_id, fiscal_year, quarter}
-        try:
-            value_repo.collection.insert_one(value_doc_dict)
-            logger.debug(f"Inserted new normalized cashflow Q{quarter} {fiscal_year}: {concept_id}")
-        except DuplicateKeyError:
-            logger.debug(f"Normalized cashflow value already exists for concept {concept_id}, Q{quarter} {fiscal_year}, skipping (DuplicateKeyError)")
-            if filing.accession_number:
-                value_repo.collection.update_one(
-                    {'concept_id': concept_id, 'company_cik': statement.company_cik,
-                     'reporting_period.fiscal_year': fiscal_year,
-                     'reporting_period.quarter': quarter,
-                     'calculated': is_calculated,
-                     'reporting_period.accession_number': {'$exists': False}},
-                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
-                )
+        if filing.accession_number:
+            value_doc_dict['accession_number'] = filing.accession_number
+        
+        # Insert the normalized value using the appropriate repository based on form_type
+        value_repo.collection.insert_one(value_doc_dict)
+        logger.debug(f"Inserted new normalized cashflow Q{quarter} {fiscal_year}: {concept_id}")
 
     def _get_quarter_start_date(self, fiscal_year: int, quarter: int):
         """Get start date for a quarter."""
@@ -2042,28 +1944,7 @@ class FinancialNormalizationService:
                 del clean_reporting_period['period_type']
             if filing.form_type == '10-K' and 'quarter' in clean_reporting_period:
                 del clean_reporting_period['quarter']
-        
-        # Normalize period_date to canonical value for this fiscal period
-        # This prevents duplicate period columns when the same fiscal period has slightly different dates
-        quarter = clean_reporting_period.get('quarter')
-        fiscal_year = clean_reporting_period.get('fiscal_year')
-        if quarter is not None and fiscal_year is not None:
-            period_date = clean_reporting_period.get('period_date')
-            if period_date:
-                # For quarterly data, normalize period_date to ensure consistency
-                canonical_period_date = self._get_canonical_period_date(
-                    company_cik=statement.company_cik,
-                    statement_type=statement.statement_type,
-                    fiscal_year=fiscal_year,
-                    quarter=quarter,
-                    period_date=period_date
-                )
-                clean_reporting_period['period_date'] = canonical_period_date
-        
-        # Add accession_number from filing to reporting_period
-        if filing.accession_number:
-            clean_reporting_period['accession_number'] = filing.accession_number
-        
+
         # Check for existing dimensional value to prevent duplicates
         # Get the appropriate value repository based on form type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
@@ -2100,14 +1981,7 @@ class FinancialNormalizationService:
             decimals=dimension_data.get('decimals')  # Preserve decimals for precision
         )
         
-        # FIX: find_dimensional_existing_value now checks fiscal_year+quarter (not the
-        # full reporting_period subdocument), so the guard above is reliable. Still wrap
-        # the insert in DuplicateKeyError as the final atomic safety net.
-        try:
-            value_repo.insert(dimensional_value_doc)
-        except DuplicateKeyError:
-            logger.debug(f"Dimensional value already exists for dimensional_concept_id {dimensional_concept_id} "
-                        f"(DuplicateKeyError), skipping")
+        value_repo.insert(dimensional_value_doc)
         
         # Validate critical data preservation
         if dimension_data.get('fact_id') and not dimensional_value_doc.fact_id:

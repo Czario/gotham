@@ -66,7 +66,7 @@ class ProcessingSummary:
 class DatabaseTracker:
     """Database-based tracker for normalization progress."""
     
-    def __init__(self, source_config, target_config, ensure_indexes: bool = True):
+    def __init__(self, source_config, target_config, ensure_indexes: bool = False):
         """
         Initialize tracker with source and target database connections.
         
@@ -101,76 +101,6 @@ class DatabaseTracker:
             self._ensure_indexes()
     
     def _ensure_indexes(self) -> None:
-        """
-        Ensure required indexes exist for optimal performance.
-        This is safe to call multiple times - MongoDB will skip existing indexes.
-        """
-        from pymongo import ASCENDING, IndexModel
-        
-        try:
-            logger.info("Ensuring MongoDB indexes exist for optimal performance...")
-            
-            # Source database indexes (skipped in merged pipeline where source_db_name is empty)
-            if self.source_connection.config.source_db_name:
-                source_db = self.source_connection.source_db
-                financial_statements = source_db['financial_statements']
-                
-                source_indexes = [
-                    IndexModel([("company_cik", ASCENDING)], name="idx_company_cik"),
-                    IndexModel(
-                        [("company_cik", ASCENDING), ("data", ASCENDING)],
-                        name="idx_company_cik_data"
-                    ),
-                    IndexModel(
-                        [
-                            ("company_cik", ASCENDING),
-                            ("reporting_period.end_date", ASCENDING),
-                            ("statement_type", ASCENDING)
-                        ],
-                        name="idx_company_period_type"
-                    ),
-                ]
-                
-                financial_statements.create_indexes(source_indexes)
-                logger.debug("Source database indexes verified/created")
-            
-            # Target database indexes
-            target_db = self.target_connection.target_db
-            
-            # Indexes for concept_values_annual
-            annual_indexes = [
-                IndexModel(
-                    [
-                        ("company_cik", ASCENDING),
-                        ("reporting_period.end_date", ASCENDING),
-                        ("statement_type", ASCENDING)
-                    ],
-                    name="idx_company_period_type"
-                ),
-                IndexModel([("company_cik", ASCENDING)], name="idx_company_cik"),
-            ]
-            
-            target_db['concept_values_annual'].create_indexes(annual_indexes)
-            
-            # Indexes for concept_values_quarterly
-            quarterly_indexes = [
-                IndexModel(
-                    [
-                        ("company_cik", ASCENDING),
-                        ("reporting_period.end_date", ASCENDING),
-                        ("statement_type", ASCENDING)
-                    ],
-                    name="idx_company_period_type"
-                ),
-                IndexModel([("company_cik", ASCENDING)], name="idx_company_cik"),
-            ]
-            
-            target_db['concept_values_quarterly'].create_indexes(quarterly_indexes)
-            logger.debug("Target database indexes verified/created")
-            
-            logger.info("✓ MongoDB indexes ready")
-            
-        except Exception as e:
             # Don't fail startup if index creation fails - just warn
             logger.warning(f"Could not ensure indexes: {e}. Performance may be degraded.")
             logger.info("Run scripts/create_indexes.py to manually create indexes.")
@@ -198,7 +128,7 @@ class DatabaseTracker:
                 {
                     "$group": {
                         "_id": {
-                            "company_cik": "$company_cik",
+                            "cik": "$cik",
                             "statement_type": "$statement_type",
                             "end_date": "$reporting_period.end_date"
                         }
@@ -221,7 +151,7 @@ class DatabaseTracker:
             pipeline_companies = [
                 {
                     "$group": {
-                        "_id": "$company_cik"
+                        "_id": "$cik"
                     }
                 },
                 {
@@ -236,9 +166,9 @@ class DatabaseTracker:
             quarterly_companies = set()
             
             if annual_companies_result:
-                annual_companies = set([doc['_id'] for doc in self.annual_value_repo.collection.aggregate([{"$group": {"_id": "$company_cik"}}])])
+                annual_companies = set([doc['_id'] for doc in self.annual_value_repo.collection.aggregate([{"$group": {"_id": "$cik"}}])])
             if quarterly_companies_result:
-                quarterly_companies = set([doc['_id'] for doc in self.quarterly_value_repo.collection.aggregate([{"$group": {"_id": "$company_cik"}}])])
+                quarterly_companies = set([doc['_id'] for doc in self.quarterly_value_repo.collection.aggregate([{"$group": {"_id": "$cik"}}])])
             
             processed_companies = len(annual_companies | quarterly_companies)
             
@@ -313,7 +243,7 @@ class DatabaseTracker:
                 },
                 {
                     "$group": {
-                        "_id": "$company_cik"
+                        "_id": "$cik"
                     }
                 }
             ]))
@@ -322,11 +252,11 @@ class DatabaseTracker:
             
             # Get all company CIKs that have been processed (have values in target)
             processed_ciks_annual = set([doc['_id'] for doc in self.annual_value_repo.collection.aggregate([
-                {"$group": {"_id": "$company_cik"}}
+                {"$group": {"_id": "$cik"}}
             ])])
             
             processed_ciks_quarterly = set([doc['_id'] for doc in self.quarterly_value_repo.collection.aggregate([
-                {"$group": {"_id": "$company_cik"}}
+                {"$group": {"_id": "$cik"}}
             ])])
             
             all_processed_ciks = processed_ciks_annual | processed_ciks_quarterly
@@ -360,7 +290,7 @@ class DatabaseTracker:
         # Query source statements for THIS company only (not all companies!)
         source_statements = list(self.source_statement_repo.collection.find(
             {
-                "company_cik": company_cik,
+                "cik": company_cik,
                 "data": {"$exists": True, "$nin": [[], None]}
             }
         ))
@@ -401,7 +331,7 @@ class DatabaseTracker:
                 
                 if statement_date:
                     query = {
-                        "company_cik": company_cik,
+                        "cik": company_cik,
                         "reporting_period.end_date": statement_date,
                         "statement_type": stmt.statement_type
                     }
@@ -488,7 +418,7 @@ class DatabaseTracker:
             
             if statement_date:
                 query = {
-                    "company_cik": statement.company_cik,
+                    "cik": statement.company_cik,
                     "reporting_period.end_date": statement_date,
                     "statement_type": statement.statement_type
                 }
@@ -531,7 +461,7 @@ class DatabaseTracker:
                 },
                 {
                     "$project": {
-                        "company_cik": 1,
+                        "cik": 1,
                         "year": {
                             "$year": {
                                 "$cond": [
@@ -550,7 +480,7 @@ class DatabaseTracker:
                 },
                 {
                     "$group": {
-                        "_id": "$company_cik"
+                        "_id": "$cik"
                     }
                 }
             ]
@@ -563,7 +493,7 @@ class DatabaseTracker:
             # Fallback: use cursor instead of loading all into memory
             cursor = self.source_statement_repo.collection.find(
                 {"data": {"$exists": True, "$nin": [[], None]}},
-                {"company_cik": 1, "reporting_period": 1}  # Only fetch needed fields
+                {"cik": 1, "reporting_period": 1}  # Only fetch needed fields
             )
             
             for doc in cursor:
@@ -581,7 +511,7 @@ class DatabaseTracker:
                             year = str(end_date.year)
                     
                     if year == fiscal_year:
-                        companies_set.add(doc['company_cik'])
+                        companies_set.add(doc['cik'])
                 except Exception:
                     continue
         
@@ -647,7 +577,7 @@ class DatabaseTracker:
                 },
                 {
                     "$group": {
-                        "_id": "$company_cik"
+                        "_id": "$cik"
                     }
                 }
             ]
@@ -660,7 +590,7 @@ class DatabaseTracker:
             # Fallback: use cursor (don't load all into memory)
             cursor = self.source_statement_repo.collection.find(
                 {"data": {"$exists": True, "$nin": [[], None]}},
-                {"company_cik": 1, "reporting_period": 1}  # Only fetch needed fields
+                {"cik": 1, "reporting_period": 1}  # Only fetch needed fields
             )
             
             for doc in cursor:
@@ -685,7 +615,7 @@ class DatabaseTracker:
                     if year and month:
                         stmt_quarter = f"Q{((month - 1) // 3) + 1}"
                         if year == fiscal_year and stmt_quarter == fiscal_period:
-                            companies_set.add(doc['company_cik'])
+                            companies_set.add(doc['cik'])
                             
                 except Exception as e:
                     logger.debug(f"Error processing statement for quarter search: {e}")
@@ -726,7 +656,7 @@ class DatabaseTracker:
         # For now, we'll use a simple approach
         try:
             existing_concepts = list(self.target_concept_repo.collection.find({
-                "company_cik": company_cik,
+                "cik": company_cik,
                 "statement_type": statement_type,
                 "dimension_concept": False
             }).sort("path", 1))

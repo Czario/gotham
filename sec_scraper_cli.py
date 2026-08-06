@@ -419,8 +419,6 @@ class SECDataScraperApp:
         self._cv_annual_col    = _norm_db['concept_values_annual']
         self._cv_quarterly_col = _norm_db['concept_values_quarterly']
         # Ensure the index that makes accession lookups fast exists (idempotent)
-        self._cv_annual_col.create_index('reporting_period.accession_number', background=True)
-        self._cv_quarterly_col.create_index('reporting_period.accession_number', background=True)
 
         # ---------------------------------------------------------------------------
         # Normalizer (merged pipeline) — writes directly to normalize_data
@@ -471,12 +469,12 @@ class SECDataScraperApp:
     def _accumulate_for_quarterly(self, cik: str, statement_doc: dict, filing_doc: dict) -> None:
         """Append a slim copy of the statement (for quarterly deaccumulation) to the per-company accumulator."""
         stmt_type = statement_doc.get('statement_type', '')
-        if stmt_type.lower() not in ('cash_flow', 'cashflow', 'cash_flows',
-                                      'income_statement', 'income_statements'):
+        if stmt_type.lower() not in ('cashflow', 'cash_flow', 'cashflow',
+                                      'income', 'income_statements'):
             return  # Balance sheets are skipped — point-in-time, no deaccumulation needed
         entry = {
             '_id': statement_doc.get('_id'),
-            'company_cik': cik,
+            'cik': cik,
             'statement_type': stmt_type,
             'reporting_period': statement_doc.get('reporting_period', {}),
             'filing_id': statement_doc.get('filing_id'),
@@ -570,7 +568,7 @@ class SECDataScraperApp:
             latest = None
             for col in (self._cv_annual_col, self._cv_quarterly_col):
                 doc = col.find_one(
-                    {'company_cik': cik},
+                    {'cik': cik},
                     sort=[('reporting_period.end_date', -1)],
                     projection={'reporting_period.end_date': 1}
                 )
@@ -601,7 +599,7 @@ class SECDataScraperApp:
             best_col_type: str = "annual"
             for col_type, col in [("annual", self._cv_annual_col), ("quarterly", self._cv_quarterly_col)]:
                 doc = col.find_one(
-                    {'company_cik': cik},
+                    {'cik': cik},
                     sort=[('reporting_period.end_date', -1)],
                     projection={'reporting_period': 1}
                 )
@@ -917,7 +915,7 @@ class SECDataScraperApp:
                     'form': 'Unknown',  # Will be determined from XBRL if possible
                     'filingDate': datetime.now().strftime('%Y-%m-%d'),
                     'reportDate': None,
-                    'company_cik': cik
+                    'cik': cik
                 }
 
             # Get ticker for logging
@@ -1291,7 +1289,7 @@ class SECDataScraperApp:
                     
                     # Content quality check for income_statement: warn if no revenue/profit concepts found.
                     # This indicates a classification error (e.g., CI statement used as income_statement).
-                    if statement_type == 'income_statement':
+                    if statement_type == 'income':
                         _revenue_markers = {
                             'Revenues', 'SalesRevenueNet', 'SalesRevenueGoodsNet',
                             'RevenueFromContractWithCustomer', 'GrossProfit',
@@ -1643,7 +1641,7 @@ class SECDataScraperApp:
                 doc['reporting_period']['accession_number']
                 for col in (self._cv_annual_col, self._cv_quarterly_col)
                 for doc in col.find(
-                    {'company_cik': cik, 'reporting_period.accession_number': {'$exists': True}},
+                    {'cik': cik, 'reporting_period.accession_number': {'$exists': True}},
                     projection={'reporting_period.accession_number': 1, 'reporting_period.end_date': 1}
                 )
                 if doc.get('reporting_period', {}).get('accession_number')
@@ -1651,7 +1649,7 @@ class SECDataScraperApp:
             latest_end = None
             for col in (self._cv_annual_col, self._cv_quarterly_col):
                 doc = col.find_one(
-                    {'company_cik': cik},
+                    {'cik': cik},
                     sort=[('reporting_period.end_date', -1)],
                     projection={'reporting_period.end_date': 1}
                 )

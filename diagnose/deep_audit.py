@@ -33,7 +33,7 @@ for ticker, cik in CIKS.items():
         cv_coll = f'concept_values_{period}'
 
         struct_docs = [
-            d for d in db[nc_coll].find({'company_cik': cik})
+            d for d in db[nc_coll].find({'cik': cik})
             if any(p in d.get('concept', '') for p in STRUCT_PATS)
             and 'Member' not in d.get('concept', '')
         ]
@@ -66,7 +66,7 @@ for ticker, cik in CIKS.items():
         cv_coll = f'concept_values_{period}'
 
         nf_docs = [
-            d for d in db[nc_coll].find({'company_cik': cik})
+            d for d in db[nc_coll].find({'cik': cik})
             if d.get('concept', '').startswith(NON_FIN_NS)
         ]
         if not nf_docs:
@@ -97,8 +97,8 @@ for ticker, cik in CIKS.items():
         nc_coll = f'normalized_concepts_{period}'
         cv_coll = f'concept_values_{period}'
 
-        nc_ids  = {str(d['_id']) for d in db[nc_coll].find({'company_cik': cik}, {'_id': 1})}
-        cv_docs = list(db[cv_coll].find({'company_cik': cik}, {'concept_id': 1, 'value': 1, 'statement_type': 1}))
+        nc_ids  = {str(d['_id']) for d in db[nc_coll].find({'cik': cik}, {'_id': 1})}
+        cv_docs = list(db[cv_coll].find({'cik': cik}, {'concept_id': 1, 'value': 1, 'statement_type': 1}))
 
         orphan_cv = [d for d in cv_docs if str(d.get('concept_id','')) not in nc_ids]
         null_cv   = [d for d in cv_docs if d.get('value') is None]
@@ -118,7 +118,7 @@ for ticker, cik in CIKS.items():
     for period in ('annual', 'quarterly'):
         nc_coll = f'normalized_concepts_{period}'
         by_stmt: dict = defaultdict(lambda: {'plain': 0, 'dim': 0})
-        for d in db[nc_coll].find({'company_cik': cik}):
+        for d in db[nc_coll].find({'cik': cik}):
             concept = d.get('concept', '')
             stmt    = d.get('statement_type', '?')
             if 'Member' in concept or concept.startswith(NON_FIN_NS):

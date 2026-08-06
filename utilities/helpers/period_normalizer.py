@@ -58,7 +58,7 @@ def create_period_query_filter(cik: str, statement_type: str, period_type: Optio
         MongoDB query filter
     """
     query_filter = {
-        'company_cik': str(cik),
+        'cik': str(cik),
         'statement_type': statement_type
     }
     

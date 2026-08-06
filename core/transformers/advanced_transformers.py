@@ -324,7 +324,7 @@ class EnhancedFinancialDataTransformer:
             statement_data: List of financial line items
             filing_id: Filing identifier
             company_cik: Company CIK
-            statement_type: Type of financial statement (e.g., 'income_statement', 'cash_flow', 'balance_sheet')
+            statement_type: Type of financial statement (e.g., 'income', 'cash_flow', 'balancesheet')
             reporting_period: Reporting period information
             primary_period_string: Primary period string from XBRL
             
@@ -339,7 +339,7 @@ class EnhancedFinancialDataTransformer:
         # Create the final document structure
         statement_doc = {
             'filing_id': filing_id,
-            'company_cik': company_cik,
+            'cik': company_cik,
             'statement_type': statement_type,
             'reporting_period': reporting_period,
             'primary_period_string': primary_period_string,

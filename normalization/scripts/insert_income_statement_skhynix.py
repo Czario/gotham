@@ -29,14 +29,13 @@ sys.path.insert(0, str(project_root / "src"))
 
 from bson import ObjectId
 from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError
 from data_normalization_service.core.config import AppConfig
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 COMPANY_CIK = "0002120882"
-STATEMENT_TYPE = "income_statement"
+STATEMENT_TYPE = "income"
 
 # ---------------------------------------------------------------------------
 # KRW → USD conversion rates (annual average KRW per 1 USD)
@@ -191,7 +190,7 @@ VALUED_CONCEPTS = {
 # ---------------------------------------------------------------------------
 def build_concept_doc(concept_def: dict, form_type: str, now: datetime) -> dict:
     return {
-        "company_cik": COMPANY_CIK,
+        "cik": COMPANY_CIK,
         "statement_type": STATEMENT_TYPE,
         "concept": concept_def["concept"],
         "form_type": form_type,
@@ -218,7 +217,7 @@ def upsert_concepts(collection, form_type: str, now: datetime) -> dict:
     for c in CONCEPTS:
         doc = build_concept_doc(c, form_type, now)
         filter_key = {
-            "company_cik": COMPANY_CIK,
+            "cik": COMPANY_CIK,
             "statement_type": STATEMENT_TYPE,
             "concept": c["concept"],
             "form_type": form_type,
@@ -248,29 +247,36 @@ def upsert_value(
     value: float,
     now: datetime,
 ) -> bool:
-    """Insert value if not already present. Returns True if inserted.
-
-    FIX: dropped reporting_period.period_date from the unique-key query (caused
-    off-by-one-day duplicates); insert is now atomic via DuplicateKeyError instead
-    of non-atomic find_one() + insert_one().
-    """
-    doc = {
+    """Insert value if not already present. Returns True if inserted."""
+    query: dict = {
         "concept_id": concept_id,
-        "company_cik": COMPANY_CIK,
+        "cik": COMPANY_CIK,
         "statement_type": STATEMENT_TYPE,
         "form_type": form_type,
-        "reporting_period": reporting_period,
-        "value": value,
-        "dimension_value": False,
-        "decimals": "-6",
-        "source": "manual_euroland_f1",
-        "created_at": now,
+        "reporting_period.fiscal_year": reporting_period["fiscal_year"],
+        "reporting_period.period_date": reporting_period["period_date"],
     }
-    try:
-        collection.insert_one(doc)
-        return True
-    except DuplicateKeyError:
+    if "quarter" in reporting_period:
+        query["reporting_period.quarter"] = reporting_period["quarter"]
+
+    if collection.find_one(query):
         return False
+
+    collection.insert_one(
+        {
+            "concept_id": concept_id,
+            "cik": COMPANY_CIK,
+            "statement_type": STATEMENT_TYPE,
+            "form_type": form_type,
+            "reporting_period": reporting_period,
+            "value": value,
+            "dimension_value": False,
+            "decimals": "-6",
+            "source": "manual_euroland_f1",
+            "created_at": now,
+        }
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -69,9 +69,9 @@ ENHANCED_COLLECTIONS_CONFIG = {
         'validator': {
             "$jsonSchema": {
                 "bsonType": "object",
-                "required": ["company_cik", "accession_number", "form_type", "filing_date", "created_at"],
+                "required": ["cik", "accession_number", "form_type", "filing_date", "created_at"],
                 "properties": {
-                    "company_cik": {"bsonType": "string"},
+                    "cik": {"bsonType": "string"},
                     "accession_number": {"bsonType": "string"},
                     "form_type": {"enum": ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-3"]},
                     "filing_date": {"bsonType": "date"},
@@ -81,8 +81,8 @@ ENHANCED_COLLECTIONS_CONFIG = {
             }
         },
         'indexes': [
-            ([("company_cik", ASCENDING), ("accession_number", ASCENDING)], {"unique": True}),
-            ([("company_cik", ASCENDING), ("filing_date", DESCENDING)], {}),
+            ([("cik", ASCENDING), ("accession_number", ASCENDING)], {"unique": True}),
+            ([("cik", ASCENDING), ("filing_date", DESCENDING)], {}),
             ([("form_type", ASCENDING)], {}),
             ([("filing_date", DESCENDING)], {})
         ]
@@ -92,11 +92,11 @@ ENHANCED_COLLECTIONS_CONFIG = {
         'validator': {
             "$jsonSchema": {
                 "bsonType": "object",
-                "required": ["company_cik", "filing_id", "statement_type", "reporting_period", "created_at"],
+                "required": ["cik", "filing_id", "statement_type", "reporting_period", "created_at"],
                 "properties": {
-                    "company_cik": {"bsonType": "string"},
+                    "cik": {"bsonType": "string"},
                     "filing_id": {"bsonType": "objectId"},
-                    "statement_type": {"enum": ["income_statement", "balance_sheet", "cash_flows", "equity", "comprehensive_income"]},
+                    "statement_type": {"enum": ["income", "balancesheet", "cashflow", "equity"]},
                     "reporting_period": {
                         "bsonType": "object",
                         "required": ["end_date"],
@@ -110,7 +110,7 @@ ENHANCED_COLLECTIONS_CONFIG = {
                             "form_type": {"bsonType": ["string", "null"]},
                             "fiscal_year_end_code": {"bsonType": ["string", "null"]},
                             "data_source": {"bsonType": ["string", "null"]},
-                            "company_cik": {"bsonType": ["string", "null"]},
+                            "cik": {"bsonType": ["string", "null"]},
                             "company_name": {"bsonType": ["string", "null"]},
                             "note": {"bsonType": ["string", "null"]},
                             "validation_warnings": {"bsonType": ["array", "null"]}
@@ -171,7 +171,7 @@ ENHANCED_COLLECTIONS_CONFIG = {
             }
         },
         'indexes': [
-            ([("company_cik", ASCENDING), ("statement_type", ASCENDING), ("reporting_period.end_date", DESCENDING)], {}),
+            ([("cik", ASCENDING), ("statement_type", ASCENDING), ("reporting_period.end_date", DESCENDING)], {}),
             ([("filing_id", ASCENDING)], {}),
             ([("statement_type", ASCENDING)], {}),
             ([("reporting_period.fiscal_year", ASCENDING)], {}),
@@ -215,12 +215,8 @@ def setup_enhanced_database_schema(db):
             
             # Create indexes
             collection = db[collection_name]
-            for index_spec, index_options in config['indexes']:
-                try:
-                    collection.create_index(index_spec, **index_options)
-                except Exception as e:
-                    # Index might already exist
-                    pass
+            # Indexes are managed by create-indexes.js in admin_backend
+            # No auto-creation here.
         
         print("Enhanced database schema setup completed successfully")
         print("New features:")

@@ -12,8 +12,8 @@ period = datetime(2026, 3, 28)
 
 # Get all concept_ids for income_statement FY2026 Q2 dimensional values
 dim_values = list(db['concept_values_quarterly'].find({
-    'company_cik': cik,
-    'statement_type': 'income_statement',
+    'cik': cik,
+    'statement_type': 'income',
     'reporting_period.end_date': period,
     'dimension_value': True
 }, {'concept_id':1,'value':1}))
@@ -36,7 +36,7 @@ for cid, doc in concepts.items():
 print('\n=== Checking concept_values_quarterly for segment axis data ===')
 # Sample a few dimensional value docs
 sample_docs = list(db['concept_values_quarterly'].find({
-    'company_cik': cik,
+    'cik': cik,
     'reporting_period.end_date': period,
     'dimension_value': True
 }).limit(10))
