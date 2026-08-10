@@ -5,7 +5,6 @@ import os
 import time
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -378,7 +377,7 @@ def parse_sec_filing_url(url: str) -> Optional[Dict[str, str]]:
 
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, latest: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None, workers: int = 1):
+    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, latest: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -388,13 +387,10 @@ class SECDataScraperApp:
         self.end_year = end_year
         self.enable_dimensions = enable_dimensions
         self.enable_reconciliation = enable_reconciliation
-        self.workers = max(1, workers)
         self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
-        # Thread-local storage for per-company state (current_company_doc / data)
-        # so parallel workers don't overwrite each other's company context.
-        self._thread_local = threading.local()
-        # Lock protecting the shared _quarterly_accumulator dict during parallel runs.
-        self._qaccum_lock = threading.Lock()
+        # Per-company state (sequential-only — no threading needed)
+        self.current_company_data = None
+        self.current_company_doc = None
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = target_fiscal_quarter
         self.reload = reload
@@ -481,13 +477,11 @@ class SECDataScraperApp:
             'data': statement_doc.get('data', []),
             '_filing_doc': filing_doc,  # carry filing for accession_number lookup
         }
-        with self._qaccum_lock:
-            self._quarterly_accumulator.setdefault(cik, []).append(entry)
+        self._quarterly_accumulator.setdefault(cik, []).append(entry)
 
     def _flush_quarterly_accumulator(self, cik: str) -> None:
         """Run deaccumulation for a company then free its accumulator entry."""
-        with self._qaccum_lock:
-            statements = self._quarterly_accumulator.pop(cik, [])
+        statements = self._quarterly_accumulator.pop(cik, [])
         if not statements:
             return
         logger.info(f"Running quarterly deaccumulation for {cik} ({len(statements)} statements)")
@@ -647,7 +641,7 @@ class SECDataScraperApp:
                 error_msg = f"Failed to fetch company data for CIK: {cik}"
                 logger.error(error_msg)
                 return False
-            self._thread_local.current_company_data = company_data
+            self.current_company_data = company_data
 
             _range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
             logger.info(f"Fetched {len(filings_list)} total filings for company {company_data.get('name', 'Unknown')} {_range_desc}")
@@ -662,7 +656,7 @@ class SECDataScraperApp:
             
             # Step 2: Prepare company doc for in-memory passing to normalization service
             company_doc = self.company_transformer.transform_company_data(company_data)
-            self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
+            self.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
             logger.info(f"Company data ready for CIK: {cik}")
             
             # Step 3: Process filings (10-K and 10-Q) with existence checks and reload logic
@@ -706,109 +700,61 @@ class SECDataScraperApp:
                 accession_number = filing.get('accessionNumber', '')
                 form_type = filing.get('form', '')
                 filing_date_short = (filing.get('filingDate') or '')[:7]  # YYYY-MM
-                filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} ⬇ net")
                 filing_bar.update(1)
                 
                 # Log to summary file
                 if summary and accession_number:
                     summary.log_filing_progress(ticker, i, len(target_filings), accession_number, "processing")
                 filing_date = filing.get('filingDate')
-                acceptance_datetime = filing.get('acceptanceDateTime')
-                
-                # Build filter for checking/deleting existing filings
-                # Use accession_number if available, otherwise use reporting period fields
-                _use_accession = bool(accession_number)
-                if _use_accession:
-                    _acc_filter = {'reporting_period.accession_number': accession_number}
-                else:
-                    # No accession number - build filter from reporting period fields
-                    _acc_filter = {'company_cik': cik}
+
+                # ── RELOAD: delete existing period data first, then always re-process ──
+                if self.reload:
+                    _del_filter: dict = {'cik': cik}
                     if self.target_fiscal_year:
-                        _acc_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+                        _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
                     if self.target_fiscal_quarter:
-                        # Extract quarter number from string like "Q2"
                         try:
                             quarter_num = int(self.target_fiscal_quarter.replace('Q', ''))
-                            _acc_filter['reporting_period.quarter'] = quarter_num
+                            _del_filter['reporting_period.quarter'] = quarter_num
                         except (ValueError, AttributeError):
                             pass
-                    # Add form_type to narrow down to this specific filing type
                     if form_type:
-                        _acc_filter['form_type'] = form_type
-                    # If we have a filing date, use it to identify the specific period
-                    if filing_date:
-                        _acc_filter['reporting_period.period_date'] = filing_date
-                
-                # Check if filing already processed by querying concept_values directly.
-                # When --fiscal-year is active, also require that at least one row for
-                # the TARGET fiscal year exists under this accession.  Prior-year
-                # comparative rows (e.g. FY2025 rows that reference a FY2026 accession
-                # number) must not satisfy this check — otherwise deleting FY2026 rows
-                # and re-running would still show as "already processed".
-                existing_filing = (
-                    self._cv_annual_col.find_one(_acc_filter, projection={'_id': 1})
-                    or self._cv_quarterly_col.find_one(_acc_filter, projection={'_id': 1})
-                )
+                        _del_filter['form_type'] = form_type
 
-                if existing_filing and not self.reload:
-                    should_process = True
-                    if self.target_fiscal_year or self.target_fiscal_quarter:
-                        should_process = self._should_process_filing_for_period(filing, company_data)
+                    _period_desc = f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}" if self.target_fiscal_year else "all periods"
+                    filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} 🔄 reload {_period_desc}")
+                    ann_del = self._cv_annual_col.delete_many(_del_filter)
+                    qtr_del = self._cv_quarterly_col.delete_many(_del_filter)
+                    total_del = ann_del.deleted_count + qtr_del.deleted_count
+                    if total_del > 0:
+                        self.progress.status(f"  [reload]  deleted {total_del} existing rows  ({_period_desc})")
+                        logger.info(f"🔄 RELOAD: Deleted {ann_del.deleted_count} annual + {qtr_del.deleted_count} quarterly rows for {cik} ({_period_desc})")
+                    else:
+                        self.progress.status(f"  [reload]  no existing rows to delete  ({_period_desc})")
+                    # Fall through to process_filing_with_full_data below
 
-                    if should_process:
-                        if _use_accession:
-                            logger.debug(f"📋 Filing {accession_number} already processed, skipping")
-                        else:
-                            logger.debug(f"📋 Filing for {cik} FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''} already processed, skipping")
+                # ── Non-reload: skip filings already in the database ──
+                else:
+                    filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} ⬇")
+                    _acc_filter: dict
+                    if accession_number:
+                        _acc_filter = {'cik': cik, 'reporting_period.accession_number': accession_number}
+                    else:
+                        _acc_filter = {'cik': cik, 'reporting_period.period_date': filing_date}
+                        if form_type:
+                            _acc_filter['form_type'] = form_type
+                    existing_filing = (
+                        self._cv_annual_col.find_one(_acc_filter, projection={'_id': 1})
+                        or self._cv_quarterly_col.find_one(_acc_filter, projection={'_id': 1})
+                    )
+                    if existing_filing:
+                        self.progress.status(f"  [skip]   {accession_number or filing_date}  already stored")
+                        logger.debug(f"📋 Filing {accession_number or filing_date} already processed, skipping")
                         if self.html_download_path and accession_number:
                             self.sec_client.download_html_filing(cik, accession_number, filing_date or '2010-01-01', self.html_download_path, ticker)
                         filings_skipped += 1
                         if summary and accession_number:
                             summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
-                        continue
-                    else:
-                        if _use_accession:
-                            logger.debug(f"📋 Filing {accession_number} exists but outside target period, skipping")
-                        else:
-                            logger.debug(f"📋 Filing for {cik} exists but outside target period, skipping")
-                        filings_skipped += 1
-                        if summary and accession_number:
-                            summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
-                        continue
-                elif existing_filing and self.reload:
-                    should_reload = True
-                    if self.target_fiscal_year or self.target_fiscal_quarter:
-                        should_reload = self._should_process_filing_for_period(filing, company_data)
-
-                    if should_reload:
-                        if _use_accession:
-                            logger.info(f"🔄 RELOAD: Deleting existing values for {accession_number}")
-                            _del_filter = {'reporting_period.accession_number': accession_number}
-                            if self.target_fiscal_year:
-                                _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
-                        else:
-                            logger.info(f"🔄 RELOAD: Deleting existing values for {cik} FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}")
-                            _del_filter = {'company_cik': cik}
-                            if self.target_fiscal_year:
-                                _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
-                            if self.target_fiscal_quarter:
-                                try:
-                                    quarter_num = int(self.target_fiscal_quarter.replace('Q', ''))
-                                    _del_filter['reporting_period.quarter'] = quarter_num
-                                except (ValueError, AttributeError):
-                                    pass
-                            if form_type:
-                                _del_filter['form_type'] = form_type
-                            if filing_date:
-                                _del_filter['reporting_period.period_date'] = filing_date
-                        self._cv_annual_col.delete_many(_del_filter)
-                        self._cv_quarterly_col.delete_many(_del_filter)
-                    else:
-                        if _use_accession:
-                            logger.debug(f"📋 Filing {accession_number} outside reload period, skipping")
-                        else:
-                            logger.debug(f"📋 Filing for {cik} outside reload period, skipping")
-                        filings_skipped += 1
                         continue
                 
                 # Process individual filing with full SEC API data
@@ -893,11 +839,11 @@ class SECDataScraperApp:
                 return False
 
             # Store company data for use in financial processing
-            self._thread_local.current_company_data = company_data
+            self.current_company_data = company_data
 
             # Transform company doc for in-memory passing to normalization service
             company_doc = self.company_transformer.transform_company_data(company_data)
-            self._thread_local.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
+            self.current_company_doc = company_doc if isinstance(company_doc, dict) else {}
             logger.info(f"Company data ready for CIK: {cik}")
 
             # Find the specific filing in the filings list
@@ -1057,56 +1003,6 @@ class SECDataScraperApp:
             
         return filtered_filings
 
-    def _should_process_filing_for_period(self, filing: Dict, company_data: Dict) -> bool:
-        """Check if a filing should be processed based on target fiscal year/quarter"""
-        if not self.target_fiscal_year:
-            return True  # No period filter, process all
-        
-        from utilities.helpers.period_utils import FiscalYearCalculator
-        
-        report_date = filing.get('reportDate')
-        form_type = filing.get('form')
-        
-        if not report_date:
-            # No report date available, include it to be safe
-            return True
-        
-        fiscal_year_end_code = company_data.get('fiscalYearEnd')
-        if not fiscal_year_end_code:
-            # No fiscal year end info, include it to be safe
-            return True
-        
-        try:
-            report_end_date = datetime.strptime(report_date, '%Y-%m-%d')
-            fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                report_end_date, fiscal_year_end_code
-            )
-            
-            # Check if this filing matches our target criteria
-            if fiscal_year == self.target_fiscal_year:
-                # If specific quarter is requested, check quarter match
-                if self.target_fiscal_quarter:
-                    quarter_map = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4}
-                    target_quarter_num = quarter_map.get(self.target_fiscal_quarter)
-                    
-                    # For 10-K (annual), include if target quarter is Q4
-                    if form_type == '10-K' and self.target_fiscal_quarter == 'Q4':
-                        return True
-                    # For 10-Q (quarterly), check exact quarter match
-                    elif form_type == '10-Q' and quarter == target_quarter_num:
-                        return True
-                    else:
-                        return False
-                else:
-                    # No specific quarter requested, include all filings for the fiscal year
-                    return True
-            else:
-                return False
-                
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Could not calculate fiscal year for filing {filing.get('accessionNumber', 'unknown')}: {e}")
-            return True  # Include it to be safe
-
     @safe_processing_operation("filing_processing", default_return=False)
     def process_filing_with_full_data(self, cik: str, filing_info: Dict) -> bool:
         """
@@ -1138,10 +1034,10 @@ class SECDataScraperApp:
         # Calculate fiscal year and quarter if possible
         fiscal_year = None
         fiscal_quarter = None
-        if hasattr(self._thread_local, 'current_company_data') and self._thread_local.current_company_data:
+        if self.current_company_data:
             try:
                 from utilities.helpers.period_utils import FiscalYearCalculator
-                fiscal_year_end = self._thread_local.current_company_data.get('fiscalYearEnd', '1231')
+                fiscal_year_end = self.current_company_data.get('fiscalYearEnd', '1231')
                 if report_period:
                     report_end_date = datetime.strptime(report_period, '%Y-%m-%d')
                     fiscal_year, quarter_num = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
@@ -1215,7 +1111,7 @@ class SECDataScraperApp:
         """
         try:
             # Enrich company info with fiscal year information for this specific filing
-            company_info_enriched = getattr(self._thread_local, 'current_company_data', None) or {}
+            company_info_enriched = self.current_company_data or {}
             
             # Calculate fiscal year and quarter for this filing to pass to XBRL parser
             if company_info_enriched and filing_info:
@@ -1323,7 +1219,7 @@ class SECDataScraperApp:
                     # Merged pipeline: normalize directly into normalize_data
                     # ----------------------------------------------------------
                     logger.debug(f"   Normalizing {statement_type} into normalize_data...")
-                    company_doc = getattr(self._thread_local, 'current_company_doc', {}) or {}
+                    company_doc = self.current_company_doc or {}
                     filing_doc_for_norm = {
                         '_id': filing_id,
                         'form_type': filing_info.get('form', filing_info.get('form_type', 'UNKNOWN')),
@@ -1557,73 +1453,40 @@ class SECDataScraperApp:
         self.progress.status(f"\nProcessing {len(ciks)} companies...\n")
         self.progress.start_companies(len(ciks))
 
-        if self.workers > 1:
-            # ── Parallel mode ──────────────────────────────────────────────
-            def _process_one(cik: str):
-                try:
-                    display = self.progress.label(
-                        cik, self.sec_client.get_ticker_from_cik(cik) or cik)
-                    stats = self.process_company(cik, summary=None)
-                    return cik, stats, display
-                except Exception as e:
-                    logger.error(f"Failed to process CIK {cik}: {e}")
-                    return cik, False, cik
+        # ── Sequential processing (one company at a time) ──────────────
+        for i, cik in enumerate(ciks, 1):
+            try:
+                if self.progress.verbose:
+                    print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
 
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures = {executor.submit(_process_one, cik): cik for cik in ciks}
-                for future in as_completed(futures):
-                    cik, stats, display = future.result()
-                    ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
-                    if isinstance(stats, dict):
-                        results[cik] = stats
-                        self.progress.advance_company(
-                            ticker,
-                            stats.get('processed', 0),
-                            stats.get('skipped', 0),
-                            stats.get('failed', 0),
-                        )
-                        if not stats.get('success', False):
-                            self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
-                    else:
-                        results[cik] = {'ticker': display, 'success': bool(stats), 'processed': 0, 'skipped': 0, 'failed': 0}
-                        self.progress.advance_company(ticker, 0, 0, 0 if stats else 1)
-                        if not stats:
-                            self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
-        else:
-            # ── Sequential mode (existing behaviour) ───────────────────────
-            for i, cik in enumerate(ciks, 1):
-                try:
-                    if self.progress.verbose:
-                        print(f"[{i}/{len(ciks)}] Processing company CIK: {cik}")
+                logger.info(f"Starting processing for CIK: {cik}")
+                display = self.progress.label(
+                    cik, self.sec_client.get_ticker_from_cik(cik) or cik)
+                self.progress.set_current_company(display, i)
+                stats = self.process_company(cik, summary=None)
 
-                    logger.info(f"Starting processing for CIK: {cik}")
-                    display = self.progress.label(
-                        cik, self.sec_client.get_ticker_from_cik(cik) or cik)
-                    self.progress.set_current_company(display, i)
-                    stats = self.process_company(cik, summary=None)
+                ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
+                if isinstance(stats, dict):
+                    results[cik] = stats
+                    self.progress.advance_company(
+                        ticker,
+                        stats.get('processed', 0),
+                        stats.get('skipped', 0),
+                        stats.get('failed', 0),
+                    )
+                    if not stats.get('success', False):
+                        self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
+                else:
+                    results[cik] = {'ticker': display, 'success': bool(stats), 'processed': 0, 'skipped': 0, 'failed': 0}
+                    self.progress.advance_company(ticker, 0, 0, 0)
+                    if not stats:
+                        self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
 
-                    ticker = (stats.get('ticker') if isinstance(stats, dict) else None) or display
-                    if isinstance(stats, dict):
-                        results[cik] = stats
-                        self.progress.advance_company(
-                            ticker,
-                            stats.get('processed', 0),
-                            stats.get('skipped', 0),
-                            stats.get('failed', 0),
-                        )
-                        if not stats.get('success', False):
-                            self.progress.error(f"  ⚠️  {ticker} ({cik}) completed with errors")
-                    else:
-                        results[cik] = {'ticker': display, 'success': bool(stats), 'processed': 0, 'skipped': 0, 'failed': 0}
-                        self.progress.advance_company(ticker, 0, 0, 0)
-                        if not stats:
-                            self.progress.error(f"  ⚠️  CIK {cik} completed with errors")
+                # Brief pause between companies (rate limiter handles
+                # per-request pacing; this gives a small inter-company gap)
+                time.sleep(1)
 
-                    # Brief pause between companies (rate limiter handles
-                    # per-request pacing; this gives a small inter-company gap)
-                    time.sleep(1)
-
-                except Exception as e:
+            except Exception as e:
                     logger.error(f"Failed to process CIK {cik}: {e}")
                     self.progress.error(f"  ❌ CIK {cik} failed: {e}")
                     self.progress.advance_company(cik, 0, 0, 1)
@@ -1989,8 +1852,7 @@ def main():
         LoggerConfig.setup_logging(level='WARNING', console_output=False)
 
     # Build progress manager — verbose=False activates clean tqdm bars
-    _workers = max(1, int(os.getenv('SEC_WORKERS', '1')))
-    progress = ProgressManager(verbose=is_verbose, parallel=_workers > 1)
+    progress = ProgressManager(verbose=is_verbose, parallel=False)
 
     # Install a SIGINT handler so the first Ctrl+C immediately tears down the
     # progress bars (stopping any half-drawn refresh) before the normal
@@ -2301,7 +2163,6 @@ def main():
             html_download_path=html_download_path,
             enable_reconciliation=not args.no_reconciliation,
             progress=progress,
-            workers=_workers,
         )
 
         if not app.setup_database():

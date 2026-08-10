@@ -119,7 +119,6 @@ def _build_app() -> SECDataScraperApp:
         html_download_path=os.getenv("SEC_HTML_DOWNLOAD_PATH"),
         enable_reconciliation=True,
         progress=progress,
-        workers=1,
     )
     if not app.setup_database():
         raise RuntimeError("Failed to set up database")

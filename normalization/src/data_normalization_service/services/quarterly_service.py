@@ -761,7 +761,7 @@ class PeriodBasedFinancialCalculationService:
         # Query existing values for this fiscal period
         existing_values = list(self.quarterly_value_repo.collection.find(
             {
-                'company_cik': company_cik,
+                'cik': company_cik,
                 'statement_type': statement_type,
                 'reporting_period.fiscal_year': fiscal_year,
                 'reporting_period.quarter': quarter
@@ -858,6 +858,13 @@ class PeriodBasedFinancialCalculationService:
                             filing_doc = getattr(self, '_memory_filing_map', {}).get(str(period_data.statement_id))
                             if filing_doc and filing_doc.accession_number:
                                 clean_reporting_period['accession_number'] = filing_doc.accession_number
+
+                        # Keep only canonical fields in reporting_period
+                        _ALLOWED_RP_KEYS = {'end_date', 'period_date', 'fiscal_year', 'quarter'}
+                        clean_reporting_period = {
+                            k: v for k, v in clean_reporting_period.items()
+                            if k in _ALLOWED_RP_KEYS
+                        }
 
                         value_doc = ValueDocument(
                             concept_id=concept_doc['_id'],

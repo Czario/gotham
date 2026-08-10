@@ -342,7 +342,7 @@ class CompanyFactsReconciliationService:
             # unique index — so this pre-check and the index agree.
             exists_filter = {
                 "concept_id": concept_id,
-                "company_cik": cik,
+                "cik": cik,
                 "reporting_period.fiscal_year": reporting_period.get("fiscal_year"),
                 "dimension_value": False,
                 "calculated": False,  # reconciliation always inserts calculated=False
@@ -394,21 +394,7 @@ class CompanyFactsReconciliationService:
     ) -> Dict[str, Any]:
         end_dt = gap["period_end"]
         fiscal_year = match.get("fy") or end_dt.year
-        rp: Dict[str, Any] = {
-            "end_date": end_dt,
-            "period_date": gap["period_str"],
-            "form_type": form_type,
-            "fiscal_year": fiscal_year,
-            "data_source": "sec_companyfacts_reconciliation",
-            "cik": cik,
-            "unit": match.get("unit"),
-            # accession_number intentionally omitted: gap-fill rows are sourced
-            # from the SEC companyfacts API and do not belong to any single filing.
-            # The companyfacts API returns the accession of whichever filing most
-            # recently included a value (often a comparative from a later filing),
-            # which would corrupt the skip-detection logic that queries by
-            # accession + fiscal_year.
-        }
+        quarter = None
         # Derive fiscal_year and quarter from the VALUE's own period end date.
         # The SEC companyfacts API tags comparative values (prior-year column) with
         # the FILING's fiscal year (e.g. fy=2026 for a balance-sheet date of
@@ -423,11 +409,19 @@ class CompanyFactsReconciliationService:
                     end_dt, fye
                 )
                 if computed_fy:
-                    rp["fiscal_year"] = computed_fy   # override API fy
-                if computed_q is not None and form_type == "10-Q":
-                    rp["quarter"] = computed_q
+                    fiscal_year = computed_fy   # override API fy
+                if computed_q is not None:
+                    quarter = computed_q
             except Exception:
                 pass  # non-fatal; fall back to API fy and no quarter
-        if match.get("start"):
-            rp["item_period"] = f"{match['start']} to {match['end']}"
+        # Build canonical reporting_period with only essential fields
+        # accession_number intentionally omitted: gap-fill rows are sourced
+        # from the SEC companyfacts API and do not belong to any single filing.
+        rp: Dict[str, Any] = {
+            "end_date": end_dt,
+            "period_date": gap["period_str"],
+            "fiscal_year": fiscal_year,
+        }
+        if quarter is not None and form_type == "10-Q":
+            rp["quarter"] = quarter
         return rp

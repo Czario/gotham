@@ -681,11 +681,7 @@ class FinancialNormalizationService:
         period_info = self._extract_period_info_from_item(item)
         
         # Clean reporting_period — keep only canonical fields
-        _ALLOWED_RP_KEYS = {
-            'end_date', 'period_date', 'fiscal_year', 'fiscal_year_end_code',
-            'data_source', 'unit', 'quarter', 'start_date',
-            'context_id', 'item_period', 'note', 'filing_report_date',
-        }
+        _ALLOWED_RP_KEYS = {'end_date', 'period_date', 'fiscal_year', 'quarter'}
         clean_reporting_period = {
             k: v for k, v in (statement.reporting_period or {}).items()
             if k in _ALLOWED_RP_KEYS
@@ -693,9 +689,6 @@ class FinancialNormalizationService:
         # Remove quarter for annual filings (10-K)
         if filing.form_type == '10-K':
             clean_reporting_period.pop('quarter', None)
-        # Add period info from item
-        if period_info:
-            clean_reporting_period.update(period_info)
 
         # Get the appropriate value repository based on form type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
@@ -1260,12 +1253,13 @@ class FinancialNormalizationService:
                                                fiscal_year: int, quarter: int, value: float, 
                                                is_calculated: bool = True) -> None:
         """Create a value record for normalized cashflow data - with sync behavior (only insert if not exists)."""
-        # Create reporting period for the normalized quarter
+        # Create reporting period for the normalized quarter (canonical fields only)
+        end_date = self._get_quarter_end_date(fiscal_year, quarter)
         reporting_period = {
             'fiscal_year': fiscal_year,
             'quarter': quarter,
-            'start_date': self._get_quarter_start_date(fiscal_year, quarter),
-            'end_date': self._get_quarter_end_date(fiscal_year, quarter)
+            'period_date': end_date.strftime('%Y-%m-%d') if hasattr(end_date, 'strftime') else str(end_date),
+            'end_date': end_date,
         }
 
         # Get the appropriate value repository based on form_type

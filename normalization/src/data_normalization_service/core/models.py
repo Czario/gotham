@@ -131,7 +131,6 @@ class ValueDocument:
             "form_type": self.form_type,
             "reporting_period": self.reporting_period,
             "value": self.value,
-            "earning_data": True,
             "created_at": self.created_at,
             "dimension_value": self.dimension_value
         }

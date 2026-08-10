@@ -457,7 +457,7 @@ class ValueRepository:
             "dimension_value": dimension_value,
         }
         if company_cik is not None:
-            query["company_cik"] = company_cik
+            query["cik"] = company_cik
         if reporting_period.get("fiscal_year") is not None:
             query["reporting_period.fiscal_year"] = reporting_period["fiscal_year"]
         if reporting_period.get("quarter") is not None:
