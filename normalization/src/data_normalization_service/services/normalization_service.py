@@ -1931,13 +1931,14 @@ class FinancialNormalizationService:
             filing: Filing data
             dimension_data: The dimensional data containing value, fact_id, decimals, etc.
         """
-        # Clean reporting_period (same as regular values)
-        clean_reporting_period = statement.reporting_period.copy() if hasattr(statement.reporting_period, 'copy') else dict(statement.reporting_period)
-        if isinstance(clean_reporting_period, dict):
-            if 'period_type' in clean_reporting_period:
-                del clean_reporting_period['period_type']
-            if filing.form_type == '10-K' and 'quarter' in clean_reporting_period:
-                del clean_reporting_period['quarter']
+        # Clean reporting_period — keep only canonical fields (same as regular values)
+        _ALLOWED_RP_KEYS = {'end_date', 'period_date', 'fiscal_year', 'quarter'}
+        clean_reporting_period = {
+            k: v for k, v in (statement.reporting_period or {}).items()
+            if k in _ALLOWED_RP_KEYS
+        }
+        if filing.form_type == '10-K':
+            clean_reporting_period.pop('quarter', None)
 
         # Check for existing dimensional value to prevent duplicates
         # Get the appropriate value repository based on form type
@@ -1971,16 +1972,11 @@ class FinancialNormalizationService:
             created_at=statement.created_at,
             dimension_value=True,
             dimensional_concept_id=dimensional_concept_id,
-            fact_id=dimension_data.get('fact_id'),  # Preserve fact_id for auditing
-            decimals=dimension_data.get('decimals')  # Preserve decimals for precision
         )
         
-        value_repo.insert(dimensional_value_doc)
-        
-        # Validate critical data preservation
-        if dimension_data.get('fact_id') and not dimensional_value_doc.fact_id:
-            logger.warning(f"CRITICAL: Lost fact_id during dimensional value processing for concept_id {dimensional_concept_id}")
-        if dimension_data.get('decimals') and not dimensional_value_doc.decimals:
-            logger.warning(f"CRITICAL: Lost decimals during dimensional value processing for concept_id {dimensional_concept_id}")
-            
+        value_doc_dict = dimensional_value_doc.to_dict()
+        value_doc_dict['calculated'] = False
+        if filing.accession_number:
+            value_doc_dict['accession_number'] = filing.accession_number
+        value_repo.collection.insert_one(value_doc_dict)
         logger.debug(f"Created dimensional value: {dimension_data.get('value')} for dimensional_concept_id {dimensional_concept_id}")
