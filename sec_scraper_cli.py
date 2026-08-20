@@ -707,30 +707,16 @@ class SECDataScraperApp:
                     summary.log_filing_progress(ticker, i, len(target_filings), accession_number, "processing")
                 filing_date = filing.get('filingDate')
 
-                # ── RELOAD: delete existing period data first, then always re-process ──
+                # ── RELOAD: extract first, then replace existing data ──
                 if self.reload:
-                    _del_filter: dict = {'cik': cik}
-                    if self.target_fiscal_year:
-                        _del_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
-                    if self.target_fiscal_quarter:
-                        try:
-                            quarter_num = int(self.target_fiscal_quarter.replace('Q', ''))
-                            _del_filter['reporting_period.quarter'] = quarter_num
-                        except (ValueError, AttributeError):
-                            pass
-                    if form_type:
-                        _del_filter['form_type'] = form_type
-
-                    _period_desc = f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}" if self.target_fiscal_year else "all periods"
-                    filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} 🔄 reload {_period_desc}")
-                    ann_del = self._cv_annual_col.delete_many(_del_filter)
-                    qtr_del = self._cv_quarterly_col.delete_many(_del_filter)
-                    total_del = ann_del.deleted_count + qtr_del.deleted_count
-                    if total_del > 0:
-                        self.progress.status(f"  [reload]  deleted {total_del} existing rows  ({_period_desc})")
-                        logger.info(f"🔄 RELOAD: Deleted {ann_del.deleted_count} annual + {qtr_del.deleted_count} quarterly rows for {cik} ({_period_desc})")
+                    if self.latest:
+                        _period_desc = f"latest {form_type} {accession_number or filing_date}"
                     else:
-                        self.progress.status(f"  [reload]  no existing rows to delete  ({_period_desc})")
+                        _period_desc = f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}" if self.target_fiscal_year else "all periods"
+                    filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} 🔄 reload {_period_desc}")
+
+                    # The actual delete is intentionally deferred until after
+                    # XBRL extraction succeeds and immediately before saving.
                     # Fall through to process_filing_with_full_data below
 
                 # ── Non-reload: skip filings already in the database ──
@@ -949,6 +935,75 @@ class SECDataScraperApp:
             traceback.print_exc()
             return False
     
+    def _build_reload_filter(self, cik: str, filing: Dict, form_type: str) -> Optional[Dict[str, Any]]:
+        """Build the database filter used before saving a reloaded filing.
+
+        ``--latest --reload`` must be scoped to the selected filing's
+        accession number; filtering only by CIK/form would delete every
+        annual or quarterly filing for that company.
+        """
+        reload_filter: Dict[str, Any] = {'cik': cik}
+        accession_number = filing.get('accessionNumber')
+
+        if self.latest:
+            if accession_number:
+                reload_filter['reporting_period.accession_number'] = accession_number
+            else:
+                # SEC submissions normally always provide an accession number,
+                # but use the period date as a safe fallback for incomplete data.
+                period_date = filing.get('reportDate') or filing.get('filingDate')
+                if not period_date:
+                    logger.warning(
+                        "Cannot safely reload latest filing for %s: missing accession and period date",
+                        cik,
+                    )
+                    return None
+                reload_filter['reporting_period.period_date'] = period_date
+        else:
+            if self.target_fiscal_year:
+                reload_filter['reporting_period.fiscal_year'] = self.target_fiscal_year
+            if self.target_fiscal_quarter:
+                try:
+                    quarter_num = int(self.target_fiscal_quarter.replace('Q', ''))
+                    reload_filter['reporting_period.quarter'] = quarter_num
+                except (ValueError, AttributeError):
+                    pass
+
+        if form_type:
+            reload_filter['form_type'] = form_type
+        return reload_filter
+
+    def _delete_reload_data(self, cik: str, filing_info: Dict) -> None:
+        """Delete the existing target filing immediately before replacement saves."""
+        if not self.reload:
+            return
+
+        form_type = filing_info.get('form', filing_info.get('form_type', ''))
+        reload_filter = self._build_reload_filter(cik, filing_info, form_type)
+        period_desc = (
+            f"latest {form_type} {filing_info.get('accessionNumber') or filing_info.get('reportDate')}"
+            if self.latest
+            else f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}"
+            if self.target_fiscal_year
+            else "all periods"
+        )
+
+        if reload_filter is None:
+            self.progress.status("  [reload]  skipped delete: filing identity unavailable")
+            return
+
+        ann_del = self._cv_annual_col.delete_many(reload_filter)
+        qtr_del = self._cv_quarterly_col.delete_many(reload_filter)
+        total_del = ann_del.deleted_count + qtr_del.deleted_count
+        if total_del > 0:
+            self.progress.status(f"  [reload]  deleted {total_del} existing rows  ({period_desc})")
+            logger.info(
+                f"🔄 RELOAD: Deleted {ann_del.deleted_count} annual + "
+                f"{qtr_del.deleted_count} quarterly rows for {cik} ({period_desc})"
+            )
+        else:
+            self.progress.status(f"  [reload]  no existing rows to delete  ({period_desc})")
+
     def _filter_filings_by_fiscal_period(self, filings_list: List[Dict], company_data: Dict) -> List[Dict]:
         """Filter filings by target fiscal year and quarter"""
         if not self.target_fiscal_year:
@@ -989,8 +1044,10 @@ class SECDataScraperApp:
                         elif form_type == '10-Q' and quarter == target_quarter_num:
                             filtered_filings.append(filing)
                     else:
-                        # No specific quarter requested, include all filings for the fiscal year
-                        filtered_filings.append(filing)
+                        # A fiscal-year-only request means the annual filing.
+                        # Quarterly filings require an explicit --fiscal-quarter.
+                        if form_type == '10-K':
+                            filtered_filings.append(filing)
                         
             except (ValueError, TypeError) as e:
                 logger.debug(f"Could not calculate fiscal year for filing {filing.get('accessionNumber', 'unknown')}: {e}")
@@ -1149,9 +1206,12 @@ class SECDataScraperApp:
                 logger.warning(f"No 'statements' key in processed data for online filing {accession_number}")
                 return 0
             
-            # Process statements using shared logic
+            # Extract and transform every statement first. In reload mode,
+            # existing rows are deleted only after this phase succeeds and
+            # immediately before the replacement statements are saved.
             statements_processed = 0
             statements_with_data = 0
+            prepared_statements = []
             statements = statements_data['statements']
             reporting_period = statements_data.get('reporting_period', {})
             
@@ -1160,7 +1220,7 @@ class SECDataScraperApp:
                     # Extract line items from the statement hierarchy structure
                     # statement_data is a dict with {'hierarchy': [root_item], ...}
                     # We need to flatten the tree to a list for validation
-                    self.progress.set_status(f"normalizing  {statement_type}")
+                    self.progress.set_status(f"extracting  {statement_type}")
                     logger.info(f"📊 Processing {statement_type}...")
                     logger.debug(f"   statement_data type: {type(statement_data)}")
                     if isinstance(statement_data, dict):
@@ -1215,30 +1275,42 @@ class SECDataScraperApp:
                     )
                     logger.debug(f"   Transformation complete")
                     
-                    # ----------------------------------------------------------
-                    # Merged pipeline: normalize directly into normalize_data
-                    # ----------------------------------------------------------
-                    logger.debug(f"   Normalizing {statement_type} into normalize_data...")
-                    company_doc = self.current_company_doc or {}
-                    filing_doc_for_norm = {
-                        '_id': filing_id,
-                        'form_type': filing_info.get('form', filing_info.get('form_type', 'UNKNOWN')),
-                        'accession_number': accession_number,
-                    }
-                    try:
-                        self._norm_service.normalize_statement_in_memory(
-                            statement_doc, filing_doc_for_norm, company_doc
-                        )
-                        statements_processed += 1
-                        statements_with_data += 1
-                        logger.info(f"✅ Normalized {statement_type} statement into normalize_data")
-                        # Accumulate slim copy for quarterly deaccumulation pass
-                        self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
-                        # Log period information
-                        self._log_period_information(statement_type, reporting_period)
-                    except Exception as norm_err:
-                        logger.warning(f"⚠️  Failed to normalize {statement_type}: {norm_err}", exc_info=True)
+                    # Keep the transformed statement in memory. No database
+                    # writes happen during extraction/transformation.
+                    prepared_statements.append((statement_type, statement_doc))
             
+            if not prepared_statements:
+                self.progress.status("  [xbrl]  0 statement(s) extracted")
+                return 0
+
+            # Extraction is complete. For reloads, remove the old rows now,
+            # immediately before the first replacement write.
+            self._delete_reload_data(cik, filing_info)
+
+            company_doc = self.current_company_doc or {}
+            filing_doc_for_norm = {
+                '_id': filing_id,
+                'form_type': filing_info.get('form', filing_info.get('form_type', 'UNKNOWN')),
+                'accession_number': accession_number,
+            }
+
+            for statement_type, statement_doc in prepared_statements:
+                self.progress.set_status(f"normalizing  {statement_type}")
+                logger.debug(f"   Normalizing {statement_type} into normalize_data...")
+                try:
+                    self._norm_service.normalize_statement_in_memory(
+                        statement_doc, filing_doc_for_norm, company_doc
+                    )
+                    statements_processed += 1
+                    statements_with_data += 1
+                    logger.info(f"✅ Normalized {statement_type} statement into normalize_data")
+                    # Accumulate slim copy for quarterly deaccumulation pass
+                    self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
+                    # Log period information
+                    self._log_period_information(statement_type, reporting_period)
+                except Exception as norm_err:
+                    logger.warning(f"⚠️  Failed to normalize {statement_type}: {norm_err}", exc_info=True)
+
             self.progress.status(
                 f"  [xbrl]  {statements_with_data} statement(s) normalized"
             )
@@ -1697,6 +1769,13 @@ def should_process_filing_for_download_period(filing: Dict, company_data: Dict, 
         # Filter by fiscal year
         if target_fiscal_year and filing_fiscal_year != target_fiscal_year:
             return False
+
+        form_type = filing.get('form') or filing.get('form_type')
+
+        # A fiscal-year-only request targets the annual filing. Quarterly
+        # filings are selected only when a specific fiscal quarter is given.
+        if target_fiscal_year and not target_fiscal_quarter:
+            return form_type == '10-K'
         
         # Filter by fiscal quarter (if specified)
         if target_fiscal_quarter:
@@ -1784,7 +1863,8 @@ def main():
              'Example: --year 2015 --end-year 2026.')
     period.add_argument(
         '--fiscal-year', type=int, metavar='YEAR',
-        help='Restrict processing to a specific fiscal year (e.g. 2024). '
+        help='Restrict processing to the annual 10-K filing for a specific fiscal year '
+             '(e.g. 2024), unless --fiscal-quarter is also provided. '
              'Overrides --year / --end-year for period matching.')
     period.add_argument(
         '--fiscal-quarter', choices=['Q1', 'Q2', 'Q3', 'Q4'],
@@ -1797,11 +1877,12 @@ def main():
         '--reload', action='store_true',
         help='Force reprocessing of filings that are already in the database. '
              'Scope with --year / --end-year or --fiscal-year / --fiscal-quarter '
-             'to reload only a specific range.')
+             'to reload only a specific range. A fiscal year without a quarter '
+             'reloads only its annual 10-K.')
     proc.add_argument(
         '--latest', action='store_true',
-        help='Process only filings newer than the most recent filing already '
-             'stored for each company. Useful for routine updates.')
+        help='Process only the most recent filing from the SEC for each company. '
+             'With --reload, delete and reload only that selected filing.')
     proc.add_argument(
         '--no-dimensions', action='store_true',
         help='Skip dimensional (segment / product / geography) data extraction. '
@@ -2097,7 +2178,7 @@ def main():
                 if args.fiscal_quarter:
                     print(f"Target: Fiscal Year {args.fiscal_year} {args.fiscal_quarter}")
                 else:
-                    print(f"Target: Complete Fiscal Year {args.fiscal_year}")
+                    print(f"Target: Annual filing for Fiscal Year {args.fiscal_year}")
             else:
                 if args.end_year:
                     print(f"Year range: {args.year} to {args.end_year}")
@@ -2125,7 +2206,7 @@ def main():
                     if args.fiscal_quarter:
                         reload_msg += f" - Will refresh FY{args.fiscal_year} {args.fiscal_quarter} data"
                     else:
-                        reload_msg += f" - Will refresh complete FY{args.fiscal_year} data"
+                        reload_msg += f" - Will refresh annual FY{args.fiscal_year} data"
                 else:
                     reload_msg += f" - Will refresh all filings from {args.year} onwards"
                 print(reload_msg)

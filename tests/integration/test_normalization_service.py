@@ -40,20 +40,16 @@ class TestNormalizationServiceIntegration:
     @patch('data_normalization_service.services.normalization_service.DatabaseConnection')
     @patch('data_normalization_service.services.normalization_service.DatabaseTracker')
     @patch('data_normalization_service.services.normalization_service.get_taxonomy_manager')
-    def test_service_initialization_with_taxonomy(self, mock_get_taxonomy, mock_tracker, mock_db_connection, mock_config):
-        """Test service initialization with taxonomy enabled."""
-        # Mock the dependencies
+    def test_service_initialization_without_taxonomy(self, mock_get_taxonomy, mock_tracker, mock_db_connection, mock_config):
+        """Taxonomy initialization is disabled in the merged pipeline."""
         mock_db_connection.return_value = Mock()
         mock_tracker.return_value = Mock()
-        mock_taxonomy = Mock()
-        mock_taxonomy.get_label_stats.return_value = {"total_concepts": 1000}
-        mock_get_taxonomy.return_value = mock_taxonomy
-        
+
         service = FinancialNormalizationService(mock_config)
-        
+
         assert service.config == mock_config
-        assert service.taxonomy_manager == mock_taxonomy
-        mock_get_taxonomy.assert_called_once()
+        assert service.taxonomy_manager is None
+        mock_get_taxonomy.assert_not_called()
     
     @patch('data_normalization_service.services.normalization_service.DatabaseConnection')
     @patch('data_normalization_service.services.normalization_service.DatabaseTracker')

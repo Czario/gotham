@@ -75,7 +75,7 @@ class TestConceptDocument:
         
         result = doc.to_dict()
         
-        assert result["company_cik"] == "0000320193"
+        assert result["cik"] == "0000320193"
         assert result["statement_type"] == "income_statement"
         assert result["concept"] == "us-gaap_Revenue"
         assert result["label"] == "Revenue"
@@ -142,6 +142,6 @@ class TestValueDocument:
         result = doc.to_dict()
         
         assert result["concept_id"] == concept_id
-        assert result["company_cik"] == "0000320193"
+        assert result["cik"] == "0000320193"
         assert result["value"] == 1000000.0
         assert result["filing_id"] == filing_id
