@@ -859,6 +859,8 @@ class PeriodBasedFinancialCalculationService:
                             if filing_doc and filing_doc.accession_number:
                                 clean_reporting_period['accession_number'] = filing_doc.accession_number
 
+                        accession_number = clean_reporting_period.get('accession_number')
+
                         # Keep only canonical fields in reporting_period
                         _ALLOWED_RP_KEYS = {'end_date', 'period_date', 'fiscal_year', 'quarter'}
                         clean_reporting_period = {
@@ -873,7 +875,8 @@ class PeriodBasedFinancialCalculationService:
                             form_type="10-Q",
                             reporting_period=clean_reporting_period,
                             value=value,
-                            created_at=datetime.now()
+                            created_at=datetime.now(),
+                            accession_number=accession_number,
                         )
 
                         value_doc_dict = value_doc.to_dict()
@@ -942,12 +945,12 @@ class PeriodBasedFinancialCalculationService:
                             logger.debug(f"Saved {'calculated' if is_calculated else 'original'} value for {concept}")
                         except DuplicateKeyError:
                             existing = self.quarterly_value_repo.collection.find_one(query)
-                            if (filing_doc and filing_doc.accession_number and existing
-                                    and not existing.get('reporting_period', {}).get('accession_number')):
+                            if (accession_number and existing
+                                    and not existing.get('accession_number')):
                                 logger.debug(f"Updating existing quarterly value with missing accession_number for {concept} on {period_date}")
                                 self.quarterly_value_repo.collection.update_one(
                                     {'_id': existing['_id']},
-                                    {'$set': {'reporting_period.accession_number': filing_doc.accession_number}}
+                                    {'$set': {'accession_number': accession_number}}
                                 )
                             else:
                                 logger.debug(f"Value already exists for {concept} on {period_date}, skipping (DuplicateKeyError)")

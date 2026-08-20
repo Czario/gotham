@@ -121,6 +121,9 @@ class ValueDocument:
     # extraction; set to 'sec_companyfacts' for values recovered via the SEC
     # companyfacts API reconciliation pass.
     source: Optional[str] = None
+    # SEC accession number is stored at the value-document top level so filing
+    # identity can be queried consistently across annual and quarterly data.
+    accession_number: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for MongoDB insertion."""
@@ -138,7 +141,9 @@ class ValueDocument:
         # Only include filing_id if it's present (for backwards compatibility)
         if self.filing_id is not None:
             result["filing_id"] = self.filing_id
-        
+        if self.accession_number is not None:
+            result["accession_number"] = self.accession_number
+
         # Add dimensional-specific fields if this is a dimensional value
         if self.dimension_value and self.dimensional_concept_id is not None:
             result["dimensional_concept_id"] = self.dimensional_concept_id

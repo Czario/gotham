@@ -722,19 +722,12 @@ class SECDataScraperApp:
                 # ── Non-reload: skip filings already in the database ──
                 else:
                     filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} ⬇")
-                    _acc_filter: dict
-                    if accession_number:
-                        _acc_filter = {'cik': cik, 'reporting_period.accession_number': accession_number}
-                    else:
-                        _acc_filter = {'cik': cik, 'reporting_period.period_date': filing_date}
-                        if form_type:
-                            _acc_filter['form_type'] = form_type
-                    existing_filing = (
-                        self._cv_annual_col.find_one(_acc_filter, projection={'_id': 1})
-                        or self._cv_quarterly_col.find_one(_acc_filter, projection={'_id': 1})
-                    )
+                    existing_filing = self._find_existing_filing(cik, filing)
                     if existing_filing:
-                        self.progress.status(f"  [skip]   {accession_number or filing_date}  already stored")
+                        _period_label = self._format_filing_period(filing, self.current_company_data)
+                        self.progress.status(
+                            f"  [skip]   {_period_label:<12} {accession_number or filing_date}  already stored"
+                        )
                         logger.debug(f"📋 Filing {accession_number or filing_date} already processed, skipping")
                         if self.html_download_path and accession_number:
                             self.sec_client.download_html_filing(cik, accession_number, filing_date or '2010-01-01', self.html_download_path, ticker)
@@ -771,11 +764,16 @@ class SECDataScraperApp:
             
             self.progress.close_filing_bar()
 
-            # Step 4: Run quarterly deaccumulation for this company (uses in-memory accumulator)
-            self._flush_quarterly_accumulator(cik)
-
-            # Step 4b: Fill genuine extraction gaps from SEC companyfacts (edge mode)
-            self._run_companyfacts_reconciliation(cik)
+            # Step 4: Run post-processing only when this run actually saved a
+            # filing. If every selected filing was skipped, there is no new
+            # accumulator data and no reason to make the potentially slow
+            # companyfacts API reconciliation calls.
+            if filings_processed > 0:
+                self._flush_quarterly_accumulator(cik)
+                self.progress.set_status(f"{ticker:<6} reconciling...")
+                self._run_companyfacts_reconciliation(cik)
+            else:
+                self.progress.set_status(f"{ticker:<6} no new filings")
 
             # Step 5: Log processing results
             logger.info(f"Processed {filings_processed} filings, skipped {filings_skipped} existing filings for company CIK: {cik}")
@@ -914,12 +912,14 @@ class SECDataScraperApp:
             else:
                 logger.error(f"❌ Failed to process filing {accession_number}")
 
-            # Deaccumulate quarterly deltas and fill extraction gaps, same as
-            # the multi-filing path.
-            self.progress.set_status("quarterly deaccumulation")
-            self._flush_quarterly_accumulator(cik)
-            self.progress.set_status("reconciliation")
-            self._run_companyfacts_reconciliation(cik)
+            # Deaccumulate quarterly deltas and fill extraction gaps only
+            # after a filing was actually saved. Avoid reconciliation network
+            # calls when the requested filing was skipped or failed.
+            if success:
+                self.progress.set_status("quarterly deaccumulation")
+                self._flush_quarterly_accumulator(cik)
+                self.progress.set_status("reconciliation")
+                self._run_companyfacts_reconciliation(cik)
 
             # Read period label from the DB (written by normalization service —
             # no calculation here, just reading what was stored).
@@ -935,6 +935,111 @@ class SECDataScraperApp:
             traceback.print_exc()
             return False
     
+    def _format_filing_period(
+        self, filing: Dict, company_data: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Return the filing's fiscal period, e.g. ``FY2026 Q2`` or ``FY2026 Annual``."""
+        form_type = filing.get('form') or filing.get('form_type') or ''
+        report_date = filing.get('reportDate') or filing.get('report_date')
+        if not report_date:
+            return "FY?"
+
+        try:
+            if isinstance(report_date, datetime):
+                report_end_date = report_date
+            else:
+                report_end_date = datetime.strptime(str(report_date)[:10], '%Y-%m-%d')
+
+            company = company_data or self.current_company_data or {}
+            fiscal_year_end = (
+                company.get('fiscalYearEnd')
+                or company.get('fiscal_year_end_code')
+                or company.get('fiscal_year_end')
+                or '1231'
+            )
+            from utilities.helpers.period_utils import FiscalYearCalculator
+            fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                report_end_date, fiscal_year_end
+            )
+            if fiscal_year is None:
+                return "FY?"
+            if form_type == '10-K':
+                return f"FY{fiscal_year} Annual"
+            if form_type == '10-Q' and quarter:
+                return f"FY{fiscal_year} Q{quarter}"
+            return f"FY{fiscal_year}"
+        except (ValueError, TypeError, AttributeError):
+            return "FY?"
+
+    def _find_existing_filing(self, cik: str, filing: Dict) -> Optional[Dict[str, Any]]:
+        """Find stored data for a filing, falling back from accession to period.
+
+        Older normalized records may not have a nested accession number, and
+        some records store it at the top level. The fiscal period is the stable
+        fallback identity so already-stored filings are not extracted again.
+        """
+        form_type = filing.get('form') or filing.get('form_type')
+        accession_number = filing.get('accessionNumber') or filing.get('accession_number')
+        collections = (self._cv_annual_col, self._cv_quarterly_col)
+
+        if accession_number:
+            accession_filter = {
+                'cik': cik,
+                '$or': [
+                    {'reporting_period.accession_number': accession_number},
+                    {'accession_number': accession_number},
+                ],
+            }
+            for collection in collections:
+                existing = collection.find_one(accession_filter, projection={'_id': 1})
+                if existing:
+                    return existing
+
+        period_filter: Dict[str, Any] = {'cik': cik}
+        if form_type:
+            period_filter['form_type'] = form_type
+
+        report_date = filing.get('reportDate') or filing.get('report_date')
+        period_added = False
+        if report_date:
+            try:
+                if isinstance(report_date, datetime):
+                    report_end_date = report_date
+                else:
+                    report_end_date = datetime.strptime(str(report_date)[:10], '%Y-%m-%d')
+                company = self.current_company_data or {}
+                fiscal_year_end = (
+                    company.get('fiscalYearEnd')
+                    or company.get('fiscal_year_end_code')
+                    or company.get('fiscal_year_end')
+                    or '1231'
+                )
+                from utilities.helpers.period_utils import FiscalYearCalculator
+                fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                    report_end_date, fiscal_year_end
+                )
+                if fiscal_year is not None:
+                    period_filter['reporting_period.fiscal_year'] = fiscal_year
+                    if form_type == '10-Q' and quarter is not None:
+                        period_filter['reporting_period.quarter'] = quarter
+                    period_added = True
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+        if not period_added and report_date:
+            period_filter['reporting_period.period_date'] = str(report_date)[:10]
+
+        # Do not issue a broad CIK/form query if the filing has no usable
+        # period identity; that could incorrectly skip unrelated filings.
+        if len(period_filter) <= (2 if form_type else 1):
+            return None
+
+        for collection in collections:
+            existing = collection.find_one(period_filter, projection={'_id': 1})
+            if existing:
+                return existing
+        return None
+
     def _build_reload_filter(self, cik: str, filing: Dict, form_type: str) -> Optional[Dict[str, Any]]:
         """Build the database filter used before saving a reloaded filing.
 
@@ -947,7 +1052,12 @@ class SECDataScraperApp:
 
         if self.latest:
             if accession_number:
-                reload_filter['reporting_period.accession_number'] = accession_number
+                # New records use the canonical top-level field. Keep the
+                # nested alternative for legacy records during reloads.
+                reload_filter['$or'] = [
+                    {'accession_number': accession_number},
+                    {'reporting_period.accession_number': accession_number},
+                ]
             else:
                 # SEC submissions normally always provide an accession number,
                 # but use the period date as a safe fallback for incomplete data.
@@ -1105,6 +1215,10 @@ class SECDataScraperApp:
                 logger.debug(f"Could not calculate fiscal period: {e}")
         
         logger.info(f"Processing online filing {accession_number} for CIK: {cik}")
+        period_label = self._format_filing_period(filing_info, self.current_company_data)
+        self.progress.status(
+            f"  [filing] {period_label:<12} {form_type} {accession_number} extracting"
+        )
         
         # Build SEC URL
         sec_url = self._build_sec_url(cik, accession_number)
@@ -1167,6 +1281,9 @@ class SECDataScraperApp:
             int: Number of statements processed (0 if failed)
         """
         try:
+            form_type = filing_info.get('form', filing_info.get('form_type', 'filing'))
+            period_label = self._format_filing_period(filing_info, self.current_company_data)
+
             # Enrich company info with fiscal year information for this specific filing
             company_info_enriched = self.current_company_data or {}
             
@@ -1280,7 +1397,10 @@ class SECDataScraperApp:
                     prepared_statements.append((statement_type, statement_doc))
             
             if not prepared_statements:
-                self.progress.status("  [xbrl]  0 statement(s) extracted")
+                self.progress.status(
+                    f"  [xbrl]  {period_label:<12} {form_type} {accession_number} "
+                    f"0 statement(s) extracted"
+                )
                 return 0
 
             # Extraction is complete. For reloads, remove the old rows now,
@@ -1312,7 +1432,8 @@ class SECDataScraperApp:
                     logger.warning(f"⚠️  Failed to normalize {statement_type}: {norm_err}", exc_info=True)
 
             self.progress.status(
-                f"  [xbrl]  {statements_with_data} statement(s) normalized"
+                f"  [xbrl]  {period_label:<12} {form_type} {accession_number} "
+                f"{statements_with_data} statement(s) normalized"
             )
             return statements_with_data
 
@@ -1573,13 +1694,25 @@ class SECDataScraperApp:
         """Get comprehensive summary for a company"""
         try:
             accessions = sorted({
-                doc['reporting_period']['accession_number']
+                doc.get('accession_number')
+                or doc.get('reporting_period', {}).get('accession_number')
                 for col in (self._cv_annual_col, self._cv_quarterly_col)
                 for doc in col.find(
-                    {'cik': cik, 'reporting_period.accession_number': {'$exists': True}},
-                    projection={'reporting_period.accession_number': 1, 'reporting_period.end_date': 1}
+                    {
+                        'cik': cik,
+                        '$or': [
+                            {'accession_number': {'$exists': True}},
+                            {'reporting_period.accession_number': {'$exists': True}},
+                        ],
+                    },
+                    projection={
+                        'accession_number': 1,
+                        'reporting_period.accession_number': 1,
+                        'reporting_period.end_date': 1,
+                    }
                 )
-                if doc.get('reporting_period', {}).get('accession_number')
+                if doc.get('accession_number')
+                or doc.get('reporting_period', {}).get('accession_number')
             })
             latest_end = None
             for col in (self._cv_annual_col, self._cv_quarterly_col):

@@ -136,7 +136,8 @@ class TestValueDocument:
             form_type="10-K",
             filing_id=filing_id,
             reporting_period={"end_date": "2023-12-31"},
-            value=1000000.0
+            value=1000000.0,
+            accession_number="0000320193-23-000077"
         )
         
         result = doc.to_dict()
@@ -145,3 +146,4 @@ class TestValueDocument:
         assert result["cik"] == "0000320193"
         assert result["value"] == 1000000.0
         assert result["filing_id"] == filing_id
+        assert result["accession_number"] == "0000320193-23-000077"

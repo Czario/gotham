@@ -372,6 +372,7 @@ class CompanyFactsReconciliationService:
                 dimension_value=False,
                 decimals=str(match["decimals"]) if match["decimals"] is not None else None,
                 source="sec_companyfacts",
+                accession_number=match.get("accession"),
             )
             doc = value_doc.to_dict()
             doc["calculated"] = False

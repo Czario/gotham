@@ -53,6 +53,20 @@ def test_fiscal_year_only_selects_annual_filing():
     assert [filing["accessionNumber"] for filing in selected] == ["k"]
 
 
+def test_filing_period_label_uses_company_fiscal_year():
+    app = SECDataScraperApp.__new__(SECDataScraperApp)
+    app.current_company_data = None
+
+    assert app._format_filing_period(
+        {"form": "10-Q", "reportDate": "2023-03-31"},
+        {"fiscalYearEnd": "0930"},
+    ) == "FY2023 Q2"
+    assert app._format_filing_period(
+        {"form": "10-K", "reportDate": "2023-09-30"},
+        {"fiscalYearEnd": "0930"},
+    ) == "FY2023 Annual"
+
+
 @pytest.mark.parametrize("quarter, accession", [("Q1", "q1"), ("Q2", "q2"), ("Q3", "q3")])
 def test_specific_fiscal_quarter_selects_quarterly_filing(quarter, accession):
     selected = _app_for_period(quarter)._filter_filings_by_fiscal_period(
@@ -97,6 +111,31 @@ def test_download_only_fiscal_year_selects_annual_filing():
     )
 
 
+def test_existing_filing_falls_back_to_fiscal_period_when_accession_is_missing():
+    app = SECDataScraperApp.__new__(SECDataScraperApp)
+    app.current_company_data = {"fiscalYearEnd": "0930"}
+    app._cv_annual_col = MagicMock()
+    app._cv_quarterly_col = MagicMock()
+    app._cv_annual_col.find_one.side_effect = [None, None]
+    app._cv_quarterly_col.find_one.side_effect = [None, {"_id": "existing"}]
+
+    existing = app._find_existing_filing(
+        "0000320193",
+        {
+            "form": "10-Q",
+            "accessionNumber": "0000320193-23-000002",
+            "reportDate": "2023-03-31",
+        },
+    )
+
+    assert existing == {"_id": "existing"}
+    period_query = app._cv_quarterly_col.find_one.call_args_list[1].args[0]
+    assert period_query["cik"] == "0000320193"
+    assert period_query["form_type"] == "10-Q"
+    assert period_query["reporting_period.fiscal_year"] == 2023
+    assert period_query["reporting_period.quarter"] == 2
+
+
 def test_latest_reload_filter_is_scoped_to_accession():
     app = SECDataScraperApp.__new__(SECDataScraperApp)
     app.latest = True
@@ -115,7 +154,10 @@ def test_latest_reload_filter_is_scoped_to_accession():
 
     assert reload_filter == {
         "cik": "0000320193",
-        "reporting_period.accession_number": "0000320193-23-000002",
+        "$or": [
+            {"accession_number": "0000320193-23-000002"},
+            {"reporting_period.accession_number": "0000320193-23-000002"},
+        ],
         "form_type": "10-Q",
     }
 

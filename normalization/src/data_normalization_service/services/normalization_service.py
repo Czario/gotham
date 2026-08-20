@@ -714,11 +714,11 @@ class FinancialNormalizationService:
         
         if existing_value:
             # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
+            if filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing value with missing accession_number for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
                 value_repo.collection.update_one(
                     {'_id': existing_value['_id']},
-                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
+                    {'$set': {'accession_number': filing.accession_number}}
                 )
             else:
                 logger.debug(f"Value already exists for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}, skipping insertion")
@@ -736,7 +736,8 @@ class FinancialNormalizationService:
             value=value,
             created_at=statement.created_at,
             fact_id=item.get('fact_id'),  # Preserve fact_id for auditing
-            decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals')  # Preserve decimals from item or dimensional facts
+            decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals'),  # Preserve decimals from item or dimensional facts
+            accession_number=filing.accession_number,
         )
         
         # Add calculated field to distinguish direct vs derived data
@@ -955,10 +956,12 @@ class FinancialNormalizationService:
                 ('concept_values_annual', self.annual_value_repo),
                 ('concept_values_quarterly', self.quarterly_value_repo)
             ]:
-                # Find values missing accession_number
+                # Find values missing the canonical top-level accession_number.
+                # Older records may have it nested under reporting_period; those
+                # are also normalized to the top-level field below.
                 missing_accession_query = {
                     'cik': company_cik,
-                    'reporting_period.accession_number': {'$exists': False}
+                    'accession_number': {'$exists': False}
                 }
                 
                 values_missing_accession = list(value_repo.collection.find(missing_accession_query))
@@ -1009,7 +1012,7 @@ class FinancialNormalizationService:
                             # Update the value record with accession_number
                             update_result = value_repo.collection.update_one(
                                 {'_id': value_record['_id']},
-                                {'$set': {'reporting_period.accession_number': accession_number}}
+                                {'$set': {'accession_number': accession_number}}
                             )
                             
                             if update_result.modified_count > 0:
@@ -1280,11 +1283,11 @@ class FinancialNormalizationService:
         
         if existing_value:
             # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
+            if filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing normalized cashflow value with missing accession_number for concept {concept_id}, Q{quarter} {fiscal_year}")
                 value_repo.collection.update_one(
                     {'_id': existing_value['_id']},
-                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
+                    {'$set': {'accession_number': filing.accession_number}}
                 )
             else:
                 logger.debug(f"Normalized cashflow value already exists for concept {concept_id}, Q{quarter} {fiscal_year}, skipping insertion")
@@ -1300,7 +1303,8 @@ class FinancialNormalizationService:
             form_type=filing.form_type,
             reporting_period=reporting_period,
             value=value,
-            created_at=datetime.now()
+            created_at=datetime.now(),
+            accession_number=filing.accession_number,
         )
         
         # Add calculated field to distinguish normalized data
@@ -1950,12 +1954,12 @@ class FinancialNormalizationService:
         
         if existing_value:
             # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('reporting_period', {}).get('accession_number'):
+            if filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing dimensional value with missing accession_number for dimensional_concept_id {dimensional_concept_id}, "
                             f"period {clean_reporting_period}")
                 value_repo.collection.update_one(
                     {'_id': existing_value['_id']},
-                    {'$set': {'reporting_period.accession_number': filing.accession_number}}
+                    {'$set': {'accession_number': filing.accession_number}}
                 )
             else:
                 logger.debug(f"Dimensional value already exists for dimensional_concept_id {dimensional_concept_id}, "
@@ -1972,6 +1976,7 @@ class FinancialNormalizationService:
             created_at=statement.created_at,
             dimension_value=True,
             dimensional_concept_id=dimensional_concept_id,
+            accession_number=filing.accession_number,
         )
         
         value_doc_dict = dimensional_value_doc.to_dict()
