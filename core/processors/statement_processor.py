@@ -87,7 +87,10 @@ class EnhancedFinancialStatementProcessor:
         enhanced_company_info = (company_info or {}).copy()
         if not enhanced_company_info.get('fiscal_year'):
             report_date = filing_info.get('reportDate')
-            fiscal_year_end_code = enhanced_company_info.get('fiscalYearEnd')
+            fiscal_year_end_code = (
+                enhanced_company_info.get('fiscal_year_end_code')
+                or enhanced_company_info.get('fiscalYearEnd')
+            )
             
             # If fiscal year end not in company_info, retrieve from database
             if not fiscal_year_end_code and hasattr(self, 'company_repo') and self.company_repo:
@@ -130,7 +133,11 @@ class EnhancedFinancialStatementProcessor:
                     logger.error(f"❌ No Statements Found in XBRL for filing {accession_number}: XBRL parsed but no financial statements identified")
                     return None
                 
-                reporting_period = extract_period_info_from_sec_api(filing_info, company_info or {})
+                # Pass the *enriched* company info so the saved reporting_period
+                # uses the authoritative fiscal year end (DB companies collection)
+                # instead of SEC submissions metadata ("fiscalYearEnd"), which is
+                # unreliable for non-calendar-year filers (e.g. Dell reports 1231).
+                reporting_period = extract_period_info_from_sec_api(filing_info, enhanced_company_info)
                 
                 return self._convert_arelle_data_to_result(financial_data, filing_info, company_cik, reporting_period)
         except Exception as e:

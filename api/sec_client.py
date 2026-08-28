@@ -179,12 +179,14 @@ class SECAPIClient:
         report_dates = recent_filings.get('reportDate', [])
         fiscal_year_ends = recent_filings.get('fiscalYearEnd', [])
         
-        # Get company fiscal year end from main data (fallback if per-filing data is missing)
-        company_fiscal_year_end = data.get('fiscalYearEnd')
-        
-        # If not available in SEC data, try to get from database
-        if not company_fiscal_year_end and company_cik:
-            company_fiscal_year_end = self._get_fiscal_year_end_from_db(company_cik)
+        # Our DB companies collection is the authoritative source for the
+        # fiscal year end. SEC submissions "fiscalYearEnd" metadata is never
+        # used — it is unreliable for non-calendar-year filers (e.g. Dell
+        # reports "1231" while its fiscal year actually ends the Friday
+        # nearest January 31).
+        company_fiscal_year_end = (
+            self._get_fiscal_year_end_from_db(company_cik) if company_cik else None
+        )
         
         for i, form in enumerate(forms):
             if form in forms_filter:

@@ -862,7 +862,7 @@ class SECDataScraperApp:
                 from utilities.helpers.period_utils import FiscalYearCalculator as _FYC
                 from datetime import datetime as _dt2
                 _rd = self._last_report_date
-                _fy_end = company_data.get('fiscalYearEnd', '1231')
+                _fy_end = self._get_authoritative_fiscal_year_end(company_data)
                 if _rd:
                     _rd_date = _dt2.strptime(_rd, '%Y-%m-%d')
                     _fy, _q = _FYC.calculate_fiscal_year_and_quarter(_rd_date, _fy_end)
@@ -951,12 +951,7 @@ class SECDataScraperApp:
                 report_end_date = datetime.strptime(str(report_date)[:10], '%Y-%m-%d')
 
             company = company_data or self.current_company_data or {}
-            fiscal_year_end = (
-                company.get('fiscalYearEnd')
-                or company.get('fiscal_year_end_code')
-                or company.get('fiscal_year_end')
-                or '1231'
-            )
+            fiscal_year_end = self._get_authoritative_fiscal_year_end(company)
             from utilities.helpers.period_utils import FiscalYearCalculator
             fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
                 report_end_date, fiscal_year_end
@@ -1008,12 +1003,7 @@ class SECDataScraperApp:
                 else:
                     report_end_date = datetime.strptime(str(report_date)[:10], '%Y-%m-%d')
                 company = self.current_company_data or {}
-                fiscal_year_end = (
-                    company.get('fiscalYearEnd')
-                    or company.get('fiscal_year_end_code')
-                    or company.get('fiscal_year_end')
-                    or '1231'
-                )
+                fiscal_year_end = self._get_authoritative_fiscal_year_end(company)
                 from utilities.helpers.period_utils import FiscalYearCalculator
                 fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
                     report_end_date, fiscal_year_end
@@ -1114,6 +1104,46 @@ class SECDataScraperApp:
         else:
             self.progress.status(f"  [reload]  no existing rows to delete  ({period_desc})")
 
+    def _get_authoritative_fiscal_year_end(self, company_data: Optional[Dict] = None) -> Optional[str]:
+        """Return the authoritative fiscal year end code (MMDD) for a company.
+
+        This ALWAYS relies on our DB ``companies`` collection
+        (``corporate_info.fiscal_year_end``). SEC submissions ``fiscalYearEnd``
+        metadata is never used — it is unreliable for non-calendar-year filers
+        (e.g. Dell reports ``1231`` while its fiscal year actually ends the
+        Friday nearest January 31). If the company is not in the DB, returns
+        ``None`` rather than guessing a value.
+        """
+        company = company_data or self.current_company_data or {}
+        cik_raw = str(company.get('cik') or '').strip()
+        cik = cik_raw.zfill(10) if cik_raw else ''
+        cache = getattr(self, '_fye_cache', None)
+        if cache is None:
+            cache = self._fye_cache = {}
+        if cik and cik in cache:
+            return cache[cik]
+
+        fye = None
+        if cik and self.db is not None:
+            try:
+                company_doc = self.db.companies.find_one(
+                    {'cik': {'$in': [cik, cik_raw]}},
+                    {'corporate_info.fiscal_year_end': 1,
+                     'fiscal_year_end_code': 1,
+                     'fiscalYearEnd': 1},
+                )
+                if company_doc:
+                    fye = (
+                        (company_doc.get('corporate_info') or {}).get('fiscal_year_end')
+                        or company_doc.get('fiscal_year_end_code')
+                        or company_doc.get('fiscalYearEnd')
+                    )
+            except Exception:
+                logger.warning(f"Failed to read fiscal year end from DB for CIK {cik}", exc_info=True)
+        if cik:
+            cache[cik] = fye
+        return fye
+
     def _filter_filings_by_fiscal_period(self, filings_list: List[Dict], company_data: Dict) -> List[Dict]:
         """Filter filings by target fiscal year and quarter"""
         if not self.target_fiscal_year:
@@ -1121,7 +1151,7 @@ class SECDataScraperApp:
         
         from utilities.helpers.period_utils import FiscalYearCalculator
         
-        fiscal_year_end_code = company_data.get('fiscalYearEnd')
+        fiscal_year_end_code = self._get_authoritative_fiscal_year_end(company_data)
         if not fiscal_year_end_code:
             logger.warning("No fiscal year end found for company, cannot filter by fiscal period")
             return filings_list
@@ -1204,7 +1234,7 @@ class SECDataScraperApp:
         if self.current_company_data:
             try:
                 from utilities.helpers.period_utils import FiscalYearCalculator
-                fiscal_year_end = self.current_company_data.get('fiscalYearEnd', '1231')
+                fiscal_year_end = self._get_authoritative_fiscal_year_end(self.current_company_data)
                 if report_period:
                     report_end_date = datetime.strptime(report_period, '%Y-%m-%d')
                     fiscal_year, quarter_num = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
@@ -1289,7 +1319,7 @@ class SECDataScraperApp:
             
             # Calculate fiscal year and quarter for this filing to pass to XBRL parser
             if company_info_enriched and filing_info:
-                fiscal_year_end_code = company_info_enriched.get('fiscalYearEnd')
+                fiscal_year_end_code = self._get_authoritative_fiscal_year_end(company_info_enriched)
                 if fiscal_year_end_code and 'reportDate' in filing_info:
                     try:
                         from utilities.helpers.period_utils import FiscalYearCalculator
@@ -1812,8 +1842,20 @@ def download_files_only_mode(companies: List[str], args) -> Dict[str, bool]:
                         'filingDate': filing_date,
                         'form': filing.get('form_type', '')
                     }
+                    # Authoritative fiscal year end ALWAYS comes from our DB
+                    # companies collection. SEC metadata is never used (it is
+                    # unreliable for non-calendar-year filers, e.g. Dell).
+                    _fye = None
+                    try:
+                        _fye_doc = db.companies.find_one({'cik': {'$in': [cik.zfill(10), cik]}})
+                        if _fye_doc:
+                            _fye = ((_fye_doc.get('corporate_info') or {}).get('fiscal_year_end')
+                                    or _fye_doc.get('fiscal_year_end_code')
+                                    or _fye_doc.get('fiscalYearEnd'))
+                    except Exception:
+                        pass
                     company_dict = {
-                        'fiscalYearEnd': existing_company.get('fiscal_year_end_code', '1231')
+                        'fiscalYearEnd': _fye
                     }
                     
                     if should_process_filing_for_download_period(filing_dict, company_dict, args.fiscal_year, args.fiscal_quarter):
@@ -1885,7 +1927,7 @@ def should_process_filing_for_download_period(filing: Dict, company_data: Dict, 
     
     # Get filing date and company fiscal year end
     filing_date = filing.get('reportDate') or filing.get('filingDate', '')
-    fiscal_year_end = company_data.get('fiscalYearEnd', '1231')
+    fiscal_year_end = company_data.get('fiscalYearEnd')
     
     if not filing_date:
         return False

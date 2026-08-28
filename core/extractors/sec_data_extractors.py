@@ -34,7 +34,13 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
     report_date = filing_info.get('reportDate')
     form_type = filing_info.get('form', '')
     filing_date = filing_info.get('filingDate')
-    fiscal_year_end_code = company_info.get('fiscalYearEnd')
+    # Prefer the authoritative fiscal year end passed in enriched company info
+    # (sourced from our DB companies collection). SEC submissions "fiscalYearEnd"
+    # is unreliable for non-calendar-year filers (e.g. Dell reports 1231).
+    fiscal_year_end_code = (
+        company_info.get('fiscal_year_end_code')
+        or company_info.get('fiscalYearEnd')
+    )
     
     # Convert report date string to datetime if available
     end_date = None
