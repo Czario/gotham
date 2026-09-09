@@ -103,13 +103,32 @@ class EnhancedFinancialStatementProcessor:
             if report_date and fiscal_year_end_code:
                 try:
                     end_date = datetime.strptime(report_date, '%Y-%m-%d')
+                    # Detect the company's fiscal-year naming convention (start vs end
+                    # year) from its existing reporting periods so early-year filers
+                    # like Chewy (FY2025 = Feb2025-Feb2026) are labeled consistently.
+                    # Falls back to the default 'end' convention when unknown.
+                    fiscal_year_convention = None
+                    if hasattr(self, 'company_repo') and self.company_repo:
+                        anchors = self.company_repo.get_fiscal_year_anchors(company_cik)
+                        if anchors:
+                            fiscal_year_convention = (
+                                FiscalYearCalculator.determine_fiscal_year_convention(
+                                    anchors, fiscal_year_end_code
+                                )
+                            )
                     fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                        end_date, fiscal_year_end_code
+                        end_date, fiscal_year_end_code, None,
+                        fiscal_year_convention or "end",
                     )
                     enhanced_company_info['fiscal_year'] = fiscal_year
                     enhanced_company_info['fiscal_quarter'] = quarter
                     enhanced_company_info['fiscal_year_end_code'] = fiscal_year_end_code
-                    logger.debug(f"Pre-calculated fiscal year {fiscal_year} Q{quarter} for fact selection")
+                    if fiscal_year_convention:
+                        enhanced_company_info['fiscal_year_convention'] = fiscal_year_convention
+                    logger.debug(
+                        f"Pre-calculated fiscal year {fiscal_year} Q{quarter} "
+                        f"(convention: {fiscal_year_convention or 'end'}) for fact selection"
+                    )
                 except Exception as e:
                     logger.warning(f"Could not pre-calculate fiscal year: {e}")
         

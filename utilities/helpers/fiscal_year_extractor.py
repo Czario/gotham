@@ -32,7 +32,9 @@ class FiscalYearExtractor:
         entity_info: Dict[str, Any],
         end_date: Optional[datetime] = None,
         document_uri: Optional[str] = None,
-        company_info: Optional[Dict[str, Any]] = None
+        company_info: Optional[Dict[str, Any]] = None,
+        fiscal_year_convention: str = "end",
+        weekday: Optional[object] = None
     ) -> Optional[int]:
         """
         Extract fiscal year trying multiple sources with fallback chain.
@@ -42,6 +44,9 @@ class FiscalYearExtractor:
             end_date: Document period end date
             document_uri: URI of the XBRL document
             company_info: Company information (may contain fiscalYearEnd)
+            fiscal_year_convention: 'end' (default) or 'start' naming used by the
+                date-based fallback calculation (see FiscalYearCalculator).
+            weekday: Optional weekday for 52/53-week filers (see FiscalYearCalculator).
             
         Returns:
             Fiscal year as integer, or None if absolutely no source available
@@ -54,7 +59,9 @@ class FiscalYearExtractor:
             return fiscal_year
         
         # Method 2: Calculate from fiscal year end code
-        fiscal_year = cls._extract_from_calculation(entity_info, end_date, company_info)
+        fiscal_year = cls._extract_from_calculation(
+            entity_info, end_date, company_info, fiscal_year_convention, weekday
+        )
         if fiscal_year:
             logger.debug(f"✓ Fiscal year from calculation: {fiscal_year}")
             return fiscal_year
@@ -110,7 +117,9 @@ class FiscalYearExtractor:
         cls,
         entity_info: Dict[str, Any],
         end_date: Optional[datetime],
-        company_info: Optional[Dict[str, Any]]
+        company_info: Optional[Dict[str, Any]],
+        fiscal_year_convention: str = "end",
+        weekday: Optional[object] = None
     ) -> Optional[int]:
         """
         Calculate fiscal year from fiscal year end code and document end date.
@@ -119,6 +128,8 @@ class FiscalYearExtractor:
             entity_info: Dictionary with XBRL entity information
             end_date: Document period end date
             company_info: Company information (may contain fiscalYearEnd)
+            fiscal_year_convention: 'end' (default) or 'start' naming.
+            weekday: Optional weekday for 52/53-week filers.
             
         Returns:
             Calculated fiscal year as integer, or None if calculation fails
@@ -137,7 +148,7 @@ class FiscalYearExtractor:
         
         try:
             fiscal_year, _ = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                end_date, fiscal_year_end_code
+                end_date, fiscal_year_end_code, weekday, fiscal_year_convention
             )
             
             if fiscal_year:
@@ -216,7 +227,9 @@ class FiscalYearExtractor:
         entity_info: Dict[str, Any],
         end_date: Optional[datetime] = None,
         document_uri: Optional[str] = None,
-        company_info: Optional[Dict[str, Any]] = None
+        company_info: Optional[Dict[str, Any]] = None,
+        fiscal_year_convention: str = "end",
+        weekday: Optional[object] = None
     ) -> Tuple[Optional[int], str]:
         """
         Extract fiscal year and return source method for tracking/debugging.
@@ -226,6 +239,8 @@ class FiscalYearExtractor:
             end_date: Document period end date
             document_uri: URI of the XBRL document
             company_info: Company information (may contain fiscalYearEnd)
+            fiscal_year_convention: 'end' (default) or 'start' naming.
+            weekday: Optional weekday for 52/53-week filers.
             
         Returns:
             Tuple of (fiscal_year, source_method)
@@ -237,7 +252,9 @@ class FiscalYearExtractor:
             return fiscal_year, "xbrl_field"
         
         # Try calculation
-        fiscal_year = cls._extract_from_calculation(entity_info, end_date, company_info)
+        fiscal_year = cls._extract_from_calculation(
+            entity_info, end_date, company_info, fiscal_year_convention, weekday
+        )
         if fiscal_year:
             return fiscal_year, "calculated"
         

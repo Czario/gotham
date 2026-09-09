@@ -2,7 +2,7 @@
 """Database operations and data access layer with unified error handling"""
 
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Optional, Any, Union, Tuple
 from bson import ObjectId
 import pandas as pd
 import time
@@ -96,6 +96,36 @@ class CompanyRepository:
         """Get the fiscal year-end for a company"""
         company = self.get_company(cik)
         return company.get('fiscal_year_end') if company else None
+
+    def get_fiscal_year_anchors(self, cik: str, limit: int = 8) -> List[Tuple[str, Optional[int]]]:
+        """Return recent (period_date, fiscal_year) anchors for a company.
+
+        Used to detect whether the company labels its fiscal years by start year
+        or end year (see FiscalYearCalculator.determine_fiscal_year_convention).
+        Queries existing concept_values across both quarterly and annual tables so
+        the detection is robust even when a company only has annual data.
+        """
+        anchors = []
+        if self.db is None:
+            return anchors
+        try:
+            for col in ('concept_values_quarterly', 'concept_values_annual'):
+                if col not in self.db.list_collection_names():
+                    continue
+                cursor = self.db[col].aggregate([
+                    {'$match': {'cik': str(cik),
+                                'reporting_period.period_date': {'$exists': True, '$ne': ''},
+                                'reporting_period.fiscal_year': {'$exists': True}}},
+                    {'$group': {'_id': {'pd': '$reporting_period.period_date',
+                                        'fy': '$reporting_period.fiscal_year'}}},
+                    {'$sort': {'_id.pd': -1}},
+                    {'$limit': limit},
+                ])
+                for doc in cursor:
+                    anchors.append((doc['_id']['pd'], doc['_id']['fy']))
+        except Exception as e:
+            print(f"Error fetching fiscal year anchors for {cik}: {e}")
+        return anchors
 
 class FilingRepository:
     """Repository for filing data operations"""

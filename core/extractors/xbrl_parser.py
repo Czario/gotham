@@ -821,7 +821,10 @@ class FlexibleXBRLExtractor:
                 entity_info=entity_info,
                 end_date=end_date_for_calc,
                 document_uri=document_uri,
-                company_info=self.company_info
+                company_info=self.company_info,
+                fiscal_year_convention=(self.company_info or {}).get(
+                    'fiscal_year_convention', 'end'
+                ),
             )
             
             if fiscal_year:
@@ -834,7 +837,8 @@ class FlexibleXBRLExtractor:
                 if end_date_for_calc and fiscal_year_end_code:
                     from utilities.helpers.period_utils import FiscalYearCalculator
                     _, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                        end_date_for_calc, fiscal_year_end_code
+                        end_date_for_calc, fiscal_year_end_code, None,
+                        (self.company_info or {}).get('fiscal_year_convention', 'end'),
                     )
                     if quarter:
                         primary_period_info['quarter'] = quarter

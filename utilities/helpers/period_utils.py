@@ -285,9 +285,81 @@ class PeriodMatcher:
 
 class FiscalYearCalculator:
     """Centralized fiscal year calculation utilities"""
-    
+
+    _WEEKDAYS = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+
     @staticmethod
-    def calculate_fiscal_quarter_boundaries(fiscal_year: int, quarter: int, fiscal_year_end_code: str) -> Optional[Tuple[datetime, datetime]]:
+    def _parse_fiscal_year_end_code(fiscal_year_end_code: str) -> Optional[Tuple[int, int]]:
+        """Parse 'MMDD' fiscal year end code into (month, day)."""
+        if not fiscal_year_end_code:
+            return None
+        code = str(fiscal_year_end_code).strip()
+        if len(code) == 4 and code.isdigit():
+            return int(code[:2]), int(code[2:])
+        return None
+
+    @staticmethod
+    def _nearest_weekday(anchor: datetime, weekday) -> datetime:
+        """Return the given weekday on or nearest to the anchor date (52/53-week filers).
+
+        Example: anchor=Jan 31, weekday=Sunday -> the Sunday closest to Jan 31
+        (Chewy's fiscal year end).
+        """
+        if isinstance(weekday, str):
+            weekday_num = FiscalYearCalculator._WEEKDAYS.get(weekday.strip().lower())
+        else:
+            weekday_num = int(weekday) if weekday is not None else None
+        if weekday_num is None:
+            return anchor
+        delta = (weekday_num - anchor.weekday()) % 7
+        if delta > 3:
+            delta -= 7
+        return anchor + timedelta(days=delta)
+
+    @staticmethod
+    def _fiscal_year_end_date(
+        fiscal_year: Optional[int],
+        fiscal_year_end_code: str,
+        weekday: Optional[object] = None,
+        fiscal_year_convention: str = "end",
+    ) -> Optional[datetime]:
+        """Return the fiscal-year-end date for a given fiscal year.
+
+        Args:
+            fiscal_year: The fiscal year label (e.g. 2024).
+            fiscal_year_end_code: 'MMDD' (e.g. '0630' for June 30, '0201' for Feb 1).
+            weekday: Optional weekday (name or int, Monday=0) for 52/53-week filers
+                whose fiscal year ends on that weekday nearest to the anchor date
+                (e.g. "sunday" for Chewy). Defaults to a fixed calendar date.
+            fiscal_year_convention:
+                'end' (default) -> fiscal year N ends on the year-end that falls in
+                    calendar year N (e.g. Walmart's FY2025 ends Jan 2025).
+                'start' -> fiscal year N ends early in calendar year N+1 for early-year
+                    (Jan/Feb) filers (e.g. Chewy's FY2025 ends Feb 2026).
+        """
+        parsed = FiscalYearCalculator._parse_fiscal_year_end_code(fiscal_year_end_code)
+        if parsed is None or not fiscal_year:
+            return None
+        fy_month, fy_day = parsed
+        end_calendar_year = fiscal_year
+        if fiscal_year_convention == "start" and fy_month in (1, 2):
+            end_calendar_year = fiscal_year + 1
+        anchor = datetime(end_calendar_year, fy_month, fy_day)
+        if weekday is None:
+            return anchor
+        return FiscalYearCalculator._nearest_weekday(anchor, weekday)
+
+    @staticmethod
+    def calculate_fiscal_quarter_boundaries(
+        fiscal_year: int,
+        quarter: int,
+        fiscal_year_end_code: str,
+        weekday: Optional[object] = None,
+        fiscal_year_convention: str = "end",
+    ) -> Optional[Tuple[datetime, datetime]]:
         """
         Calculate the start and end dates for a specific fiscal quarter.
         
@@ -298,6 +370,8 @@ class FiscalYearCalculator:
             fiscal_year: The fiscal year (e.g., 2024)
             quarter: The fiscal quarter (1, 2, 3, or 4)
             fiscal_year_end_code: Company fiscal year end code (e.g., '0630' for June 30)
+            weekday: Optional weekday for 52/53-week filers (see _fiscal_year_end_date).
+            fiscal_year_convention: 'end' (default) or 'start' (see _fiscal_year_end_date).
             
         Returns:
             Tuple of (quarter_start_date, quarter_end_date) or None if calculation fails
@@ -314,18 +388,18 @@ class FiscalYearCalculator:
             return None
         
         try:
-            # Parse fiscal year end code (e.g., '0630' = June 30)
-            if len(fiscal_year_end_code) == 4:
-                fy_month = int(fiscal_year_end_code[:2])
-                fy_day = int(fiscal_year_end_code[2:])
-            else:
+            # Fiscal year end date (handles early-year filers + 52/53-week weekday rule)
+            fiscal_year_end = FiscalYearCalculator._fiscal_year_end_date(
+                fiscal_year, fiscal_year_end_code, weekday, fiscal_year_convention
+            )
+            prev_fiscal_year_end = FiscalYearCalculator._fiscal_year_end_date(
+                fiscal_year - 1, fiscal_year_end_code, weekday, fiscal_year_convention
+            )
+            if fiscal_year_end is None or prev_fiscal_year_end is None:
                 return None
             
-            # Calculate fiscal year end date
-            fiscal_year_end = datetime(fiscal_year, fy_month, fy_day)
-            
             # Calculate fiscal year start (day after previous fiscal year end)
-            fiscal_year_start = fiscal_year_end - relativedelta(months=12) + timedelta(days=1)
+            fiscal_year_start = prev_fiscal_year_end + timedelta(days=1)
             
             # Calculate quarter boundaries
             quarter_start = fiscal_year_start + relativedelta(months=3 * (quarter - 1))
@@ -337,13 +411,20 @@ class FiscalYearCalculator:
             return None
     
     @staticmethod
-    def determine_fiscal_year_from_date(end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
+    def determine_fiscal_year_from_date(
+        end_date: datetime,
+        fiscal_year_end_code: str,
+        weekday: Optional[object] = None,
+        fiscal_year_convention: str = "end",
+    ) -> Optional[int]:
         """
         Determine which fiscal year a given date belongs to.
         
         Args:
             end_date: The date to check
             fiscal_year_end_code: Company fiscal year end code (e.g., '0630' for June 30)
+            weekday: Optional weekday for 52/53-week filers (see _fiscal_year_end_date).
+            fiscal_year_convention: 'end' (default) or 'start' (see _fiscal_year_end_date).
             
         Returns:
             The fiscal year that this date belongs to, or None if calculation fails
@@ -356,46 +437,59 @@ class FiscalYearCalculator:
             return None
         
         try:
-            # Parse fiscal year end code
-            if len(fiscal_year_end_code) == 4:
-                fy_month = int(fiscal_year_end_code[:2])
-                fy_day = int(fiscal_year_end_code[2:])
-            else:
+            if FiscalYearCalculator._parse_fiscal_year_end_code(fiscal_year_end_code) is None:
                 return None
             
-            # Try fiscal year ending in the current calendar year
-            fiscal_year_end_current = datetime(end_date.year, fy_month, fy_day)
+            tolerance = timedelta(days=PeriodConfig.FISCAL_YEAR_TOLERANCE_DAYS)
             
-            # Try fiscal year ending in the next calendar year
-            fiscal_year_end_next = datetime(end_date.year + 1, fy_month, fy_day)
+            # A period end date can only belong to a fiscal year ending in its own
+            # calendar year, the previous, or the next. Determine which fiscal-year
+            # span (s, e] contains the end_date (with tolerance at the boundaries to
+            # absorb 52/53-week drift).
+            for candidate in [end_date.year - 1, end_date.year, end_date.year + 1]:
+                e = FiscalYearCalculator._fiscal_year_end_date(
+                    candidate, fiscal_year_end_code, weekday, fiscal_year_convention
+                )
+                prev_e = FiscalYearCalculator._fiscal_year_end_date(
+                    candidate - 1, fiscal_year_end_code, weekday, fiscal_year_convention
+                )
+                if e is None or prev_e is None:
+                    continue
+                s = prev_e + timedelta(days=1)
+                if (s - tolerance) <= end_date <= (e + tolerance):
+                    return candidate
             
-            # Determine which fiscal year the end_date belongs to
-            tolerance_days = PeriodConfig.FISCAL_YEAR_TOLERANCE_DAYS
-            
-            # Calculate days to each potential fiscal year end
-            days_to_current = (fiscal_year_end_current - end_date).days
-            
-            # If we're within tolerance of the current year's fiscal year end, use it
-            if abs(days_to_current) <= tolerance_days:
-                return end_date.year
-            # If end_date is before or at the current year's fiscal year end, use current year
-            elif days_to_current >= 0:
-                return end_date.year
-            # Otherwise, the end_date is in the fiscal year ending next calendar year
-            else:
-                return end_date.year + 1
+            # Shouldn't normally happen; fall back to nearest fiscal year end
+            best, best_days = None, None
+            for candidate in [end_date.year - 1, end_date.year, end_date.year + 1]:
+                e = FiscalYearCalculator._fiscal_year_end_date(
+                    candidate, fiscal_year_end_code, weekday, fiscal_year_convention
+                )
+                if e is None:
+                    continue
+                days = abs((e - end_date).days)
+                if best_days is None or days < best_days:
+                    best, best_days = candidate, days
+            return best
                 
         except (ValueError, AttributeError):
             return None
     
     @staticmethod
-    def determine_quarter_from_date(end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
+    def determine_quarter_from_date(
+        end_date: datetime,
+        fiscal_year_end_code: str,
+        weekday: Optional[object] = None,
+        fiscal_year_convention: str = "end",
+    ) -> Optional[int]:
         """
         Determine which fiscal quarter a given date belongs to.
         
         Args:
             end_date: The date to check
             fiscal_year_end_code: Company fiscal year end code (e.g., '0630' for June 30)
+            weekday: Optional weekday for 52/53-week filers (see _fiscal_year_end_date).
+            fiscal_year_convention: 'end' (default) or 'start' (see _fiscal_year_end_date).
             
         Returns:
             The fiscal quarter (1, 2, 3, or 4) that this date belongs to, or None if calculation fails
@@ -405,7 +499,9 @@ class FiscalYearCalculator:
         
         try:
             # First determine the fiscal year
-            fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(end_date, fiscal_year_end_code)
+            fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(
+                end_date, fiscal_year_end_code, weekday, fiscal_year_convention
+            )
             if not fiscal_year:
                 return None
             
@@ -414,7 +510,7 @@ class FiscalYearCalculator:
             
             for q in [1, 2, 3, 4]:
                 boundaries = FiscalYearCalculator.calculate_fiscal_quarter_boundaries(
-                    fiscal_year, q, fiscal_year_end_code
+                    fiscal_year, q, fiscal_year_end_code, weekday, fiscal_year_convention
                 )
                 if boundaries:
                     q_start, q_end = boundaries
@@ -440,20 +536,90 @@ class FiscalYearCalculator:
         return quarter_map.get(fiscal_period)
 
     @staticmethod
-    def calculate_fiscal_year_and_quarter(end_date: datetime, fiscal_year_end_code: str) -> Tuple[Optional[int], Optional[int]]:
+    def calculate_fiscal_year_and_quarter(
+        end_date: datetime,
+        fiscal_year_end_code: str,
+        weekday: Optional[object] = None,
+        fiscal_year_convention: str = "end",
+    ) -> Tuple[Optional[int], Optional[int]]:
         """
         Calculate fiscal year and quarter based on end date and fiscal year end code.
         
         This function now uses the centralized DRY logic for fiscal calculations.
+
+        Args:
+            end_date: The period end date.
+            fiscal_year_end_code: 'MMDD' fiscal year end code (e.g. '0630').
+            weekday: Optional weekday for 52/53-week filers (see _fiscal_year_end_date).
+            fiscal_year_convention: 'end' (default) or 'start' (see _fiscal_year_end_date).
         """
         if not end_date or not fiscal_year_end_code:
             return None, None
         
         # Use centralized functions - DRY principle
-        fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(end_date, fiscal_year_end_code)
-        quarter = FiscalYearCalculator.determine_quarter_from_date(end_date, fiscal_year_end_code)
+        fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(
+            end_date, fiscal_year_end_code, weekday, fiscal_year_convention
+        )
+        quarter = FiscalYearCalculator.determine_quarter_from_date(
+            end_date, fiscal_year_end_code, weekday, fiscal_year_convention
+        )
         
         return fiscal_year, quarter
+
+    @staticmethod
+    def determine_fiscal_year_convention(
+        fiscal_anchors,
+        fiscal_year_end_code: str,
+        weekday: Optional[object] = None,
+    ) -> Optional[str]:
+        """Infer whether a company labels its fiscal years by START year or END year.
+
+        Companies with an early (Jan/Feb) fiscal year end differ in how they name
+        their fiscal years:
+          * END-year naming (Walmart, majority): FY2025 runs Feb 2024 - Jan 2025.
+          * START-year naming (Chewy):            FY2025 runs Feb 2025 - Feb 2026.
+
+        Given a company's known (end_date, fiscal_year) anchors (e.g. from its
+        existing reporting periods in the DB), this returns 'start', 'end', or None
+        (when ambiguous, e.g. calendar-year filers where the two conventions agree).
+
+        Args:
+            fiscal_anchors: Iterable of (end_date, fiscal_year) tuples.
+            fiscal_year_end_code: 'MMDD' fiscal year end code.
+            weekday: Optional weekday for 52/53-week filers.
+        """
+        if not fiscal_anchors or not fiscal_year_end_code:
+            return None
+        try:
+            start_matches = end_matches = total = 0
+            for end_date, fy in fiscal_anchors:
+                if not end_date or fy is None:
+                    continue
+                if isinstance(end_date, str):
+                    try:
+                        end_date = datetime.strptime(end_date[:10], "%Y-%m-%d")
+                    except (ValueError, TypeError):
+                        continue
+                total += 1
+                fys = FiscalYearCalculator.determine_fiscal_year_from_date(
+                    end_date, fiscal_year_end_code, weekday, "start"
+                )
+                fye = FiscalYearCalculator.determine_fiscal_year_from_date(
+                    end_date, fiscal_year_end_code, weekday, "end"
+                )
+                if fys == fy:
+                    start_matches += 1
+                if fye == fy:
+                    end_matches += 1
+            if total == 0:
+                return None
+            if start_matches > end_matches:
+                return "start"
+            if end_matches > start_matches:
+                return "end"
+            return None
+        except (ValueError, AttributeError, TypeError):
+            return None
 
     @staticmethod
     def determine_quarter_from_form_and_date(form_type: str, end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
