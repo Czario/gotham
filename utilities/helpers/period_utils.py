@@ -493,6 +493,18 @@ class FiscalYearCalculator:
             
         Returns:
             The fiscal quarter (1, 2, 3, or 4) that this date belongs to, or None if calculation fails
+
+        Notes:
+            Quarter boundaries are calculated on a strict 3-month grid.
+
+            Retailers that operate a 52/53-week calendar may use an uneven
+            quarter layout (e.g. Kroger's first quarter is 16 weeks while the
+            rest are 12 weeks).  A pure "which interval contains this date"
+            lookup mislabels such periods because the real quarter end can be
+            several weeks past the grid boundary (Kroger's Q1 ends in late May
+            instead of late April).  We instead pick the quarter whose grid end
+            is *nearest* to the period end date, which correctly resolves both
+            even (13-week) and uneven (16/12/12/12) fiscal calendars.
         """
         if not end_date or not fiscal_year_end_code:
             return None
@@ -505,19 +517,23 @@ class FiscalYearCalculator:
             if not fiscal_year:
                 return None
             
-            # Check each quarter to see which one contains this date
-            tolerance = timedelta(days=PeriodConfig.FISCAL_YEAR_TOLERANCE_DAYS)
-            
+            # Pick the quarter whose (grid) end date is closest to the period end.
+            best_quarter: Optional[int] = None
+            best_delta: Optional[int] = None
             for q in [1, 2, 3, 4]:
                 boundaries = FiscalYearCalculator.calculate_fiscal_quarter_boundaries(
                     fiscal_year, q, fiscal_year_end_code, weekday, fiscal_year_convention
                 )
-                if boundaries:
-                    q_start, q_end = boundaries
-                    # Check if end_date falls within this quarter (with tolerance)
-                    if q_start - tolerance <= end_date <= q_end + tolerance:
-                        return q
-            
+                if not boundaries:
+                    continue
+                _, q_end = boundaries
+                delta = abs((end_date - q_end).days)
+                if best_delta is None or delta < best_delta:
+                    best_quarter, best_delta = q, delta
+
+            if best_quarter is not None:
+                return best_quarter
+
             # Default to Q4 if we can't determine (shouldn't happen)
             return 4
             

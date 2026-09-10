@@ -44,6 +44,33 @@ def test_start_year_convention_chewy(date_str, exp_fy, exp_q):
     assert calc(date_str, "0201", convention="start") == (exp_fy, exp_q)
 
 
+# --- Uneven fiscal quarters (16/12/12/12-week retailers) ---
+@pytest.mark.parametrize("date_str,exp_fy,exp_q", [
+    # Kroger's first quarter is 16 weeks, so it ends in late May instead of
+    # late April.  The quarter grid is still 3-month based, but the real Q1
+    # end is closest to the Q1 grid end, so it must be labelled Q1.
+    ("2022-05-21", 2023, 1),
+    ("2022-08-13", 2023, 2),
+    ("2022-11-05", 2023, 3),
+    ("2023-05-20", 2024, 1),
+    ("2023-08-12", 2024, 2),
+    ("2023-11-04", 2024, 3),
+    ("2024-05-25", 2025, 1),
+    ("2024-08-17", 2025, 2),
+    ("2024-11-09", 2025, 3),
+    ("2025-05-24", 2026, 1),
+    ("2025-08-16", 2026, 2),
+    ("2025-11-08", 2026, 3),
+    ("2026-05-23", 2027, 1),
+])
+def test_kroger_16_week_first_quarter(date_str, exp_fy, exp_q):
+    # Kroger ends its fiscal year on the Saturday closest to Jan 31 and never
+    # files a 10-Q for Q4 (that is the 10-K), so only Q1-Q3 10-Q dates are used.
+    assert calc(date_str, "0131") == (exp_fy, exp_q)
+    # Q4 is still the annual period (late Jan / early Feb).
+    assert calc("2025-02-01", "0131") == (2025, 4)
+
+
 # --- 52/53-week weekday-closest fiscal year end ---
 def test_52_53_week_sunday_closest_jan31():
     # Chewy ends fiscal year on the Sunday closest to Jan 31.
