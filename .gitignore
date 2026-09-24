@@ -49,6 +49,10 @@ Thumbs.db
 htmlcov/
 coverage.xml
 
+# ─── Dev LLM response cache (LLM_CACHE=1) ─────────────────────────────────────
+# Holds full prompts/responses incl. filing text. Delete to reset.
+.llm_cache/
+
 # ─── Logs ─────────────────────────────────────────────────────────────────────
 *.log
 logs/
@@ -80,3 +84,6 @@ dimensional_*.json
 *.backup.json
 *_backup_*.json
 
+
+# Filings agent runtime state (audit trail + durable run session)
+.filings_agent/

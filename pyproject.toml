@@ -20,17 +20,26 @@ dependencies = [
     "data-normalization-service",
     "xlrd>=2.0.2",
     "redis>=5.0.0",
+    "langgraph>=0.2.0",
+    "langchain-core>=0.3.0",
+    "langchain-openai>=0.2.0",
+    "rich>=15.0.0",
+    "diskcache>=5.6.3",
 ]
 
 [project.scripts]
 main = "sec_scraper_cli:main"
 sec-scraper-worker = "worker_10kq:main"
+filings-agent = "main_filing_agent:main"
 
 [tool.uv]
 package = true
 
 [tool.setuptools]
-py-modules = ["sec_scraper_cli", "worker_10kq", "redis_queue"]
+py-modules = ["sec_scraper_cli", "worker_10kq", "redis_queue", "main_filing_agent"]
+
+[tool.setuptools.packages.find]
+include = ["filings_agent*"]
 
 [tool.uv.sources]
 data-normalization-service = { path = "./normalization", editable = true }
