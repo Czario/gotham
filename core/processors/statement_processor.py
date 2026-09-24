@@ -250,6 +250,26 @@ class EnhancedFinancialStatementProcessor:
             fiscal_year = primary_period_info.get('fiscal_year')
             quarter = primary_period_info.get('quarter')
         
+        # Abstract grouping headers ("Operating expenses:", "Earnings per
+        # share:") carry no value but PARENT the rows beneath them.  Dropping
+        # them makes each nested row attach to the nearest preceding line item
+        # instead (e.g. R&D ending up under Gross Profit), so they are kept —
+        # as structure only.  Collected in a pre-pass over the tree.
+        grouping_headers: set = set()
+
+        def _collect_grouping_headers(items, ancestors) -> None:
+            for node in items or []:
+                is_abstract = bool(getattr(node, 'abstract', False))
+                if not is_abstract and getattr(node, 'value', None) is not None:
+                    grouping_headers.update(ancestors)
+                _collect_grouping_headers(
+                    getattr(node, 'children', None),
+                    ancestors + ([node.concept_name] if is_abstract else []),
+                )
+
+        for _root in hierarchy if isinstance(hierarchy, list) else []:
+            _collect_grouping_headers([_root], [])
+
         def process_item(item, level=0):
             # Convert FinancialLineItem to dictionary format
             fact_dict = {
@@ -327,13 +347,26 @@ class EnhancedFinancialStatementProcessor:
             # Abstract header/grouping concepts with no value and no dimensional data are
             # structural noise and must not be stored.
             has_dimensional_data = bool(fact_dict.get('dimensional_facts'))
+            local_name = fact_dict['concept'].split(':')[-1]
+            is_abstract_wrapper = (
+                local_name.endswith(('Abstract', 'Table', 'LineItems', 'Domain'))
+                or fact_dict['concept'].endswith('Axis')
+            )
+            # Abstract wrappers (e.g. EarningsPerShareAbstract) carry no values and are
+            # never stored in the database. Only non-abstract financial grouping headers
+            # (e.g. us-gaap:OperatingExpenses) may act as grouping parents.
+            is_grouping_header = (
+                (fact_dict['concept'] in grouping_headers)
+                and not is_abstract_wrapper
+            )
             should_include = (
-                fact_dict['value'] is not None
+                (fact_dict['value'] is not None and not is_abstract_wrapper)
                 or has_dimensional_data
+                or is_grouping_header
             )
             
             # Always exclude non-financial taxonomy concepts even if they have a value
-            if should_include and self._should_skip_irrelevant_concept(
+            if should_include and not is_grouping_header and self._should_skip_irrelevant_concept(
                 fact_dict['concept'], fact_dict['abstract'], has_dimensional_data
             ):
                 should_include = False
@@ -341,10 +374,12 @@ class EnhancedFinancialStatementProcessor:
             if should_include:
                 flat_data.append(fact_dict)
             
-            # Process children recursively
+            # Process children recursively: when an abstract wrapper is omitted,
+            # children inherit the current level instead of being indented.
             if hasattr(item, 'children') and item.children:
+                child_level = level + 1 if should_include else level
                 for child in item.children:
-                    process_item(child, level + 1)
+                    process_item(child, child_level)
         
         # Process all items in hierarchy
         for item in hierarchy:

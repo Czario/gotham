@@ -2,10 +2,11 @@
 Business logic services for financial data normalization.
 """
 from typing import Dict, Set, Optional, NamedTuple, Any, List
+from datetime import datetime
 from bson import ObjectId
 import logging
 
-from ..core.models import ConceptKey, ConceptDocument, ValueDocument, Company, FinancialStatement
+from ..core.models import ConceptKey, ConceptDocument, ValueDocument, Company, FinancialStatement, StatementBundle
 from ..database import (
     DatabaseConnection,
     FinancialStatementRepository,
@@ -17,14 +18,33 @@ from ..database import (
 )
 from ..core.config import AppConfig
 from ..core.concept_canonicalization import canonical_concept
+from ..core.row_identity import row_key_str
 from ..core.logging_config import get_status_logger
 from ..utils.hierarchy import HierarchyManager
 from ..utils.progress import progress_wrapper, create_progress_bar
 from .quarterly_service import PeriodBasedFinancialCalculationService
 from ..utils.taxonomy import get_taxonomy_manager, lookup_concept_label
 from ..utils.duplicate_prevention import DuplicatePreventionManager
+from ..utils.label_cleaning import clean_label, clean_labels_in_item
 
 logger = logging.getLogger(__name__)
+
+# Statement types materialized into normalized_concepts_* / concept_values_*.
+# Core statements plus equity_changes (share buybacks, dividends, retained
+# earnings).  comprehensive_income is intentionally excluded — its key metrics
+# (NetIncomeLoss, ComprehensiveIncomeNetOfTax) are already captured from the
+# income_statement.
+_ALLOWED_STATEMENT_TYPES = {'income', 'balancesheet', 'cashflow'}
+
+# Structural / namespace guards used to reduce a statement hierarchy down to
+# concrete financial line items (see ``_is_structural_concept``).
+_NON_FIN_NS = ('dei:', 'srt:', 'country:', 'invest:')
+_ALWAYS_SKIP_CONTAINS = (
+    'IncomeStatementAbstract', 'StatementOfFinancialPositionAbstract',
+    'StatementOfCashFlowsAbstract', 'StatementOfIncomeAndComprehensiveIncomeAbstract',
+    'StatementOfStockholdersEquityAbstract', 'StatementTable', 'StatementLineItems',
+    'ComprehensiveIncomeNetOfTaxAbstract', 'WeightedAverageNumberOfSharesOutstandingAbstract',
+)
 
 
 class DimensionalConceptInfo(NamedTuple):
@@ -352,44 +372,209 @@ class FinancialNormalizationService:
     # In-memory API — used by the merged scraper pipeline (no source DB)
     # ------------------------------------------------------------------
 
-    def normalize_statement_in_memory(
+    def _is_structural_concept(self, concept: str, is_abstract: bool) -> bool:
+        """True when *concept* is structural/namespace noise, not a line item.
+
+        Some filings report a zero-value fact for abstract/structural concepts
+        (e.g. ``StatementOfFinancialPositionAbstract``), which makes them arrive
+        with ``abstract=False`` — the name-pattern checks below catch those
+        regardless of the abstract flag.
+        """
+        if concept.startswith(_NON_FIN_NS):
+            return True  # DEI / SRT / country / invest are not financial line items
+        if concept.endswith('Axis'):
+            return True  # Axis concepts never carry values
+        if any(p in concept for p in _ALWAYS_SKIP_CONTAINS):
+            return True
+        if is_abstract:
+            local = concept.split(':')[-1]
+            if local.endswith(('Abstract', 'Domain')):
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # In-memory API — pure compute (no DB) + explicit persist
+    # ------------------------------------------------------------------
+
+    def _build_bundle(self, statement, filing, company_doc: Optional[dict] = None) -> StatementBundle:
+        """PURE: build a ``StatementBundle`` from resolved model objects.
+
+        No database reads or writes happen here.  Cross-company hierarchy
+        reference resolution (path/order_key promotion) is deliberately a
+        persistence concern — it happens in ``persist_statement_bundle``.
+        """
+        logger.debug(f"Building bundle for {statement.statement_type} / CIK {statement.company_cik}")
+
+        # Clean every label before it can reach the database.  Taxonomy labels
+        # carry XBRL presentation tags such as "[Member]" ("Rest Of World
+        # [Member]") and redundant "Segment" words; those must never be
+        # persisted.  Done in place so hierarchy/source views stay consistent.
+        for _item in statement.financial_data:
+            clean_labels_in_item(_item)
+            for _fact in _item.get('dimensional_facts') or []:
+                clean_labels_in_item(_fact)
+
+        # PHASE 1 (pure): dimensional concepts + their source facts
+        all_dimensional_concepts, dimension_data_map = self._extract_all_dimensional_concepts(
+            statement.financial_data
+        )
+
+        # PHASE 2 (pure): the filing's own hierarchy + concrete-concept filter
+        hierarchy_data = self.hierarchy_manager.build_hierarchy_data(statement.financial_data)
+
+        # Grouping headers: abstract rows that PARENT at least one non-abstract
+        # row ("Operating expenses:", "Earnings per share:").  They carry no
+        # value but must be persisted as rows, otherwise their children attach
+        # to the nearest preceding line item instead (e.g. R&D under Gross
+        # Profit).  They are handled SEPARATELY from the concrete concepts so
+        # each row is resolved exactly once.
+        def _parents_a_concrete_row(candidate: dict) -> bool:
+            path = candidate.get('path')
+            if not path:
+                return False
+            return any(
+                (not other.get('abstract'))
+                and (other.get('path') or '').startswith(f"{path}.")
+                for other in hierarchy_data
+            )
+
+        def _is_statement_root_header(concept: str) -> bool:
+            """Statement-level/table wrappers carry no grouping information.
+
+            ``IncomeStatementAbstract`` / ``StatementTable`` / ``...LineItems``
+            only restate the statement type, so they stay out; mid-statement
+            groupings (``OperatingExpenses``, ``EarningsPerShareBasicAbstract``)
+            are what give nested rows their real parent.
+            """
+            if concept.startswith(_NON_FIN_NS) or concept.endswith('Axis'):
+                return True
+            if any(p in concept for p in _ALWAYS_SKIP_CONTAINS):
+                return True
+            return concept.split(':')[-1].endswith(('Table', 'LineItems', 'Domain', 'Abstract'))
+
+        abstract_concepts = [
+            item for item in hierarchy_data
+            if item.get('abstract')
+            and _parents_a_concrete_row(item)
+            and not _is_statement_root_header(item.get('concept', ''))
+        ]
+        header_names = {item.get('concept') for item in abstract_concepts}
+
+        concrete_concepts = [
+            item for item in hierarchy_data
+            if item.get('concept') not in header_names
+            and not self._is_structural_concept(
+                item.get('concept', ''), item.get('abstract', False)
+            )
+        ]
+
+        # Re-root: if all concrete concepts were nested under a dropped statement root header
+        # (e.g. "001.001", "001.002", "001.004.001"), re-root them by stripping the
+        # "001." prefix so Revenue starts at "001", Cost at "002", etc., matching
+        # production reference companies (TSLA, GOOGL, MSFT, META) with zero orphans.
+        concrete_paths = [item.get('path') for item in concrete_concepts if item.get('path')]
+        if concrete_paths and not any(p == '001' for p in concrete_paths) and all(p.startswith('001.') for p in concrete_paths):
+            for item in concrete_concepts:
+                if item.get('path', '').startswith('001.'):
+                    item['path'] = item['path'][4:]
+                    item['level'] = max(0, len(item['path'].split('.')) - 1)
+                    item['hierarchy_level'] = item['level']
+
+        logger.info(
+            f"Bundle: kept {len(concrete_concepts)} concrete concept(s) and "
+            f"{len(abstract_concepts)} grouping header(s), "
+            f"skipped {len(hierarchy_data) - len(concrete_concepts) - len(abstract_concepts)} "
+            f"abstract/structural"
+        )
+
+        dimensional_concepts = []
+        for dim_info in all_dimensional_concepts:
+            dim_data = dimension_data_map.get(dim_info, {})
+            label = None
+            dim_details = dim_data.get('dimension_details', {})
+            for _ax, _det in dim_details.items():
+                if isinstance(_det, dict) and _det.get('member_qname') == dim_info.concept:
+                    label = _det.get('member_label') or _det.get('member_local_name')
+                    break
+            if not label:
+                label = dim_data.get('fact_label') or dim_data.get('label') or dim_info.concept.split(':')[-1]
+            dimensional_concepts.append({
+                'parent_concept': dim_info.parent_concept,
+                'segment_type': dim_info.segment_type,
+                'concept': dim_info.concept,
+                'label': clean_label(label),
+                'dimension_data': dim_data,
+            })
+
+        # Informational flattened value view.  Persistence re-reads the items
+        # (which carry fact_id/decimals/dimensional_facts) for the actual write.
+        values = []
+        for item in concrete_concepts:
+            for period_key, value in self._extract_time_period_values(item).items():
+                if value is None:
+                    continue
+                values.append({
+                    'concept': item.get('concept'),
+                    'period_key': period_key,
+                    'value': value,
+                    'fact_id': item.get('fact_id'),
+                    'decimals': item.get('decimals'),
+                    'unit': item.get('unit'),
+                })
+
+        return StatementBundle(
+            company_cik=statement.company_cik,
+            statement_type=statement.statement_type,
+            form_type=filing.form_type,
+            accession_number=filing.accession_number,
+            reporting_period=statement.reporting_period,
+            created_at=statement.created_at,
+            statement_id=statement.id,
+            filing_id=filing.id,
+            concepts=concrete_concepts,
+            abstract_concepts=abstract_concepts,
+            dimensional_concepts=dimensional_concepts,
+            values=values,
+            dimensional_values=[],
+            hierarchy=hierarchy_data,
+            source_items=list(statement.financial_data),
+            company_doc=dict(company_doc or {}),
+        )
+
+    def normalize_statement_to_bundle(
         self,
         statement_doc: dict,
         filing_doc: dict,
         company_doc: dict,
-    ) -> None:
-        """Normalize a single financial statement provided entirely in memory.
+    ) -> Optional[StatementBundle]:
+        """PURE: normalize a single statement into an in-memory bundle.
 
-        This is the primary entry point for the merged scraper pipeline.
-        No reads from the source database are performed.
+        Primary entry point for the merged scraper pipeline.  Performs NO
+        database reads or writes — the bundle is plain data.  The caller
+        decides whether/when to persist it via ``persist_statement_bundle``
+        (in the agent pipeline, validation and repair run in between).
 
         Args:
-            statement_doc: Raw statement dict as produced by the scraper's
-                ``process_filing_with_full_data``.  Must contain at least:
-                ``company_cik``, ``statement_type``, ``reporting_period`` (dict),
-                ``data`` (list of line-item dicts).
-            filing_doc: Filing metadata dict.  Must contain ``form_type``
-                and optionally ``accession_number``.
+            statement_doc: Raw statement dict as produced by the scraper.  Must
+                contain ``cik``, ``statement_type`` and ``data`` (list of
+                line-item dicts); ``reporting_period`` (dict) is optional.
+            filing_doc: Filing metadata dict.  Must contain ``form_type`` and
+                optionally ``accession_number``.
             company_doc: Company master dict (same shape as the ``companies``
-                collection).  Written to the target DB if not already present.
+                collection).  Written to the target DB on persist if missing.
         """
-        from bson import ObjectId as _ObjectId
         from datetime import datetime as _datetime
         from ..core.models import FinancialStatement as _FS, Filing as _Filing
 
-        # Ensure company is in target DB
-        self._ensure_company_in_target_from_dict(company_doc)
-
-        # Build model objects from dicts — reuses existing dataclass shapes
         filing = _Filing(
-            id=filing_doc.get('_id', _ObjectId()),
+            id=filing_doc.get('_id', ObjectId()),
             form_type=filing_doc.get('form_type', filing_doc.get('form', 'UNKNOWN')),
             accession_number=filing_doc.get('accession_number',
                                             filing_doc.get('accessionNumber')),
         )
 
         statement = _FS(
-            id=statement_doc.get('_id', _ObjectId()),
+            id=statement_doc.get('_id', ObjectId()),
             company_cik=statement_doc['cik'],
             filing_id=filing.id,
             statement_type=statement_doc['statement_type'],
@@ -398,93 +583,123 @@ class FinancialNormalizationService:
             financial_data=statement_doc.get('data', statement_doc.get('financial_data', [])),
         )
 
-        # Core statements plus equity_changes (share buybacks, dividends, retained earnings).
-        # comprehensive_income is intentionally excluded — its key metrics (NetIncomeLoss,
-        # ComprehensiveIncomeNetOfTax) are already captured from the income_statement.
-        _ALLOWED_STATEMENT_TYPES = {'income', 'balancesheet', 'cashflow'}
-        if statement.statement_type not in _ALLOWED_STATEMENT_TYPES:
-            logger.debug(f"Skipping statement_type='{statement.statement_type}' (not in allowed set)")
-            return
+        return self._build_bundle(statement, filing, company_doc)
 
-        # Delegate to the existing processing logic (no changes needed there)
-        self._process_financial_statement_with_filing(statement, filing)
+    def persist_statement_bundle(
+        self,
+        bundle: Optional[StatementBundle],
+        *,
+        enforce_allowed_types: bool = True,
+        replace_existing: bool = False,
+    ) -> bool:
+        """WRITES: persist an approved bundle to the target database.
 
-    def _process_financial_statement_with_filing(self, statement, filing) -> None:
-        """Core normalization logic — accepts pre-resolved filing object.
+        The only in-memory entry point that mutates the database.  Mirrors the
+        historical write order exactly: ensure company -> resolve concept paths
+        -> create/reuse concepts -> create/reuse dimensional concepts -> write
+        values.
 
-        Identical to ``_process_financial_statement`` except it uses the
-        already-resolved ``filing`` argument instead of fetching from source DB.
+        Args:
+            bundle: The bundle to persist (``None`` is a no-op).
+            enforce_allowed_types: When True (merged pipeline) statements
+                outside ``_ALLOWED_STATEMENT_TYPES`` are skipped.  The legacy
+                source-DB path passes False to preserve its historical
+                behaviour of processing every statement type.
+            replace_existing: True for a ``--reload``: an existing row for the
+                same period is overwritten instead of skipped, so the reload
+                actually replaces the period's values.
+
+        Returns:
+            True when the bundle was written, False when it was skipped.
         """
-        logger.debug(f"Processing {statement.statement_type} for CIK: {statement.company_cik}")
-
-        # PHASE 1: Dimensional concepts
-        all_dimensional_concepts, dimension_data_map = self._extract_all_dimensional_concepts(statement.financial_data)
-
-        # PHASE 2: Hierarchy + concrete concept promotion
-        hierarchy_data = self.hierarchy_manager.build_hierarchy_data(statement.financial_data)
-        concept_mapping: dict = {}
-
-        # Filter to concrete concepts (non-abstract).
-        # Also apply a name-pattern guard: some filings report a zero-value fact for
-        # abstract/structural concepts (e.g. StatementOfFinancialPositionAbstract),
-        # which causes them to arrive with abstract=False.  The concept name check
-        # catches those regardless of the abstract flag.
-        _NON_FIN_NS   = ('dei:', 'srt:', 'country:', 'invest:')
-        _ALWAYS_SKIP_CONTAINS  = (
-            'IncomeStatementAbstract', 'StatementOfFinancialPositionAbstract',
-            'StatementOfCashFlowsAbstract', 'StatementOfIncomeAndComprehensiveIncomeAbstract',
-            'StatementOfStockholdersEquityAbstract', 'StatementTable', 'StatementLineItems',
-            'ComprehensiveIncomeNetOfTaxAbstract', 'WeightedAverageNumberOfSharesOutstandingAbstract',
-        )
-
-        def _is_structural_concept(concept: str, is_abstract: bool) -> bool:
-            if concept.startswith(_NON_FIN_NS):
-                return True  # DEI / SRT / country / invest are not financial line items
-            if concept.endswith('Axis'):
-                return True  # Axis concepts never carry values
-            if any(p in concept for p in _ALWAYS_SKIP_CONTAINS):
-                return True
-            if is_abstract:
-                local = concept.split(':')[-1]
-                if local.endswith(('Abstract', 'Domain')):
-                    return True
+        if bundle is None:
             return False
 
-        concrete_concepts = [
-            item for item in hierarchy_data
-            if not _is_structural_concept(item.get('concept', ''), item.get('abstract', False))
-        ]
-        abstract_count = len(hierarchy_data) - len(concrete_concepts)
+        # Companies are ensured before the statement-type filter (historical
+        # behaviour).  A bundle with an empty company_doc is a safe no-op.
+        self._ensure_company_in_target_from_dict(bundle.company_doc)
+
+        if enforce_allowed_types and bundle.statement_type not in _ALLOWED_STATEMENT_TYPES:
+            logger.debug(f"Skipping statement_type='{bundle.statement_type}' (not in allowed set)")
+            return False
+
+        from ..core.models import FinancialStatement as _FS, Filing as _Filing
+
+        filing = _Filing(
+            id=bundle.filing_id,
+            form_type=bundle.form_type,
+            accession_number=bundle.accession_number,
+        )
+        statement = _FS(
+            id=bundle.statement_id,
+            company_cik=bundle.company_cik,
+            filing_id=bundle.filing_id,
+            statement_type=bundle.statement_type,
+            reporting_period=bundle.reporting_period,
+            created_at=bundle.created_at,
+            financial_data=bundle.source_items,
+        )
+
+        logger.debug(f"Persisting bundle: {statement.statement_type} for CIK {statement.company_cik}")
 
         concept_repo = self._get_concept_repo_by_form_type(filing.form_type)
+        concept_mapping: dict = {}
 
-        promoted_concepts = []
-        for i, item in enumerate(concrete_concepts):
+        # P5 hierarchy resolution normally runs before this method. Resolved
+        # bundles keep their approved company-specific path/order_key. The
+        # fallback below preserves the P1/legacy behavior for direct callers
+        # that bypass the graph.
+        def _promote(item: dict, index: int) -> dict:
+            """Resolve an item's hierarchy placement (P5-resolved items keep theirs)."""
             promoted_item = item.copy()
-            reference = concept_repo.find_concept_reference_for_hierarchy(
-                statement.statement_type, item['concept'], dimension_concept=False
-            )
-            if reference:
-                promoted_item['path'] = reference['path']
-                promoted_item['order_key'] = reference['order_key']
-            else:
-                promoted_item['path'] = f"{i+1:03d}"
-                promoted_item['order_key'] = (
-                    chr(ord('a') + (i % 26))
-                    if i < 26
-                    else f"{chr(ord('a') + (i // 26 - 1))}{chr(ord('a') + (i % 26))}"
+            if not item.get('_hierarchy_resolved'):
+                reference = concept_repo.find_concept_reference_for_hierarchy(
+                    statement.statement_type, item['concept'], dimension_concept=False
                 )
-            promoted_item['level'] = 1
-            promoted_concepts.append(promoted_item)
+                if reference:
+                    promoted_item['path'] = reference['path']
+                    promoted_item['order_key'] = reference['order_key']
+                else:
+                    promoted_item['path'] = f"{index + 1:03d}"
+                    promoted_item['order_key'] = (
+                        chr(ord('a') + (index % 26))
+                        if index < 26
+                        else f"{chr(ord('a') + (index // 26 - 1))}{chr(ord('a') + (index % 26))}"
+                    )
+                promoted_item['level'] = 1
+            else:
+                promoted_item['path'] = item.get('path')
+                promoted_item['order_key'] = item.get('order_key')
+                promoted_item['level'] = item.get(
+                    'hierarchy_level', item.get('level', 0)
+                )
+            return promoted_item
 
+        # Do NOT insert abstract wrapper concepts into the database (matching production reference
+        # companies TSLA, GOOGL, META, MSFT which have 0 abstract concepts in the DB).
+        # Exception: ``custom:`` prefixed grouping headers (e.g. custom:ProductSegmentation)
+        # are deliberately abstract rows inserted by the hierarchy agent to group multi-
+        # dimensional segment breakdowns.  They must be stored with abstract=True so the
+        # agent and UI can distinguish them from financial line items.
+        all_concepts_to_persist = [
+            item for item in (list(bundle.concepts) + list(bundle.abstract_concepts or []))
+            if not item.get("concept", "").split(":")[-1].endswith("Abstract")
+        ]
+        promoted_concepts = [
+            _promote(item, i) for i, item in enumerate(all_concepts_to_persist)
+        ]
         for item in promoted_concepts:
+            # Preserve abstract=True for custom: grouping headers; force False for everything else.
+            if not item.get("concept", "").startswith("custom:"):
+                item["abstract"] = False
             concept_id = self._get_or_create_concept(
                 statement.company_cik, statement.statement_type, item, filing.form_type
             )
-            concept_mapping[item['concept']] = concept_id
+            if concept_id:
+                concept_mapping[item['concept']] = concept_id
 
-        logger.info(f"Promotion: skipped {abstract_count} abstract, promoted {len(promoted_concepts)} concrete")
-        hierarchy_data = promoted_concepts
+        logger.info(f"Promotion: promoted {len(promoted_concepts)} concept(s) (abstract wrappers skipped)")
+
 
         # PHASE 3: Dimensional concepts
         dimensional_concept_mapping: dict = {}
@@ -494,25 +709,27 @@ class FinancialNormalizationService:
             if item.get('dimensional_facts')
         }
 
-        for dim_info in all_dimensional_concepts:
-            if dim_info.parent_concept not in parent_concepts_with_dimensions:
+        for dim in bundle.dimensional_concepts:
+            if dim['parent_concept'] not in parent_concepts_with_dimensions:
                 continue
-            parent_concept_id = concept_mapping.get(dim_info.parent_concept)
+            parent_concept_id = concept_mapping.get(dim['parent_concept'])
             if parent_concept_id:
                 try:
                     dim_concept_id = self._get_or_create_dimensional_concept(
                         concept_id=parent_concept_id,
                         company_cik=statement.company_cik,
                         statement_type=statement.statement_type,
-                        dimension_data=dimension_data_map[dim_info],
+                        dimension_data=dim['dimension_data'],
                         form_type=filing.form_type,
+                        assigned_path=dim.get('path'),
+                        assigned_order_key=dim.get('order_key'),
                     )
-                    dimensional_concept_mapping[(dim_info.parent_concept, dim_info.concept)] = dim_concept_id
+                    dimensional_concept_mapping[(dim['parent_concept'], dim['concept'])] = dim_concept_id
                 except Exception as e:
-                    logger.warning(f"Error creating dimensional concept {dim_info.concept}: {e}")
+                    logger.warning(f"Error creating dimensional concept {dim['concept']}: {e}")
 
         # PHASE 4: Values
-        for item in hierarchy_data:
+        for item in promoted_concepts:
             if item.get('abstract', False):
                 continue
             concept_id = concept_mapping.get(item['concept'])
@@ -529,6 +746,7 @@ class FinancialNormalizationService:
                         item=item,
                         value=value,
                         is_calculated=False,
+                        replace_existing=replace_existing,
                     )
             if 'dimensional_facts' in item:
                 self._process_dimensional_data_enhanced(
@@ -538,6 +756,94 @@ class FinancialNormalizationService:
                     item=item,
                     dimensional_concept_mapping=dimensional_concept_mapping,
                 )
+
+        return True
+
+    def normalize_statement_in_memory(
+        self,
+        statement_doc: dict,
+        filing_doc: dict,
+        company_doc: dict,
+    ) -> None:
+        """Backward-compatible wrapper: compute a bundle, then persist it.
+
+        Equivalent to ``normalize_statement_to_bundle`` followed by
+        ``persist_statement_bundle``.  Kept so existing callers/tests keep
+        working; new code should call the two methods explicitly so a
+        validation/repair agent can sit between compute and persist.
+        """
+        bundle = self.normalize_statement_to_bundle(statement_doc, filing_doc, company_doc)
+        self.persist_statement_bundle(bundle)
+
+    def _process_financial_statement_with_filing(self, statement, filing) -> None:
+        """Legacy source-DB path: build a bundle from model objects, then persist.
+
+        Preserves the historical behaviour of processing every statement type
+        (no allowed-type filter) and not touching the company doc here (the
+        caller ensures the company before processing).
+        """
+        bundle = self._build_bundle(statement, filing, None)
+        self.persist_statement_bundle(bundle, enforce_allowed_types=False)
+
+    def apply_hierarchy_updates(self, updates: list[dict]) -> None:
+        """Apply agent-approved repairs to existing concept hierarchy metadata."""
+        for update in updates or []:
+            concept_id = update.get('_id')
+            if not concept_id:
+                continue
+            repo = self._get_concept_repo_by_form_type(
+                '10-Q' if update.get('form_type') == '10-Q' else '10-K'
+            )
+            fields = {
+                key: update[key]
+                for key in ('path', 'order_key', 'hide', 'abstract', 'hierarchy_level', 'level')
+                if update.get(key) is not None
+            }
+            if fields:
+                # User rule: don't hide any concept, instead put in path 555
+                if fields.get('path') == '555':
+                    fields['hide'] = False
+                fields['hierarchy_repaired_at'] = datetime.utcnow()
+                fields['hierarchy_repair_reason'] = update.get('reason', 'agent_repath')
+                res = repo.collection.update_one({'_id': concept_id}, {'$set': fields})
+                if res.matched_count == 0:
+                    other_repo = (
+                        self.annual_concept_repo
+                        if repo == self.quarterly_concept_repo
+                        else self.quarterly_concept_repo
+                    )
+                    other_repo.collection.update_one({'_id': concept_id}, {'$set': fields})
+
+    def update_hierarchy_seed_metadata(self, cik: str, hierarchy_plan: dict) -> None:
+        """Persist P5 hierarchy seed metadata after financial data writes."""
+        if not cik or not hierarchy_plan:
+            return
+        seeded_types = hierarchy_plan.get('seeded_statement_types') or []
+        now = datetime.utcnow()
+        update = {
+            'hierarchy_seed_version': 1,
+            'hierarchy_last_updated_at': now,
+        }
+        if seeded_types:
+            update['hierarchy_seeded_at'] = now
+            self.company_repo.target_collection.update_one(
+                {'cik': str(cik)},
+                {
+                    '$set': update,
+                    '$addToSet': {
+                        'hierarchy_seeded_statement_types': {
+                            '$each': seeded_types
+                        }
+                    },
+                },
+                upsert=False,
+            )
+        else:
+            self.company_repo.target_collection.update_one(
+                {'cik': str(cik)},
+                {'$set': update},
+                upsert=False,
+            )
 
     def _ensure_company_in_target_from_dict(self, company_doc: dict) -> None:
         """Write company to target DB from an in-memory dict (no source DB read)."""
@@ -574,10 +880,48 @@ class FinancialNormalizationService:
         This ensures that when all values are deleted but concepts remain for any statement,
         we keep those concepts as-is and only add new values to them during reprocessing.
         """
+        if item.get("concept", "").split(":")[-1].endswith("Abstract"):
+            return None
+        # Preserve abstract=True for custom: grouping headers; force False for all others.
+        if not item.get("concept", "").startswith("custom:"):
+            item['abstract'] = False
+
         concept_key = ConceptKey(cik, statement_type, item['concept'])
         
         # Get the appropriate concept repository based on form type
         concept_repo = self._get_concept_repo_by_form_type(form_type)
+
+        # Agent-decided concept equivalence: when the concept-resolution agent
+        # (or a stored alias decision) judged this incoming concept name to be
+        # the SAME economic line item as an already-stored concept under a
+        # different tag, we must NOT create a duplicate row — the values attach
+        # to the existing concept instead.
+        alias_target = self._resolve_concept_alias(
+            cik, statement_type, item, form_type, concept_repo
+        )
+        if alias_target:
+            logger.info(
+                f"Concept '{item['concept']}' resolved by alias to '{alias_target}' "
+                f"for {cik} {statement_type} — reusing existing concept (no duplicate)"
+            )
+            existing = concept_repo.find_existing(
+                cik, statement_type, alias_target,
+                dimension_concept=item.get('dimension', False),
+            )
+            if existing:
+                concept_id = existing['_id']
+                logger.debug(
+                    f"Alias reuse: {item['concept']} -> {alias_target} "
+                    f"(ID: {concept_id}), skipping separate creation"
+                )
+                self.concept_cache[(concept_key, form_type)] = concept_id
+                return concept_id
+            # Target concept is gone (deleted/migrated): fall through and treat
+            # the incoming concept normally below.
+            logger.warning(
+                f"Alias target '{alias_target}' not found for {cik} {statement_type} "
+                f"— creating '{item['concept']}' as its own concept"
+            )
         
         # Check cache first (make cache form-type specific)
         cache_key = (concept_key, form_type)
@@ -595,6 +939,16 @@ class FinancialNormalizationService:
         )
         if existing:
             concept_id = existing['_id']
+            # Self-heal labels persisted before cleaning existed.
+            cleaned_existing_label = clean_label(existing.get('label'))
+            if cleaned_existing_label and cleaned_existing_label != existing.get('label'):
+                concept_repo.collection.update_one(
+                    {'_id': concept_id}, {'$set': {'label': cleaned_existing_label}}
+                )
+                logger.debug(
+                    f"Cleaned stored label for existing concept {item['concept']}: "
+                    f"{existing.get('label')!r} -> {cleaned_existing_label!r}"
+                )
             logger.debug(f"Reusing existing concept: {item['concept']} (ID: {concept_id}) - keeping concept as-is")
         else:
             # Only create new concept if it doesn't exist
@@ -605,11 +959,275 @@ class FinancialNormalizationService:
         self.concept_cache[cache_key] = concept_id
         return concept_id
 
+    def _resolve_concept_alias(
+        self, cik: str, statement_type: str, item: dict, form_type: str,
+        concept_repo: 'ConceptRepository' = None,
+    ) -> Optional[str]:
+        """Return the alias target concept name for an incoming concept, if one
+        has been decided (by the concept-resolution agent) for this
+        company+statement+form-type.
+
+        Preference order:
+          1. The item's own ``_concept_target`` annotation — the in-memory
+             decision made this run by the ``concept_resolve`` agent node;
+          2. A previously recorded decision in the ``concept_aliases`` store
+             (so callers that bypass the agent still get the merge).
+
+        Returns ``None`` when no alias exists (the incoming concept is a real
+        new concept and may be created).
+        """
+        target = item.get('_concept_target')
+        if target:
+            return target if isinstance(target, str) and target else None
+        try:
+            store = getattr(self, '_concept_alias_store', None)
+            if store is None:
+                from ..database import ConceptAliasStore
+                store = ConceptAliasStore(self.db_connection)
+                self._concept_alias_store = store
+            return store.get(cik, statement_type, form_type, item.get('concept', ''))
+        except Exception as exc:  # noqa: BLE001 — alias lookup must never break ingestion
+            logger.debug(f"Concept alias lookup failed for {item.get('concept')}: {exc}")
+            return None
+
+    # ------------------------------------------------------------------ #
+    # Newest-period concept promotion
+    # ------------------------------------------------------------------ #
+    def promote_concept(
+        self,
+        cik: str,
+        statement_type: str,
+        form_type: str,
+        from_concept: str,
+        to_concept: str,
+        *,
+        winner_item: Optional[dict] = None,
+    ) -> dict:
+        """Newest-period concept wins: move ALL values of ``from_concept`` onto
+        ``to_concept`` and hard-delete the ``from_concept`` concept row.
+
+        Historical values are never dropped: each value row is repointed to the
+        winner's concept ``_id``.  The only exception is a genuine same-period
+        duplicate — the value collections have a unique key
+        (cik, concept_id, fiscal_year, quarter), so if the winner already holds
+        the exact period the loser's redundant row cannot coexist and is
+        removed (the winner's row is kept).  That is reported as
+        ``duplicate_values_dropped`` in the receipt.
+
+        The delete of the losing concept row is the very last step, so a crash
+        at any point can be retried safely.
+
+        Scope is a single form type: a 10-Q promotion only ever touches the
+        quarterly collections and a 10-K promotion only the annual ones.  The
+        two never influence each other.
+
+        Returns a small receipt (counts) for logging/audit.
+        """
+        receipt = {
+            "cik": cik,
+            "statement_type": statement_type,
+            "form_type": form_type,
+            "from_concept": from_concept,
+            "to_concept": to_concept,
+            "values_moved": 0,
+            "duplicate_values_dropped": 0,
+            "dimensional_children_moved": 0,
+            "alias_rows_repointed": 0,
+            "deleted": False,
+            "skipped": None,
+        }
+        if not from_concept or not to_concept or from_concept == to_concept:
+            receipt["skipped"] = "invalid_names"
+            return receipt
+
+        concept_repo = self._get_concept_repo_by_form_type(form_type)
+        value_repo = self._get_value_repo_by_form_type(form_type)
+
+        loser = concept_repo.find_existing(
+            cik, statement_type, from_concept, dimension_concept=False
+        )
+        if not loser:
+            # Already promoted (or never existed): make sure the old tag still
+            # resolves to the winner, then stop.  Idempotent retry path.
+            receipt["skipped"] = "from_concept_absent"
+            receipt["alias_rows_repointed"] = self._repoint_concept_aliases(
+                cik, statement_type, form_type, from_concept, to_concept
+            )
+            return receipt
+
+        winner = concept_repo.find_existing(
+            cik, statement_type, to_concept, dimension_concept=False
+        )
+        if not winner:
+            item = dict(winner_item or {})
+            item.update(
+                {
+                    "concept": to_concept,
+                    "label": item.get("label") or loser.get("label"),
+                    "path": item.get("path") or loser.get("path"),
+                    "order_key": item.get("order_key") or loser.get("order_key"),
+                    "abstract": False,
+                    "dimension": loser.get("dimension", False),
+                }
+            )
+            winner_id = self._create_concept(cik, statement_type, item, form_type)
+            winner = concept_repo.find_existing(
+                cik, statement_type, to_concept, dimension_concept=False
+            ) or {"_id": winner_id, "concept": to_concept, "path": item.get("path")}
+        winner_id = winner["_id"]
+
+        # 1) MOVE values — repoint, never delete.  The value collection has a
+        #    unique key (cik, concept_id, fiscal_year, quarter), so if the
+        #    winner already holds the same period the bulk repoint trips it;
+        #    fall back to a per-row move that keeps the winner's row and drops
+        #    only the genuine same-period duplicate.
+        try:
+            moved = value_repo.collection.update_many(
+                {"concept_id": loser["_id"]},
+                {"$set": {"concept_id": winner_id}},
+            )
+            receipt["values_moved"] = getattr(moved, "modified_count", 0)
+        except Exception as exc:  # noqa: BLE001 — likely a unique-key collision
+            logger.info(
+                "Concept promotion %s -> %s: bulk value move hit %s; "
+                "retrying collision-safe",
+                from_concept, to_concept, type(exc).__name__,
+            )
+            moved_count, dropped = self._move_values_collision_safe(
+                value_repo, loser["_id"], winner_id, cik
+            )
+            receipt["values_moved"] = moved_count
+            receipt["duplicate_values_dropped"] = dropped
+
+        # 2) Re-parent the loser's dimensional children under the winner.
+        #    (Dimensional VALUES hang off the dimensional concept id, which is
+        #    unchanged, so they are not touched.)
+        child = concept_repo.collection.update_many(
+            {
+                "cik": cik,
+                "statement_type": statement_type,
+                "concept_id": loser["_id"],
+                "dimension_concept": True,
+            },
+            {
+                "$set": {
+                    "concept_id": winner_id,
+                    "parent_concept": to_concept,
+                    "parent_path": winner.get("path"),
+                }
+            },
+        )
+        receipt["dimensional_children_moved"] = getattr(child, "modified_count", 0)
+
+        # 3) Decision store: members of the loser now resolve to the winner.
+        receipt["alias_rows_repointed"] = self._repoint_concept_aliases(
+            cik, statement_type, form_type, from_concept, to_concept
+        )
+
+        # 4) Hard-delete the losing concept row (the only destructive step).
+        deleted = concept_repo.collection.delete_one({"_id": loser["_id"]})
+        receipt["deleted"] = bool(getattr(deleted, "deleted_count", 0))
+
+        # 5) Drop stale in-process concept-id cache entries for the loser.
+        self._invalidate_concept_cache(cik, statement_type, from_concept, form_type)
+
+        logger.info(
+            "Concept promotion %s -> %s for %s %s/%s: moved %s value(s), "
+            "re-parented %s dimensional child(ren), deleted loser=%s",
+            from_concept, to_concept, cik, statement_type, form_type,
+            receipt["values_moved"], receipt["dimensional_children_moved"],
+            receipt["deleted"],
+        )
+        return receipt
+
+    def _move_values_collision_safe(
+        self,
+        value_repo: 'ValueRepository',
+        loser_id: ObjectId,
+        winner_id: ObjectId,
+        cik: str,
+    ) -> tuple[int, int]:
+        """Repoint each remaining loser value onto the winner.
+
+        When the winner already has a value for the same period (the unique
+        key that would collide), the loser's row is a genuine same-period
+        duplicate: the winner's row is kept and only the duplicate is removed.
+        Returns ``(moved, duplicates_removed)``.
+        """
+        moved = 0
+        dropped = 0
+        for doc in list(value_repo.collection.find({"concept_id": loser_id})):
+            reporting_period = doc.get("reporting_period") or {}
+            query = {
+                "concept_id": winner_id,
+                "cik": cik,
+                "dimension_value": {"$ne": True},
+                "reporting_period.fiscal_year": reporting_period.get("fiscal_year"),
+            }
+            if reporting_period.get("quarter") is not None:
+                query["reporting_period.quarter"] = reporting_period.get("quarter")
+            if value_repo.collection.find_one(query):
+                value_repo.collection.delete_one({"_id": doc["_id"]})
+                dropped += 1
+            else:
+                value_repo.collection.update_one(
+                    {"_id": doc["_id"]}, {"$set": {"concept_id": winner_id}}
+                )
+                moved += 1
+        return moved, dropped
+
+    def _repoint_concept_aliases(
+        self,
+        cik: str,
+        statement_type: str,
+        form_type: str,
+        from_concept: str,
+        to_concept: str,
+    ) -> int:
+        """Re-key the durable alias/series store after a promotion."""
+        try:
+            store = getattr(self, '_concept_alias_store', None)
+            if store is None:
+                from ..database import ConceptAliasStore
+                store = ConceptAliasStore(self.db_connection)
+                self._concept_alias_store = store
+            return store.promote(
+                cik, statement_type, form_type, from_concept, to_concept,
+                reason="newest-period promotion",
+            )
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must not break the merge
+            logger.warning(
+                "Could not repoint concept aliases %s -> %s: %s",
+                from_concept, to_concept, exc,
+            )
+            return 0
+
+    def _invalidate_concept_cache(
+        self, cik: str, statement_type: str, concept: str, form_type: str
+    ) -> None:
+        """Forget any cached concept id for a name that was just promoted away."""
+        try:
+            self.concept_cache.pop(
+                (ConceptKey(cik, statement_type, concept), form_type), None
+            )
+        except Exception:  # noqa: BLE001 — cache hygiene only
+            pass
+
     def _create_concept(self, cik: str, statement_type: str, item: dict, form_type: str = '10-K') -> ObjectId:
         """
         Create a new concept document with taxonomy-based label and proper hierarchy placement.
         Ensures concepts are fitted into hierarchy correctly and preserves abstract concepts for hierarchy.
         """
+        if item.get("concept", "").split(":")[-1].endswith("Abstract"):
+            return None
+        # custom: grouping headers (e.g. custom:ProductSegmentation) are allowed through
+        # with abstract=True — they are NOT structural XBRL noise.
+        is_custom_grouping = item.get("concept", "").startswith("custom:")
+        if not is_custom_grouping and item.get("abstract"):
+            return None
+        if not is_custom_grouping:
+            item['abstract'] = False
+
         # Use taxonomy label only if taxonomy manager is enabled
         if self.taxonomy_manager:
             taxonomy_label = lookup_concept_label(item['concept'])
@@ -619,15 +1237,18 @@ class FinancialNormalizationService:
         else:
             # Use the label from the source database if available, otherwise use concept name
             taxonomy_label = item.get('label', item['concept'])
-        
-        # Preserve the abstract flag from the source data for hierarchy structure
-        is_abstract = item.get('abstract', False)
-        
+
+        # Never persist XBRL presentation tags ("[Member]", "[Text Block]" ...).
+        taxonomy_label = clean_label(taxonomy_label) or item['concept']
+
+        # custom: grouping headers are stored with abstract=True; everything else is False.
+        is_abstract = bool(is_custom_grouping and item.get('abstract'))
+
         # Compute the cross-era canonical concept name so equivalent concepts
         # (e.g. ASC 606 revenue, continuing-operations cash-flow variants) form a
         # single continuous time series for downstream consumers.
         canonical = canonical_concept(item['concept'])
-        
+
         # Ensure proper hierarchy placement by preserving path and order_key
         concept_doc = ConceptDocument(
             company_cik=cik,
@@ -638,9 +1259,10 @@ class FinancialNormalizationService:
             canonical_concept=canonical,  # Cross-era canonical name
             path=item.get('path'),  # Preserve hierarchy path for correct placement
             order_key=item.get('order_key'),  # Preserve order for correct hierarchy position
-            abstract=is_abstract,  # Preserve abstract flag from source data
+            abstract=is_abstract,  # True for custom: grouping headers, False for all others
             dimension=item.get('dimension', False)
         )
+
         
         # Get the appropriate concept repository based on form type
         concept_repo = self._get_concept_repo_by_form_type(form_type)
@@ -666,7 +1288,7 @@ class FinancialNormalizationService:
         logger.debug(f"Successfully created new concept: {item['concept']} with hierarchy path: {item.get('path', 'N/A')}")
         return concept_id
 
-    def _create_value_record(self, concept_id: ObjectId, statement, filing, item: dict, value: float, is_calculated: bool = False) -> None:
+    def _create_value_record(self, concept_id: ObjectId, statement, filing, item: dict, value: float, is_calculated: bool = False, replace_existing: bool = False) -> Optional[ObjectId]:
         """
         Create a value record for a specific time period - with sync behavior (only insert if not exists).
         
@@ -676,6 +1298,9 @@ class FinancialNormalizationService:
         
         This ensures that when reprocessing a statement after deleting values,
         only the new/missing values are added without duplicating existing ones.
+
+        Returns the ``_id`` of the existing or newly inserted value document so
+        callers (the persistence/validation agent) can reference the row.
         """
         # Extract period information from the item
         period_info = self._extract_period_info_from_item(item)
@@ -693,28 +1318,69 @@ class FinancialNormalizationService:
         # Get the appropriate value repository based on form type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
         
-        # Check if value already exists to implement sync behavior (only insert new data)
-        existing_query = {
-            'concept_id': concept_id,
-            'cik': statement.company_cik,
-            'statement_type': statement.statement_type,
-            'form_type': filing.form_type,
-            'calculated': is_calculated
-        }
-        
-        # Add reporting period fields to query for precise matching
-        if 'fiscal_year' in clean_reporting_period:
-            existing_query['reporting_period.fiscal_year'] = clean_reporting_period['fiscal_year']
-        if 'period_date' in clean_reporting_period:
-            existing_query['reporting_period.period_date'] = clean_reporting_period['period_date']
-        if 'quarter' in clean_reporting_period:
-            existing_query['reporting_period.quarter'] = clean_reporting_period['quarter']
-        
-        existing_value = value_repo.collection.find_one(existing_query)
+        # Dedup on EXACTLY the DB unique index key:
+        #   quarterly (cik, concept_id, reporting_period.fiscal_year, .quarter)
+        #   annual    (cik, concept_id, reporting_period.fiscal_year)
+        #   (quarter is already popped for 10-K above, matching the annual index)
+        # Any EXTRA filter (statement_type / form_type / calculated /
+        # reporting_period.period_date) can miss a row the index considers
+        # identical, so the insert then fails with E11000 DuplicateKeyError.
+        # The repository finder encodes this key — always use it.
+        existing_value = value_repo.find_existing_value(
+            concept_id,
+            clean_reporting_period,
+            dimension_value=False,
+            company_cik=statement.company_cik,
+        )
         
         if existing_value:
+            # A repaired bundle is explicitly allowed to update the existing
+            # period value. Ordinary reprocessing remains insert/skip-only.
+            if item.get('repaired'):
+                repair_fields = {
+                    'value': value,
+                    'source': item.get('source', 'deterministic_identity'),
+                    'corrected_from': item.get('corrected_from'),
+                    'correction_reason': item.get('correction_reason'),
+                    'correction_source': item.get('correction_source', item.get('source')),
+                    'corrected_at': datetime.utcnow(),
+                }
+                if filing.accession_number and not existing_value.get('accession_number'):
+                    repair_fields['accession_number'] = filing.accession_number
+                value_repo.collection.update_one(
+                    {'_id': existing_value['_id']},
+                    {'$set': repair_fields}
+                )
+                logger.info(
+                    "Updated repaired value for concept %s: %s -> %s",
+                    concept_id, item.get('corrected_from'), value,
+                )
+            # --reload: the period is being replaced, so overwrite in place.
+            # Checked BEFORE the accession backfill, because a replace also
+            # refreshes the accession number.
+            # (The DB allows only ONE row per period, so an update — not a
+            # second insert — is the only correct way to replace it.)
+            elif replace_existing:
+                replace_fields = {
+                    'value': value,
+                    'reporting_period': clean_reporting_period,
+                    'source': item.get('source'),
+                    'calculated': is_calculated,
+                    'fact_id': item.get('fact_id'),
+                    'decimals': item.get('decimals'),
+                }
+                if filing.accession_number:
+                    replace_fields['accession_number'] = filing.accession_number
+                value_repo.collection.update_one(
+                    {'_id': existing_value['_id']},
+                    {'$set': {k: v for k, v in replace_fields.items() if v is not None}},
+                )
+                logger.info(
+                    "Reload: replaced value for concept %s (period %s)",
+                    concept_id, clean_reporting_period.get('period_date', 'unknown'),
+                )
             # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('accession_number'):
+            elif filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing value with missing accession_number for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
                 value_repo.collection.update_one(
                     {'_id': existing_value['_id']},
@@ -722,7 +1388,7 @@ class FinancialNormalizationService:
                 )
             else:
                 logger.debug(f"Value already exists for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}, skipping insertion")
-            return
+            return existing_value['_id']
         
         # Extract metadata from metadata-only dimensional facts
         metadata_from_dimensional_facts = self._extract_metadata_from_dimensional_facts(item)
@@ -737,6 +1403,7 @@ class FinancialNormalizationService:
             created_at=statement.created_at,
             fact_id=item.get('fact_id'),  # Preserve fact_id for auditing
             decimals=item.get('decimals') or metadata_from_dimensional_facts.get('decimals'),  # Preserve decimals from item or dimensional facts
+            source=item.get('source'),
             accession_number=filing.accession_number,
         )
         
@@ -745,9 +1412,16 @@ class FinancialNormalizationService:
         value_doc_dict['calculated'] = is_calculated
         if filing.accession_number:
             value_doc_dict['accession_number'] = filing.accession_number
+        if item.get('repaired'):
+            value_doc_dict.update({
+                'corrected_from': item.get('corrected_from'),
+                'correction_reason': item.get('correction_reason'),
+                'correction_source': item.get('correction_source', item.get('source')),
+                'corrected_at': datetime.utcnow(),
+            })
         
         # Insert the value (only new data)
-        value_repo.collection.insert_one(value_doc_dict)
+        insert_result = value_repo.collection.insert_one(value_doc_dict)
         logger.debug(f"Inserted new value for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
         
         # Validate critical data preservation
@@ -759,6 +1433,8 @@ class FinancialNormalizationService:
         # Log when we preserve metadata from dimensional facts
         if metadata_from_dimensional_facts:
             logger.debug(f"Preserved metadata from dimensional facts for {item.get('concept', 'unknown')}: {metadata_from_dimensional_facts}")
+
+        return insert_result.inserted_id
     
     def _extract_period_info_from_item(self, item: dict) -> dict:
         """Extract period information from a financial data item."""
@@ -1456,13 +2132,22 @@ class FinancialNormalizationService:
                 dimension_data=dimension_data
             )
 
-    def _get_or_create_dimensional_concept(self, concept_id: ObjectId, company_cik: str, statement_type: str, dimension_data: dict, form_type: str = '10-K') -> ObjectId:
+    def _get_or_create_dimensional_concept(
+        self,
+        concept_id: ObjectId,
+        company_cik: str,
+        statement_type: str,
+        dimension_data: dict,
+        form_type: str = '10-K',
+        assigned_path: Optional[str] = None,
+        assigned_order_key: Optional[str] = None,
+    ) -> ObjectId:
         """
         Get existing dimensional concept or create new one using the appropriate repository based on form type.
         Always prioritizes existing concepts to avoid duplicates.
         
         SYNC BEHAVIOR FOR REPROCESSING:
-        - If dimensional concept exists: REUSE IT (preserve existing)
+        - If dimensional concept exists: REUSE IT (preserve existing, update path/order_key if assigned)
         - If dimensional concept doesn't exist: CREATE IT
         
         This ensures dimensional concepts follow the same sync pattern as regular concepts.
@@ -1492,11 +2177,25 @@ class FinancialNormalizationService:
             if existing.get('segment_type') != segment_type:
                 logger.debug(f"Dimensional concept {concept} found with different segment_type: "
                            f"existing={existing.get('segment_type')}, determined={segment_type}. Using existing.")
+            updates = {}
+            # Self-heal labels persisted before cleaning existed.
+            cleaned_existing_label = clean_label(existing.get('label'))
+            if cleaned_existing_label and cleaned_existing_label != existing.get('label'):
+                updates['label'] = cleaned_existing_label
+            if assigned_path and existing.get('path') != assigned_path:
+                updates['path'] = assigned_path
+                updates['hierarchy_level'] = len(assigned_path.split('.')) - 1
+                updates['level'] = updates['hierarchy_level']
+            if assigned_order_key and existing.get('order_key') != assigned_order_key:
+                updates['order_key'] = assigned_order_key
+            if updates:
+                concept_repo.collection.update_one({'_id': dimensional_concept_id}, {'$set': updates})
         else:
             # Only create new dimensional concept if it doesn't exist
             logger.debug(f"Creating new dimensional concept: {concept}")
             dimensional_concept_id = self._create_dimensional_concept(
-                concept_id, company_cik, statement_type, dimension_data, segment_type, concept, form_type
+                concept_id, company_cik, statement_type, dimension_data, segment_type, concept, form_type,
+                assigned_path=assigned_path, assigned_order_key=assigned_order_key,
             )
         
         # Cache the result
@@ -1740,10 +2439,23 @@ class FinancialNormalizationService:
                     primary_member = concept
                     break
 
-        # Fallback: Use first dimension but create more descriptive segment type
+        # Fallback: use a deterministic primary dimension and derive a descriptive
+        # segment type from its axis.  Dict iteration order is not stable across
+        # runs, so an arbitrary pick here previously produced order-reversed
+        # duplicate concepts for the same fact (435 such twins in production).
+        def _primary_dimension_key(axis_name: str) -> tuple:
+            lowered = str(axis_name).lower()
+            return (
+                0 if "segment" in lowered else 1,
+                0 if "product" in lowered else 1,
+                0 if "geograph" in lowered else 1,
+                lowered,
+            )
+
         if not segment_type and meaningful_dimensions:
-            first_axis = list(meaningful_dimensions.keys())[0]
-            first_member = list(meaningful_dimensions.values())[0]
+            first_axis, first_member = sorted(
+                meaningful_dimensions.items(), key=lambda kv: _primary_dimension_key(kv[0])
+            )[0]
             
             # Create segment type from axis name
             axis_clean = first_axis.replace('Axis', '').lower()
@@ -1756,26 +2468,17 @@ class FinancialNormalizationService:
             primary_axis = first_axis
             primary_member = concept
         
-        # Handle multi-dimensional cases - only create composite concept when the secondary
-        # dimension adds genuine specificity (e.g. Product × Geography).
-        # Wrapper/consolidation axes like ConsolidationItemsAxis are redundant — they merely
-        # flag that the row belongs to an operating segment and must NOT be appended.
-        _WRAPPER_AXES = {
-            'consolidationitemsaxis',       # srt:ConsolidationItemsAxis / us-gaap:ConsolidationItemsAxis
-            'consolidationaxis',
-            'segmentreportingaxis',
-        }
-        if len(meaningful_dimensions) > 1 and primary_axis and concept:
-            other_dimensions = {
-                k: v for k, v in meaningful_dimensions.items()
-                if k != primary_axis and k.lower() not in _WRAPPER_AXES
-            }
-            if other_dimensions:
-                significant_other = next(iter(other_dimensions.items()))
-                other_axis, other_member = significant_other
-                other_qualified = get_qualified_member_name(other_axis, other_member)
-                concept = f"{concept}_{other_qualified}"
-        
+        # Multi-axis facts (e.g. segment x product, segment x geography) are NOT encoded
+        # into the concept name any more.  Concatenating member names produced values like
+        # "meta:FamilyOfAppsMember_us-gaap:ServiceOtherMember" which
+        #   * dropped the axis each member belonged to,
+        #   * varied with dict iteration order (order-reversed twins in production), and
+        #   * could not separate rows that share a member but differ in line item, because
+        #     the row identity does not contain the parent line item.
+        # The full slice is now recorded as a canonical dimension signature on the row
+        # (``data_normalization_service.core.row_identity.dimension_signature``) and the row
+        # is keyed by its parent, so the concept stays a clean, reusable member name.
+        #
         # Don't clean up concept name - preserve the qualified names with namespaces
         # The qualified names are needed to match existing dimensional concepts in the database
         
@@ -1811,7 +2514,18 @@ class FinancialNormalizationService:
         
         return str(segment_type), str(concept)
 
-    def _create_dimensional_concept(self, concept_id: ObjectId, company_cik: str, statement_type: str, dimension_data: dict, segment_type: str, concept: str, form_type: str = '10-K') -> ObjectId:
+    def _create_dimensional_concept(
+        self,
+        concept_id: ObjectId,
+        company_cik: str,
+        statement_type: str,
+        dimension_data: dict,
+        segment_type: str,
+        concept: str,
+        form_type: str = '10-K',
+        assigned_path: Optional[str] = None,
+        assigned_order_key: Optional[str] = None,
+    ) -> ObjectId:
         """Create a new dimensional concept document using the appropriate repository based on form type."""
         # Get the appropriate concept repository based on form type
         concept_repo = self._get_concept_repo_by_form_type(form_type)
@@ -1821,8 +2535,12 @@ class FinancialNormalizationService:
         parent_concept_path = parent_concept.get('path', '') if parent_concept else ''
         
         # Generate path and order_key for this dimensional concept
-        path = concept_repo.generate_dimensional_path(concept_id, segment_type, parent_concept_path)
-        order_key = concept_repo.get_next_dimensional_order_key(concept_id, segment_type)
+        if assigned_path and assigned_order_key:
+            path = assigned_path
+            order_key = assigned_order_key
+        else:
+            path = concept_repo.generate_dimensional_path(concept_id, segment_type, parent_concept_path)
+            order_key = concept_repo.get_next_dimensional_order_key(concept_id, segment_type)
         
         # Create base dimensional concept document using ConceptDocument with dimension_concept=True
         dimensional_concept_doc = ConceptDocument(
@@ -1883,6 +2601,12 @@ class FinancialNormalizationService:
 
         # The `concept` parameter is already correct — do NOT overwrite it from dimension_details,
         # which would pick the wrong axis for dual-axis facts (regression fix).
+
+        # Labels come straight from the taxonomy linkbase and carry XBRL
+        # presentation tags ("Rest Of World [Member]", "Rest of Asia Pacific
+        # Segment [Member]").  Clean them before the row is written.
+        if dimensional_concept_doc.label:
+            dimensional_concept_doc.label = clean_label(dimensional_concept_doc.label)
         
         # Store new dimensional data fields
         dimensional_fields = {
@@ -1899,6 +2623,29 @@ class FinancialNormalizationService:
         for field_name, field_value in dimensional_fields.items():
             if field_value is not None:
                 setattr(dimensional_concept_doc, field_name, field_value)
+
+        # Parent linkage + canonical identity.  The member name alone cannot
+        # identify this row (the same member is a child of Revenues and of
+        # CostOfRevenue), so stamp the parent and the full identity here — the
+        # hierarchy layer reads both back and must never have to guess a parent
+        # from the concept name.
+        dimensional_concept_doc.parent_concept = (
+            parent_concept.get('concept') if parent_concept else None
+        ) or dimension_data.get('concept_name')
+        dimensional_concept_doc.parent_path = parent_concept_path or None
+        dimensional_concept_doc.row_key = row_key_str(
+            {
+                "cik": company_cik,
+                "form_type": form_type,
+                "statement_type": statement_type,
+                "period": dimension_data.get('period'),
+                "concept": concept,
+                "concept_id": concept_id,
+                "concept_name": dimension_data.get('concept_name'),
+                "dimensions": dimension_data.get('dimensions'),
+                "dimension_details": dimension_data.get('dimension_details'),
+            }
+        )
         
         # Use the appropriate repository for insertion with duplicate prevention
         duplicate_manager = DuplicatePreventionManager(self.config, concept_repo)

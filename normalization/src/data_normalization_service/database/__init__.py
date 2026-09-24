@@ -8,6 +8,7 @@ from .database import (
     ValueRepository,
     CompanyRepository
 )
+from .concept_aliases import ConceptAliasStore
 from .tracker import DatabaseTracker
 
 __all__ = [
@@ -17,5 +18,6 @@ __all__ = [
     "ConceptRepository",
     "ValueRepository",
     "CompanyRepository",
+    "ConceptAliasStore",
     "DatabaseTracker"
 ]

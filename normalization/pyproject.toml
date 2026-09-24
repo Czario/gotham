@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-normalize-data = "main:main"
+normalize-data = "data_normalization_service.cli:main"
 
 [build-system]
 requires = ["hatchling"]

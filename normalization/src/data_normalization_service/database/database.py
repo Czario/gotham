@@ -366,6 +366,12 @@ class ConceptRepository:
 
     def insert(self, concept_doc: ConceptDocument) -> ObjectId:
         """Insert new concept document with duplicate prevention."""
+        # Guard: abstract concepts are never inserted into the database
+        # Exception: custom: abstract concepts (grouping headers created by the hierarchy agent) ARE allowed
+        is_custom = concept_doc.concept.startswith("custom:")
+        if (concept_doc.concept.split(":")[-1].endswith("Abstract") or getattr(concept_doc, "abstract", False)) and not is_custom:
+            raise ValueError(f"Refusing to insert abstract concept '{concept_doc.concept}' into database per business requirements")
+
         # FIRST: Check if concept with same name already exists (most important check for sync behavior)
         # For dimensional concepts, use more specific matching
         if concept_doc.dimension_concept:

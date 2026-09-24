@@ -12,6 +12,14 @@ import pandas as pd
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
+# Test environment
+# ---------------------------------------------------------------------------
+# The agent-owned hierarchy review calls an LLM.  Tests must never do that, so
+# it is OFF for the whole suite; tests that exercise the agent path enable it
+# explicitly (monkeypatch) and inject a stub model.
+os.environ["HIERARCHY_AGENT_ENABLED"] = "0"
+
+# ---------------------------------------------------------------------------
 # Python path setup
 # ---------------------------------------------------------------------------
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

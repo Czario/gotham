@@ -130,6 +130,35 @@ class PeriodBasedFinancialCalculationService:
         if concept_doc:
             logger.debug(f"Found concept {concept} in annual collection")
             return concept_doc
+
+        # The concept may have been merged by the concept-resolution agent: a
+        # filing reporting a legacy-era tag (e.g. us-gaap:Revenues) whose values
+        # attach to the existing modern-tag concept (concept_aliases).  Without
+        # this fallback those values would be dropped as "no concept".
+        try:
+            from ..database import ConceptAliasStore  # noqa: F401
+            store = getattr(self, '_concept_alias_store', None)
+            if store is None:
+                store = ConceptAliasStore(self.db_connection)
+                self._concept_alias_store = store
+            for form_type in ('10-Q', '10-K'):
+                target = store.get(company_cik, statement_type, form_type, concept)
+                if not target:
+                    continue
+                for repo in (self.quarterly_concept_repo, self.annual_concept_repo):
+                    alias_doc = repo.collection.find_one({
+                        'cik': company_cik,
+                        'statement_type': statement_type,
+                        'concept': target
+                    })
+                    if alias_doc:
+                        logger.info(
+                            f"Alias-resolved concept {concept} -> {target} for "
+                            f"{company_cik} {statement_type}"
+                        )
+                        return alias_doc
+        except Exception as exc:  # noqa: BLE001 — alias fallback must never break processing
+            logger.debug(f"Concept alias fallback failed for {concept}: {exc}")
             
         return None
     

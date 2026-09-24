@@ -38,6 +38,7 @@ class DatabaseManager:
                 collection = db[collection_name]
                 for index_spec, options in config['indexes']:
                     try:
+                        collection.create_index(index_spec, **options)
                     except Exception as e:
                         print(f"Index creation warning for {collection_name}: {e}")
             

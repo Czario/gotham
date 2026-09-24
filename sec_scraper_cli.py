@@ -42,46 +42,121 @@ from utilities.helpers.error_handling import (
     format_filing_log_message
 )
 import re
-from tqdm import tqdm
-
-def _fmt_time(seconds: float) -> str:
-    """Convert seconds to a human-readable string: 5s, 2m 15s, 1h 23m."""
-    s = int(seconds)
-    if s < 60:
-        return f"{s}s"
-    m, s = divmod(s, 60)
-    if m < 60:
-        return f"{m}m {s:02d}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m:02d}m"
-
-
-# tqdm.format_meter() calls tqdm.format_interval() directly (not via self),
-# so subclass overrides are ignored. Patch the class method globally instead.
-tqdm.format_interval = staticmethod(_fmt_time)  # type: ignore[method-assign]
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Column, Table
+from rich.text import Text
 
 # ---------------------------------------------------------------------------
-# Progress display
+# Progress display (Rich)
 # ---------------------------------------------------------------------------
-class ProgressManager:
-    """Clean progress bars for multi-company processing.
+class _RichFilingBar:
+    """Adapter exposing the old ``tqdm``-style filing-bar API over a Rich task.
 
-    In verbose mode all tqdm bars are disabled and full log output flows to
-    the console. In default (clean) mode logger console output is suppressed
-    and progress is communicated exclusively via tqdm bars.
+    Call sites use ``.update(n)``, ``.set_description_str(s)`` and ``.close()``;
+    keeping those names means no changes at any of them.
     """
 
-    def __init__(self, verbose: bool = False, parallel: bool = False):
+    def __init__(self, progress: "Progress", task_id: TaskID):
+        self._progress = progress
+        self._task_id = task_id
+        self._closed = False
+
+    def update(self, n: int = 1) -> None:
+        if not self._closed:
+            self._progress.update(self._task_id, advance=n)
+
+    def set_description_str(self, description: str) -> None:
+        if not self._closed:
+            self._progress.update(self._task_id, description=description)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            try:
+                self._progress.update(self._task_id, visible=False)
+            except Exception:  # noqa: BLE001 — bar teardown must never fail
+                pass
+
+
+class _NullFilingBar:
+    """No-op filing bar (parallel mode)."""
+
+    def update(self, n: int = 1) -> None: ...
+    def set_description_str(self, description: str) -> None: ...
+    def close(self) -> None: ...
+
+
+class ProgressManager:
+    """Rich-powered progress bars + a clean step-by-step console.
+
+    The public API is unchanged from the previous tqdm implementation
+    (``status`` / ``set_status`` / ``error`` / ``label`` / ``start_companies`` /
+    ``set_current_company`` / ``advance_company`` / ``finish_companies`` /
+    ``filing_bar`` / ``close_filing_bar`` / ``close_all``) so every existing
+    call site — including the Redis worker's ``WorkerProgressManager`` subclass —
+    keeps working.
+
+    Rich renders the live progress region and reprints scrolled step lines
+    above it, so narration and bars never corrupt each other (the tqdm version
+    produced overwritten, wrapped lines).
+
+    In verbose mode the live bars are disabled and full log output flows to the
+    console; step narration is still printed.
+    """
+
+    def __init__(self, verbose: bool = False, parallel: bool = False,
+                 console: Optional[Console] = None):
         self.verbose = verbose
         self.parallel = parallel
-        self._company_bar: Optional["tqdm"] = None
-        self._filing_bar: Optional["tqdm"] = None
+        # ``console`` is injectable so the display can be captured in tests.
+        self.console = console or Console(highlight=False, soft_wrap=True)
+        self._progress = Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn(
+                "{task.description}",
+                style="bold",
+                markup=False,
+                # Keep the live line to ONE row: a wrapped description would
+                # corrupt the progress region.
+                table_column=Column(no_wrap=True, overflow="ellipsis"),
+            ),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=self.console,
+            transient=False,
+            disable=verbose,
+        )
+        self._started = False
+        self._company_task: Optional[TaskID] = None
+        self._filing_task: Optional[TaskID] = None
+        self._filing_bar = None
         self._current_index: int = 0
         self._lock = threading.Lock()
         # Maps CIK -> the ticker symbol the user actually typed, so the bar
         # shows e.g. "JPM" instead of whatever the reverse CIK->ticker map
         # happens to return (a CIK can map to multiple tickers).
         self.cik_labels: dict = {}
+
+    # -- output -------------------------------------------------------------
+    def write(self, message: str) -> None:
+        """Print one line above the live progress region.
+
+        ``markup=False`` is essential: our step lines start with literal
+        ``[normalize]`` / ``[llm]`` / ``[tool]`` tags, which Rich would
+        otherwise swallow as style markup.
+        """
+        self.console.print(message, markup=False)
 
     def label(self, cik: str, fallback: str) -> str:
         """Return the user-supplied ticker for a CIK, else the fallback."""
@@ -92,43 +167,56 @@ class ProgressManager:
                 or self.cik_labels.get(str(cik).lstrip('0'))
                 or fallback)
 
+    def summary(self, title: str, rows: list, subtitle: str = "") -> None:
+        """Render a compact end-of-run panel (``("", "")`` adds a separator)."""
+        table = Table(show_header=False, box=None, pad_edge=False)
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column()
+        for label, value in rows:
+            if label == "" and value == "":
+                table.add_section()
+                continue
+            table.add_row(str(label), str(value))
+        body: Any = table
+        if subtitle:
+            grid = Table.grid()
+            grid.add_row(table)
+            grid.add_row(f"[dim]{subtitle}[/dim]")
+            body = grid
+        self.console.print(Panel(body, title=title, expand=False, border_style="cyan"))
+
     # -- Company-level bar --------------------------------------------------
     def start_companies(self, total: int) -> None:
         if self.verbose:
             return
-        self._company_bar = tqdm(
-            total=total,
-            desc="waiting       ",
-            unit="co",
-            colour="cyan",
-            dynamic_ncols=True,
-            position=0,
-            leave=True,
-            bar_format="Companies [{desc}] {bar} {n_fmt}/{total_fmt}  ⏱ {elapsed}  eta {remaining}",
-        )
+        with self._lock:
+            if not self._started:
+                self._progress.start()
+                self._started = True
+            self._company_task = self._progress.add_task("waiting", total=total)
 
     def set_current_company(self, ticker: str, index: Optional[int] = None) -> None:
         """Show the company currently being processed in the outer bar.
 
         The bar position reflects *completed* companies, so while company
-        ``index`` is in progress the bar sits at ``index - 1``. If ``index``
-        is None, only the description is updated.
+        ``index`` is in progress the bar sits at ``index - 1``.
         """
-        if self.verbose or self._company_bar is None:
+        if self.verbose or self._company_task is None:
             return
         with self._lock:
+            task = self._progress.tasks[self._company_task]
             if index is not None and not self.parallel:
                 self._current_index = index
-                target = index - 1  # companies finished before this one
-                delta = target - self._company_bar.n
+                delta = (index - 1) - task.completed
                 if delta > 0:
-                    self._company_bar.update(delta)
-            self._company_bar.set_description_str(f"{ticker:<6} processing")
-            self._company_bar.refresh()
+                    self._progress.update(self._company_task, advance=delta)
+            self._progress.update(
+                self._company_task, description=f"{ticker:<6} processing"
+            )
 
     def advance_company(self, ticker: str, processed: int, skipped: int,
                         failed: int, reconciled: int = 0) -> None:
-        if self.verbose or self._company_bar is None:
+        if self.verbose or self._company_task is None:
             return
         parts = []
         if processed:
@@ -136,89 +224,90 @@ class ProgressManager:
         if skipped:
             parts.append(f"{skipped} skip")
         if failed:
-            parts.append(f"{failed} ❌")
+            parts.append(f"{failed} failed")
         if reconciled:
             parts.append(f"+{reconciled} filled")
         status = ", ".join(parts) or "done"
         with self._lock:
+            task = self._progress.tasks[self._company_task]
             if self.parallel:
-                # Companies complete out of order; simply increment by 1.
-                self._company_bar.update(1)
+                self._progress.update(
+                    self._company_task, advance=1, description=f"{ticker:<6} {status}"
+                )
             else:
-                # Sequential: advance to the current index.
-                delta = self._current_index - self._company_bar.n
+                delta = self._current_index - task.completed
                 if delta > 0:
-                    self._company_bar.update(delta)
-            self._company_bar.set_description_str(f"{ticker:<6} {status}")
-            self._company_bar.refresh()
+                    self._progress.update(self._company_task, advance=delta)
+                self._progress.update(
+                    self._company_task, description=f"{ticker:<6} {status}"
+                )
 
     def finish_companies(self) -> None:
         self.close_filing_bar()
-        if self._company_bar is not None:
-            self._company_bar.close()
-            self._company_bar = None
+        with self._lock:
+            if self._started:
+                self._progress.stop()
+                self._started = False
 
-    # -- Filing-level bar (per company) ------------------------------------
-    def filing_bar(self, ticker: str, total: int) -> "tqdm":
-        """Return a tqdm bar for the filing loop; disabled in verbose or parallel mode.
-
-        The bar is pinned to ``position=1`` so it renders on its own line
-        directly beneath the company bar instead of overwriting it. Any
-        previously open filing bar is closed first.
-        """
-        if self.parallel:
-            # In parallel mode multiple companies run simultaneously; a single
-            # shared bar would be chaotic. Return a silent bar instead so that
-            # all callers can still call .update() / .set_description_str()
-            # without crashing.
-            return tqdm(total=total, disable=True)
+    def filing_bar(self, ticker: str, total: int):
+        """Return a filing-level bar (no-op object in parallel mode)."""
+        if self.parallel or self.verbose:
+            return _NullFilingBar()
         self.close_filing_bar()
-        self._filing_bar = tqdm(
-            total=total,
-            desc=f"{ticker:<6}              ",
-            unit="f",
-            leave=False,
-            disable=self.verbose,
-            dynamic_ncols=True,
-            colour="green",
-            position=1,
-            bar_format="  [{desc}] {bar} {n_fmt}/{total_fmt}  ⏱ {elapsed}  eta {remaining}",
-        )
+        with self._lock:
+            if not self._started and not self.verbose:
+                self._progress.start()
+                self._started = True
+            self._filing_task = self._progress.add_task(f"{ticker:<6}", total=total)
+        self._filing_bar = _RichFilingBar(self._progress, self._filing_task)
         return self._filing_bar
 
     def close_filing_bar(self) -> None:
-        """Close the active filing bar if one is open."""
         if self._filing_bar is not None:
             self._filing_bar.close()
             self._filing_bar = None
+            self._filing_task = None
 
     def close_all(self) -> None:
-        """Tear down every active bar cleanly (e.g. on interrupt)."""
         self.close_filing_bar()
-        if self._company_bar is not None:
-            self._company_bar.close()
-            self._company_bar = None
+        with self._lock:
+            if self._started:
+                self._progress.stop()
+                self._started = False
+            self._company_task = None
 
-    def set_status(self, msg: str) -> None:
-        """Update company bar description without changing progress count.
+    # -- One-line status ----------------------------------------------------
+    def set_filing_status(self, msg: str) -> None:
+        """Update the filing bar's description (the live per-filing stage).
 
-        Use this for transient states like 'fetching...' or live filing counts
-        that are shown inside the company bar description area.
+        Used by the agent presenter so the operator sees the current step in
+        the bar instead of a printed line per node.
         """
-        if self.verbose or self._company_bar is None:
+        if self.verbose or self._filing_task is None:
             return
         with self._lock:
-            self._company_bar.set_description_str(msg)
-            self._company_bar.refresh()
+            self._progress.update(self._filing_task, description=msg)
 
-    # -- One-line status (verbose suppressed) ------------------------------
+    def set_status(self, msg: str) -> None:
+        """Update the transient state shown in the company bar's description."""
+        if self.verbose or self._company_task is None:
+            return
+        with self._lock:
+            self._progress.update(self._company_task, description=msg)
+
     def status(self, msg: str) -> None:
-        """Print a status line that appears above progress bars in clean mode."""
-        if not self.verbose:
-            tqdm.write(msg)
+        """Print a step line above the live progress region.
+
+        ``markup=False`` keeps our literal ``[tag]`` prefixes intact instead of
+        letting Rich interpret them as style markup.
+        """
+        if self.verbose:
+            return  # verbose mode: the logger owns console output
+        self.console.print(msg, markup=False)
 
     def error(self, msg: str) -> None:
-        tqdm.write(msg)
+        self.console.print(Text(str(msg), style="red"))
+
 
 # ---------------------------------------------------------------------------
 # Merged normalization pipeline
@@ -391,6 +480,8 @@ class SECDataScraperApp:
         # Per-company state (sequential-only — no threading needed)
         self.current_company_data = None
         self.current_company_doc = None
+        # Outcome of the last filing the agent processed (decision / failure reason)
+        self._last_agent_outcome: Optional[Dict[str, Any]] = None
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = target_fiscal_quarter
         self.reload = reload
@@ -429,13 +520,21 @@ class SECDataScraperApp:
         self._quarterly_service = _QuarterlyService(_norm_config)
         # companyfacts reconciliation: fills genuine extraction gaps (incl. the
         # latest filing's edge) from the SEC companyfacts API after each company.
-        # Built lazily in _run_companyfacts_reconciliation (needs sec_client).
+        # Built lazily by _build_reconciliation_service (needs sec_client).
         self._reconciliation_service = None
         self._reconciliation_db_uri = _mongo_uri
         self._reconciliation_db_name = _database_name
         # Per-company accumulator: company_cik -> list of raw statement dicts
         # (only cash_flow + income statements; used for deaccumulation)
         self._quarterly_accumulator: Dict[str, List[Dict]] = {}
+
+        # ── P7: agent graphs / audit / durable session ──────────────────────
+        self._filing_graph = None      # cached per-filing LangGraph
+        self._company_graph = None     # cached company-stage LangGraph
+        self._presenter = None         # live terminal step narration (lazy)
+        self._audit = None             # JSONL audit trail (lazy)
+        self._audit_checked = False
+        self._agent_session = None     # Mongo-backed run session (lazy)
         
         # Initialize services
         self.sec_client = SECAPIClient(database=self.db)
@@ -479,42 +578,31 @@ class SECDataScraperApp:
         }
         self._quarterly_accumulator.setdefault(cik, []).append(entry)
 
-    def _flush_quarterly_accumulator(self, cik: str) -> None:
-        """Run deaccumulation for a company then free its accumulator entry."""
-        statements = self._quarterly_accumulator.pop(cik, [])
-        if not statements:
-            return
-        logger.info(f"Running quarterly deaccumulation for {cik} ({len(statements)} statements)")
-        try:
-            self._quarterly_service.process_company_from_statements(cik, statements)
-        except Exception as e:
-            logger.error(f"Quarterly deaccumulation failed for {cik}: {e}", exc_info=True)
+    def _record_filing_session(
+        self,
+        cik: str,
+        accession_number: str,
+        status: str,
+        **fields: Any,
+    ) -> None:
+        """Append a filing outcome to the durable session ledger (best-effort).
 
-    def _run_companyfacts_reconciliation(self, cik: str) -> None:
-        """Fill genuine extraction gaps for a company from the SEC companyfacts
-        API after its filings are processed. Edge mode is on, so the latest
-        filing's gaps are recovered immediately. INSERT-ONLY and provenance
-        tagged; never overwrites primary-extracted values."""
-        if not self.enable_reconciliation:
+        The scraper's authoritative de-duplication remains the MongoDB
+        existence check; the session ledger is the durable audit/resume record.
+        """
+        self._ensure_audit()
+        session = getattr(self, "_agent_session", None)
+        if session is None:
             return
         try:
-            if self._reconciliation_service is None:
-                from pymongo import MongoClient as _MongoClient
-                from data_normalization_service.services.companyfacts_reconciliation import (
-                    CompanyFactsReconciliationService as _ReconService,
-                )
-                recon_db = _MongoClient(self._reconciliation_db_uri)[self._reconciliation_db_name]
-                self._reconciliation_service = _ReconService(recon_db, self.sec_client)
-            cik_padded = str(cik).zfill(10)
-            total = 0
-            for freq in ("annual", "quarterly"):
-                stats = self._reconciliation_service.reconcile_company(
-                    cik_padded, frequency=freq, include_edge=True)
-                total += stats.get("filled", 0)
-            if total:
-                logger.info(f"✅ companyfacts reconciliation filled {total} gap value(s) for CIK {cik}")
-        except Exception as e:
-            logger.warning(f"companyfacts reconciliation failed for CIK {cik}: {e}", exc_info=True)
+            session.record_filing(
+                cik=cik,
+                accession_number=accession_number,
+                status=status,
+                **fields,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"session record failed for {accession_number}: {e}")
 
     def _build_sec_url(self, company_cik: str, accession_number: str) -> str:
         accession_clean = accession_number.replace('-', '')
@@ -524,6 +612,130 @@ class SECDataScraperApp:
         # Schema/indexes are managed by the normalization service (DatabaseTracker._ensure_indexes)
         # No raw collections (filings, financial_statements) should be created here
         return True
+
+    def _ensure_audit(self) -> None:
+        """Install the terminal presenter, JSONL audit trail and run session.
+
+        All three are observability and installed exactly once per process: the
+        presenter narrates every agent step to the terminal, the audit writes
+        the same events to ``.filings_agent/audit.jsonl`` and the session is the
+        durable resume ledger.  A failure in any of them is logged at debug
+        level and never affects processing.
+        """
+        if getattr(self, "_audit_checked", False):
+            return
+        self._audit_checked = True
+        try:
+            from filings_agent.presenter import install_presenter
+
+            # Quiet by default: the live stage goes in the filing bar and only
+            # the per-filing outcome (plus anomalies) is printed.  Rich's
+            # markup=False keeps our literal [tag] prefixes intact.
+            verbose = bool(getattr(self.progress, "verbose", False))
+            self._presenter = install_presenter(
+                writer=lambda msg: self.progress.console.print(msg, markup=False),
+                stage_writer=self.progress.set_filing_status,
+                # -v (or AGENT_STEPS=1) restores the full per-node trace.
+                detailed=True if verbose else None,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"presenter install failed: {e}")
+        try:
+            from filings_agent.audit import install_audit
+
+            self._audit = install_audit()
+            if self._audit is not None:
+                logger.info(f"agent audit trail: {self._audit.path}")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"audit install failed: {e}")
+        try:
+            from filings_agent.session import build_session
+
+            self._agent_session = build_session()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"agent session unavailable: {e}")
+
+    def _agent_event_sink(self):
+        """Structured agent-event sink for the audit trail (or None)."""
+        return getattr(self._audit, "agent_event", None)
+
+    def _build_reconciliation_service(self):
+        """Lazily build the SEC companyfacts reconciliation service."""
+        if self._reconciliation_service is None:
+            from pymongo import MongoClient as _MongoClient
+            from data_normalization_service.services.companyfacts_reconciliation import (
+                CompanyFactsReconciliationService as _ReconService,
+            )
+
+            recon_db = _MongoClient(self._reconciliation_db_uri)[self._reconciliation_db_name]
+            self._reconciliation_service = _ReconService(recon_db, self.sec_client)
+        return self._reconciliation_service
+
+    def _build_company_agent_graph(self):
+        """Build the company-stage graph (P7) over the normalizer's target DB."""
+        from filings_agent.company_graph import build_company_graph
+        from filings_agent.reports import ValidationReportStore
+
+        report_store = ValidationReportStore(self._norm_service.db_connection.target_db)
+        return build_company_graph(
+            quarterly_service=self._quarterly_service,
+            reconciliation_provider=self._build_reconciliation_service,
+            report_store=report_store,
+            enable_reconciliation=self.enable_reconciliation,
+        )
+
+    def _run_company_agent_stage(self, cik: str, ticker: str = "") -> Optional[Dict[str, Any]]:
+        """Run the agent-owned company stage: quarterly deaccumulation →
+        companyfacts reconciliation → validation-report finalization.
+
+        Replaces the former inline post-processing. Every step is best-effort
+        inside the graph, so a failure is recorded rather than raised.
+        """
+        statements = self._quarterly_accumulator.pop(cik, [])
+        if not statements and not self.enable_reconciliation:
+            return None
+        self._ensure_audit()
+        try:
+            if self._company_graph is None:
+                self._company_graph = self._build_company_agent_graph()
+            from filings_agent.state import company_state_summary, new_company_state
+
+            session = getattr(self, "_agent_session", None)
+            state = new_company_state(
+                cik=cik,
+                ticker=ticker or cik,
+                run_id=getattr(session, "run_id", None),
+                quarterly_statements=statements,
+                enable_reconciliation=self.enable_reconciliation,
+            )
+            final = self._company_graph.invoke(state)
+            summary = company_state_summary(final)
+            logger.info(f"company stage {cik}: {summary}")
+            return summary
+        except Exception as e:  # noqa: BLE001 — never fail the company run
+            logger.warning(f"company agent stage failed for {cik}: {e}", exc_info=True)
+            return None
+
+    def _build_filing_agent_graph(self):
+        """Build (and cache) the per-filing agent graph.
+
+        The scraper owns the normalization service, so the graph receives the
+        same service instance and the validation report store points at the
+        same target database. This keeps the graph's persist node as the sole
+        financial-data writer.
+        """
+        if self._filing_graph is not None:
+            return self._filing_graph
+        from filings_agent.graph import build_filing_graph
+        from filings_agent.reports import ValidationReportStore
+
+        report_store = ValidationReportStore(self._norm_service.db_connection.target_db)
+        self._filing_graph = build_filing_graph(
+            self._norm_service,
+            report_store=report_store,
+            on_event=self._agent_event_sink(),
+        )
+        return self._filing_graph
     
     def filter_latest_filings(self, filings_list: List[Dict], cik: str, latest_date: str) -> List[Dict]:
         """Filter filings to only include those with reporting periods newer than the latest in database"""
@@ -618,6 +830,9 @@ class SECDataScraperApp:
     
     def process_company(self, cik: str, summary: Optional['ProcessingSummary'] = None) -> Dict:
         company_start_time = time.time()
+        # Attach the JSONL audit trail before any graph runs, so filing-graph
+        # node/tool events are captured too (not just the company stage).
+        self._ensure_audit()
         
         try:
             # Determine the start date for processing
@@ -636,12 +851,23 @@ class SECDataScraperApp:
                 logger.info(f"🔄 RELOAD mode: refreshing data for CIK: {cik}")
                 if self.target_fiscal_year or self.target_fiscal_quarter:
                     logger.info(f"🎯 Will reload specific period: FY{self.target_fiscal_year} {self.target_fiscal_quarter or 'complete'}")
+            _fetch_t0 = time.perf_counter()
             company_data, filings_list = self.sec_client.get_company_submissions(cik, start_year=effective_start_year, end_year=self.end_year)
+            _fetch_ms = (time.perf_counter() - _fetch_t0) * 1000
             if not company_data:
                 error_msg = f"Failed to fetch company data for CIK: {cik}"
                 logger.error(error_msg)
                 return False
             self.current_company_data = company_data
+            # Company-level step: which filings SEC returned for this window.
+            if self._presenter is not None:
+                self._presenter.step(
+                    "fetch",
+                    f"{len(filings_list)} filing(s) listed on EDGAR "
+                    f"({self.start_year}+)",
+                    ok=bool(filings_list),
+                    duration_ms=_fetch_ms,
+                )
 
             _range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
             logger.info(f"Fetched {len(filings_list)} total filings for company {company_data.get('name', 'Unknown')} {_range_desc}")
@@ -744,11 +970,19 @@ class SECDataScraperApp:
                     # Log to summary
                     if summary:
                         summary.log_filing_progress(ticker, i, total_target, accession_number, "processed")
+                    self._record_filing_session(
+                        cik, accession_number, "saved",
+                        form_type=filing.get('form'), filing_date=filing.get('filingDate'),
+                    )
                 else:
                     filings_failed += 1
                     # Log to summary
                     if summary:
                         summary.log_filing_progress(ticker, i, total_target, accession_number, "failed")
+                    self._record_filing_session(
+                        cik, accession_number, "failed",
+                        form_type=filing.get('form'), filing_date=filing.get('filingDate'),
+                    )
 
                 # Update company bar with live filing counts
                 _done = filings_processed + filings_skipped + filings_failed
@@ -769,9 +1003,8 @@ class SECDataScraperApp:
             # accumulator data and no reason to make the potentially slow
             # companyfacts API reconciliation calls.
             if filings_processed > 0:
-                self._flush_quarterly_accumulator(cik)
-                self.progress.set_status(f"{ticker:<6} reconciling...")
-                self._run_companyfacts_reconciliation(cik)
+                self.progress.set_status(f"{ticker:<6} company stage...")
+                self._run_company_agent_stage(cik, ticker)
             else:
                 self.progress.set_status(f"{ticker:<6} no new filings")
 
@@ -812,6 +1045,8 @@ class SECDataScraperApp:
         Returns:
             bool: True if processing successful, False otherwise
         """
+        # See process_company: attach the audit trail before the graph runs.
+        self._ensure_audit()
         try:
             logger.info(f"Processing single filing: CIK {cik}, Accession {accession_number}")
 
@@ -916,10 +1151,8 @@ class SECDataScraperApp:
             # after a filing was actually saved. Avoid reconciliation network
             # calls when the requested filing was skipped or failed.
             if success:
-                self.progress.set_status("quarterly deaccumulation")
-                self._flush_quarterly_accumulator(cik)
-                self.progress.set_status("reconciliation")
-                self._run_companyfacts_reconciliation(cik)
+                self.progress.set_status("company stage")
+                self._run_company_agent_stage(cik, ticker)
 
             # Read period label from the DB (written by normalization service —
             # no calculation here, just reading what was stored).
@@ -1041,7 +1274,15 @@ class SECDataScraperApp:
         accession_number = filing.get('accessionNumber')
 
         if self.latest:
-            if accession_number:
+            # Values are UNIQUE per (cik, concept_id, fiscal_year[, quarter]) in
+            # the target DB, so a reload must delete by that period identity.
+            # Deleting by accession alone leaves rows written under another
+            # accession (or without one) for the same period, which the
+            # replacement write would then skip or collide with.
+            period_filter = self._reload_period_filter(filing, form_type)
+            if period_filter:
+                reload_filter.update(period_filter)
+            elif accession_number:
                 # New records use the canonical top-level field. Keep the
                 # nested alternative for legacy records during reloads.
                 reload_filter['$or'] = [
@@ -1072,6 +1313,45 @@ class SECDataScraperApp:
         if form_type:
             reload_filter['form_type'] = form_type
         return reload_filter
+
+    def _reload_period_filter(self, filing: Dict, form_type: str) -> Optional[Dict[str, Any]]:
+        """Return the period-identity filter for the filing being reloaded.
+
+        ``{reporting_period.fiscal_year[, .quarter]}`` — the same identity the
+        DB's unique value index uses.  Returns ``None`` when the fiscal period
+        cannot be derived (e.g. the company is not yet in ``companies``), in
+        which case the caller falls back to accession-based deletion.
+        """
+        report_date = filing.get('reportDate') or filing.get('report_date')
+        if not report_date:
+            return None
+        try:
+            report_end_date = datetime.strptime(str(report_date)[:10], '%Y-%m-%d')
+        except (ValueError, TypeError):
+            return None
+        try:
+            fiscal_year_end = self._get_authoritative_fiscal_year_end(
+                getattr(self, "current_company_data", None) or {}
+            )
+        except Exception:  # noqa: BLE001 — no DB/state available (unit contexts)
+            return None
+        if not fiscal_year_end:
+            return None
+        try:
+            from utilities.helpers.period_utils import FiscalYearCalculator
+
+            fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                report_end_date, fiscal_year_end
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if fiscal_year is None:
+            return None
+        period_filter: Dict[str, Any] = {'reporting_period.fiscal_year': fiscal_year}
+        # Annual values are stored WITHOUT a quarter, so only 10-Q needs it.
+        if (form_type or '') == '10-Q' and quarter is not None:
+            period_filter['reporting_period.quarter'] = quarter
+        return period_filter
 
     def _delete_reload_data(self, cik: str, filing_info: Dict) -> None:
         """Delete the existing target filing immediately before replacement saves."""
@@ -1246,9 +1526,23 @@ class SECDataScraperApp:
         
         logger.info(f"Processing online filing {accession_number} for CIK: {cik}")
         period_label = self._format_filing_period(filing_info, self.current_company_data)
-        self.progress.status(
-            f"  [filing] {period_label:<12} {form_type} {accession_number} extracting"
-        )
+        # Header for this filing's step list (the agent narrates the steps).
+        self._ensure_audit()
+        if self._presenter is not None:
+            self._presenter.filing_header(
+                {
+                    'ticker': ticker,
+                    'cik': cik,
+                    'form_type': form_type,
+                    'accession_number': accession_number,
+                },
+                period_label=period_label,
+            )
+        else:  # narration disabled -> keep the plain header
+            self.progress.status(
+                f"  [filing] {period_label:<12} {form_type} {accession_number} extracting"
+            )
+        filing_started_at = time.perf_counter()
         
         # Build SEC URL
         sec_url = self._build_sec_url(cik, accession_number)
@@ -1275,7 +1569,7 @@ class SECDataScraperApp:
             )
             return True
         else:
-            failure_reason = "No financial statements extracted from XBRL data (parsing failed or no recognized statement types found)"
+            failure_reason = self._determine_filing_failure_reason(cik, accession_number, filing_id)
             
             log_operation_result(
                 f"{filing_type.capitalize()} filing {accession_number}{url_info}", 
@@ -1341,10 +1635,21 @@ class SECDataScraperApp:
             
             # Process using unified financial processor
             self.progress.set_status("downloading / parsing XBRL")
+            _extract_t0 = time.perf_counter()
             statements_data = self.financial_processor.process_filing(
                 filing_info, cik, company_info_enriched
             )
-            
+            _extract_ms = (time.perf_counter() - _extract_t0) * 1000
+            if self._presenter is not None:
+                n_statements = len((statements_data or {}).get('statements') or {})
+                self._presenter.step(
+                    "extract",
+                    (f"{n_statements} statement table(s) parsed from XBRL"
+                     if statements_data else "no XBRL statements found"),
+                    ok=bool(statements_data),
+                    duration_ms=_extract_ms,
+                )
+
             if not statements_data:
                 logger.warning(f"Financial processor returned None for online filing {accession_number}")
                 return 0
@@ -1433,9 +1738,10 @@ class SECDataScraperApp:
                 )
                 return 0
 
-            # Extraction is complete. For reloads, remove the old rows now,
-            # immediately before the first replacement write.
-            self._delete_reload_data(cik, filing_info)
+            # Extraction is complete.  The --reload delete is DEFERRED: it is
+            # handed to the agent as a pre-write hook so it only runs once the
+            # agent has decided to write.  Deleting here would destroy existing
+            # rows whenever the agent decides to skip the filing.
 
             company_doc = self.current_company_doc or {}
             filing_doc_for_norm = {
@@ -1444,27 +1750,84 @@ class SECDataScraperApp:
                 'accession_number': accession_number,
             }
 
-            for statement_type, statement_doc in prepared_statements:
-                self.progress.set_status(f"normalizing  {statement_type}")
-                logger.debug(f"   Normalizing {statement_type} into normalize_data...")
-                try:
-                    self._norm_service.normalize_statement_in_memory(
-                        statement_doc, filing_doc_for_norm, company_doc
-                    )
-                    statements_processed += 1
-                    statements_with_data += 1
-                    logger.info(f"✅ Normalized {statement_type} statement into normalize_data")
-                    # Accumulate slim copy for quarterly deaccumulation pass
-                    self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
-                    # Log period information
-                    self._log_period_information(statement_type, reporting_period)
-                except Exception as norm_err:
-                    logger.warning(f"⚠️  Failed to normalize {statement_type}: {norm_err}", exc_info=True)
+            try:
+                # P4: hand every prepared statement to the graph. The graph
+                # performs pure normalization → validation/review/repair →
+                # the sole persist node. No statement write occurs in this
+                # scraper method anymore.
+                from filings_agent.state import new_state
 
-            self.progress.status(
-                f"  [xbrl]  {period_label:<12} {form_type} {accession_number} "
-                f"{statements_with_data} statement(s) normalized"
-            )
+                self.progress.set_status("agent validating / repairing")
+                filing_date = filing_info.get('filingDate', filing_info.get('reportDate'))
+                agent_state = new_state(
+                    cik=cik,
+                    ticker=self.sec_client.get_ticker_from_cik(cik) or str(cik),
+                    company_name=(company_doc or {}).get('name', str(cik)),
+                    form_type=form_type,
+                    accession_number=accession_number,
+                    statement_docs=[doc for _, doc in prepared_statements],
+                    filing_doc=filing_doc_for_norm,
+                    company_doc=company_doc,
+                    filing_date=filing_date,
+                    sec_client=self.sec_client,
+                )
+                agent_state['reporting_period'] = reporting_period
+                if self.reload:
+                    # Deferred reload: only delete if the agent writes, and
+                    # replace (not skip) rows that survive the delete.
+                    agent_state['pre_write_hook'] = (
+                        lambda c=cik, f=filing_info: self._delete_reload_data(c, f)
+                    )
+                    agent_state['replace_existing'] = True
+                final_state = self._build_filing_agent_graph().invoke(agent_state)
+
+                if final_state.get('status') != 'saved':
+                    from filings_agent.validation.findings import (
+                        blocking_findings as _blocking_findings,
+                    )
+                    # The agent is the writer: a non-saved outcome is either a
+                    # deliberate decision (skip) or a genuine failure.  Record
+                    # the real reason so the caller never reports a validation
+                    # skip as an XBRL parse error.
+                    decision = final_state.get('decision') or {}
+                    self._last_agent_outcome = {
+                        'status': final_state.get('status'),
+                        'action': decision.get('action'),
+                        'decided_by': decision.get('decided_by'),
+                        'reason': decision.get('reason') or final_state.get('error'),
+                        'blocking_findings': len(
+                            _blocking_findings(final_state.get('findings') or [])
+                        ),
+                    }
+                    logger.warning(
+                        "⚠️  Filing agent did not persist %s: status=%s decision=%s (%s)",
+                        accession_number,
+                        final_state.get('status'),
+                        decision.get('action') or 'n/a',
+                        self._last_agent_outcome['reason'] or 'no reason recorded',
+                    )
+                    return 0
+
+                receipt = final_state.get('persist_receipt') or {}
+                statements_with_data = int(
+                    receipt.get('statements_written', len(prepared_statements))
+                )
+                statements_processed = statements_with_data
+
+                # Accumulate only after the agent confirms the statements were
+                # persisted; the quarterly pass must never consume rejected
+                # bundles.
+                for statement_type, statement_doc in prepared_statements:
+                    self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
+                    self._log_period_information(statement_type, reporting_period)
+                    logger.info(f"✅ Agent persisted {statement_type} statement into normalize_data")
+            except Exception as agent_err:
+                logger.warning(
+                    f"⚠️  Filing agent failed for {accession_number}: {agent_err}",
+                    exc_info=True,
+                )
+                return 0
+
             return statements_with_data
 
         except Exception as e:
@@ -1636,7 +1999,20 @@ class SECDataScraperApp:
         Returns:
             str: Detailed failure reason
         """
-        # In the merged pipeline, financial_statements are not stored — failure reason is always XBRL parse failure
+        # In the merged pipeline the agent is the writer, so the reason is
+        # either the agent's own decision (validation refused the write) or an
+        # XBRL parse failure when the agent never produced a decision.
+        outcome = getattr(self, '_last_agent_outcome', None) or {}
+        action = outcome.get('action')
+        if action in ('skip', 'write_partial'):
+            detail = outcome.get('reason') or 'validation refused the write'
+            return (
+                f"Filing agent decided NOT to write ({action} by "
+                f"{outcome.get('decided_by') or 'policy'}): {detail}"
+                f" [{outcome.get('blocking_findings', 0)} blocking finding(s)]"
+            )
+        if outcome.get('status') == 'failed' and outcome.get('reason'):
+            return f"Filing agent failed: {outcome['reason']}"
         return "No financial statements extracted from XBRL data (parsing failed or no recognized statement types found)"
         items_with_values = 0  # unreachable; kept to preserve method signature
         
@@ -1716,7 +2092,6 @@ class SECDataScraperApp:
                     results[cik] = {'ticker': cik, 'success': False, 'processed': 0, 'skipped': 0, 'failed': 1, 'error': str(e)}
 
         self.progress.finish_companies()
-        self.progress.status("\n✅ Processing complete")
 
         return results
     
@@ -2107,7 +2482,7 @@ def main():
         from utilities.helpers.logger_config import LoggerConfig
         LoggerConfig.setup_logging(level='WARNING', console_output=False)
 
-    # Build progress manager — verbose=False activates clean tqdm bars
+    # Build the Rich progress manager (verbose=True disables live bars)
     progress = ProgressManager(verbose=is_verbose, parallel=False)
 
     # Install a SIGINT handler so the first Ctrl+C immediately tears down the
@@ -2166,7 +2541,7 @@ def main():
                     html_download_path = None
                 else:
                     if is_verbose:
-                        tqdm.write(f"📁 HTML filings will be saved to: {html_path.absolute()}")
+                        progress.write(f"📁 HTML filings will be saved to: {html_path.absolute()}")
             except Exception as e:
                 print(f"⚠️  Invalid SEC_HTML_DOWNLOAD_PATH: {e} — HTML downloads disabled")
                 html_download_path = None
@@ -2305,7 +2680,7 @@ def main():
                                     if is_verbose:
                                         print(f"✅ Validated CIK: {token}")
                                 else:
-                                    tqdm.write(f"❌ CIK not found in SEC: {token} — skipping")
+                                    progress.write(f"❌ CIK not found in SEC: {token} — skipping")
                             else:
                                 # Treat token as ticker symbol
                                 mapped = ticker_map.get(token.upper())
@@ -2320,7 +2695,7 @@ def main():
                                         if is_verbose:
                                             print(f"✅ Validated as CIK in SEC: {token}")
                                     else:
-                                        tqdm.write(f"⚠️  Unknown ticker or CIK: {token} — skipping")
+                                        progress.write(f"⚠️  Unknown ticker or CIK: {token} — skipping")
 
                             if cik_resolved:
                                 companies.append(cik_resolved)
@@ -2333,7 +2708,7 @@ def main():
                 if is_verbose:
                     print(f"Loaded {len(companies)} companies from {args.file}")
             else:
-                tqdm.write(f"❌ Companies file not found: {args.file}")
+                progress.write(f"❌ Companies file not found: {args.file}")
                 sys.exit(1)
         else:
             print("❌ No companies specified")
@@ -2396,15 +2771,15 @@ def main():
             successful = sum(1 for success in results.values() if success)
             total = len(results)
             
-            print(f"\n{'='*50}")
-            print(f"HTML DOWNLOAD-ONLY MODE COMPLETE")
-            print(f"{'='*50}")
-            print(f"Companies processed: {successful}/{total}")
-            
-            if successful == total:
-                print(f"\nAll companies' HTML files downloaded successfully!")
-            else:
-                print(f"\n{total - successful} companies had issues downloading HTML files. Check logs for details.")
+            progress.summary(
+                "HTML DOWNLOAD-ONLY MODE",
+                [("Companies", f"{successful}/{total} downloaded")],
+                subtitle=(
+                    "all HTML files downloaded successfully"
+                    if successful == total
+                    else f"{total - successful} companies had issues — check logs for details"
+                ),
+            )
             
             sys.exit(0)
         
@@ -2428,49 +2803,66 @@ def main():
         # Process companies
         results = app.process_multiple_companies(companies, resume=True)
         
-        # Show results
-        successful = sum(1 for s in results.values() if (s.get('success', False) if isinstance(s, dict) else bool(s)))
+        # Show results. A company counts as successful only when it ran cleanly
+        # AND had no failed filings — reporting "success" for a company whose
+        # filings all failed was actively misleading.
+        def _company_ok(entry: Any) -> bool:
+            if not isinstance(entry, dict):
+                return bool(entry)
+            return bool(entry.get('success', False)) and not entry.get('failed', 0)
+
+        successful = sum(1 for s in results.values() if _company_ok(s))
         total = len(results)
         
-        print(f"\n{'='*50}")
-        print(f"PROCESSING COMPLETE")
-        print(f"{'='*50}")
-        
-        # Per-company breakdown
-        for cik, s in results.items():
-            if isinstance(s, dict):
-                ticker  = s.get('ticker', cik)
-                new_    = s.get('processed', 0)
-                skip_   = s.get('skipped', 0)
-                fail_   = s.get('failed', 0)
-                ok      = s.get('success', False)
+        total_failed = sum(
+            (s.get('failed', 0) if isinstance(s, dict) else 0)
+            for s in results.values()
+        )
+        total_new = sum(
+            (s.get('processed', 0) if isinstance(s, dict) else 0)
+            for s in results.values()
+        )
+
+        # One compact Rich panel: per-company outcome + overall totals.
+        rows: list = []
+        for cik, entry in results.items():
+            if isinstance(entry, dict):
+                ticker = entry.get('ticker', cik)
                 parts = []
-                if new_:
-                    parts.append(f"{new_} new")
-                if skip_:
-                    parts.append(f"{skip_} skipped")
-                if fail_:
-                    parts.append(f"{fail_} failed")
+                if entry.get('processed'):
+                    parts.append(f"{entry['processed']} new")
+                if entry.get('skipped'):
+                    parts.append(f"{entry['skipped']} skipped")
+                if entry.get('failed'):
+                    parts.append(f"{entry['failed']} failed")
                 if not parts:
                     parts.append("no filings")
-                icon = "✅" if ok else "⚠️ "
-                print(f"  {icon} {ticker:<8} {', '.join(parts)}")
+                mark = "[green]✓[/green]" if _company_ok(entry) else "[yellow]![/yellow]"
+                rows.append((f"  {mark} {ticker}", ", ".join(parts)))
             else:
-                icon = "✅" if s else "❌"
-                print(f"  {icon} {cik}")
-        
-        print(f"\nCompanies: {successful}/{total} succeeded")
-        
+                mark = "[green]✓[/green]" if entry else "[red]✗[/red]"
+                rows.append((f"  {mark} {cik}", ""))
+        rows.append(("", ""))
+        rows.append(("  Companies", f"{successful}/{total} succeeded"))
+        if total_new:
+            rows.append(("  New filings", str(total_new)))
+        if total_failed:
+            rows.append(("  Failed filings", f"[red]{total_failed}[/red]"))
+
+        subtitle = (
+            "all companies processed successfully"
+            if successful == total
+            else f"{total - successful} company/companies had issues — run with --verbose for details"
+        )
+        progress.summary("PROCESSING COMPLETE", rows, subtitle=subtitle)
+        progress.console.print("")
+        progress.console.print(
+            "[dim]For more options: python sec_scraper_cli.py --help[/dim]"
+        )
+
         # Cleanup
         if app is not None:
             app.cleanup()
-        
-        if successful == total:
-            print("All companies processed successfully!")
-        else:
-            print(f"{total - successful} company/companies had issues. Run with --verbose for details.")
-        
-        print(f"\nFor more features, try: python sec_scraper_cli.py --help")
         
     except KeyboardInterrupt:
         try:

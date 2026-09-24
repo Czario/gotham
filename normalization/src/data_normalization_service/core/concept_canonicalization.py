@@ -103,6 +103,16 @@ for _cls in _EQUIVALENCE_CLASSES:
         _CANONICAL[_variant] = _canon
 
 
+def all_equivalence_classes():
+    """Return every equivalence class as a tuple (canonical concept first).
+
+    Public accessor for ``_EQUIVALENCE_CLASSES`` so consumers (e.g. the
+    canonical-concept migration script) can iterate the full mapping without
+    touching the private module variable.
+    """
+    return tuple(_EQUIVALENCE_CLASSES)
+
+
 def canonical_concept(concept: str) -> str:
     """Return the canonical concept name for an equivalence class.
 

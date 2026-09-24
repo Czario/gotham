@@ -193,6 +193,13 @@ class DuplicatePreventionManager:
         Returns:
             ObjectId if successful, None if insertion fails
         """
+        # Guard: abstract concepts are never inserted into the database
+        # Exception: custom: abstract concepts (grouping headers created by the hierarchy agent) ARE allowed
+        is_custom = concept_doc.concept.startswith("custom:")
+        if (concept_doc.concept.split(":")[-1].endswith("Abstract") or getattr(concept_doc, "abstract", False)) and not is_custom:
+            logger.warning(f"Refusing to insert abstract concept '{concept_doc.concept}' into database")
+            return None
+
         # SYNC BEHAVIOR: First check if this concept already exists.
         # For dimensional concepts, uniqueness must include the parent concept
         # relationship (concept_id). Reusing by member name alone (e.g.
