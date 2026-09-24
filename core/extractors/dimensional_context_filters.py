@@ -51,6 +51,19 @@ class DimensionalContextFilter:
         'srt:EliminationsMember',
         'us-gaap:IntersegmentEliminationMember',
         'us-gaap:IntersubsegmentEliminationsMember',
+
+        # Disclosure-only members that are not statement line-item breakdowns:
+        # derivative hedge instruments and AOCI-reclassification schedules.
+        # These are matched by EXACT member name (both the qualified qname and
+        # the local name), never by keyword, so the earlier substring/token
+        # false-positives (e.g. 'change' inside 'ForeignExchangeContractMember')
+        # are not reintroduced — only these specific members are dropped.
+        'us-gaap:ForeignExchangeContractMember',
+        'ForeignExchangeContractMember',
+        'us-gaap:InterestRateContractMember',
+        'InterestRateContractMember',
+        'us-gaap:ReclassificationOutOfAccumulatedOtherComprehensiveIncomeMember',
+        'ReclassificationOutOfAccumulatedOtherComprehensiveIncomeMember',
     }
     
     # Dimensional axes that often contain unwanted data

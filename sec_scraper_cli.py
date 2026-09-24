@@ -1309,6 +1309,29 @@ class SECDataScraperApp:
                     reload_filter['reporting_period.quarter'] = quarter_num
                 except (ValueError, AttributeError):
                     pass
+            if not self.target_fiscal_year and not self.target_fiscal_quarter:
+                # An UNSCOPED --reload must replace only THIS filing, not wipe
+                # every period of the form type.  Previously the filter was
+                # just {cik, form_type}, so each filing of a --reload run
+                # deleted the company's entire annual/quarterly value set and
+                # left only the last filing's data.
+                period_filter = self._reload_period_filter(filing, form_type)
+                if period_filter:
+                    reload_filter.update(period_filter)
+                elif accession_number:
+                    reload_filter['$or'] = [
+                        {'accession_number': accession_number},
+                        {'reporting_period.accession_number': accession_number},
+                    ]
+                else:
+                    period_date = filing.get('reportDate') or filing.get('filingDate')
+                    if not period_date:
+                        logger.warning(
+                            "Cannot safely reload %s: missing accession and period date",
+                            cik,
+                        )
+                        return None
+                    reload_filter['reporting_period.period_date'] = str(period_date)[:10]
 
         if form_type:
             reload_filter['form_type'] = form_type

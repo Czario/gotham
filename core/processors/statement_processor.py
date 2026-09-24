@@ -134,7 +134,7 @@ class EnhancedFinancialStatementProcessor:
         
         # Use FlexibleXBRLExtractor to extract financial statements
         try:
-            with FlexibleXBRLExtractor(enable_enhanced_dimensions=self.include_dimensions, company_info=enhanced_company_info, filing_form_type=filing_form_type) as extractor:
+            with FlexibleXBRLExtractor(enable_enhanced_dimensions=self.include_dimensions, company_info=enhanced_company_info, filing_form_type=filing_form_type, filing_date=filing_info.get('filingDate') or filing_info.get('reportDate')) as extractor:
                 financial_data = extractor.extract_financial_statements(url_to_use)
                 
                 if not financial_data:

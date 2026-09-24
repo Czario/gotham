@@ -18,6 +18,10 @@ from pathlib import Path
 # it is OFF for the whole suite; tests that exercise the agent path enable it
 # explicitly (monkeypatch) and inject a stub model.
 os.environ["HIERARCHY_AGENT_ENABLED"] = "0"
+# Guidance is enabled by default in tests regardless of the developer's .env
+# (load_dotenv does not override an already-set env var).
+os.environ["GUIDANCE_ENABLED"] = "1"
+os.environ["GUIDANCE_LLM_ENABLED"] = "1"
 
 # ---------------------------------------------------------------------------
 # Python path setup

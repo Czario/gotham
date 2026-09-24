@@ -206,33 +206,44 @@ class ConceptRepository:
         
         return result
 
-    def find_dimensional_existing(self, company_cik: str, statement_type: str, segment_type: str, concept: str, parent_concept_id: Optional[ObjectId] = None, context_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Find existing dimensional concept by company, statement, concept, parent concept ID, and optionally context ID."""
-        logger.debug(f"Querying dimensional concept: company_cik={company_cik}, statement_type={statement_type}, concept={concept}, parent_concept_id={parent_concept_id}, context_id={context_id}")
-        
-        # Build query to find dimensional concept
+    def find_dimensional_existing(self, company_cik: str, statement_type: str, segment_type: str, concept: str, parent_concept_id: Optional[ObjectId] = None, context_id: Optional[str] = None, dimension_signature: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Find an existing dimensional concept.
+
+        Identity is ``(cik, statement_type, parent concept, member, dimensional
+        slice)``.  ``context_id`` is deliberately NOT used: it is
+        filing-specific, so including it created a new row for the same member
+        on every filing (duplicate rows that then shared a path).
+        """
         query = {
             "cik": company_cik,
             "statement_type": statement_type,
             "concept": concept,
-            "dimension_concept": True
+            "dimension_concept": True,
         }
-        
-        # Add parent concept ID to ensure uniqueness per parent-child relationship
         if parent_concept_id:
             query["concept_id"] = parent_concept_id
-        
-        # Add context_id if provided for even more specific matching
-        # This helps identify the exact dimensional slice across related concepts
-        if context_id:
-            query["context_id"] = context_id
-        
+        if dimension_signature is not None:
+            query["dimension_signature"] = dimension_signature
+
         result = self.collection.find_one(query)
         if result:
-            logger.debug(f"Found existing dimensional concept: {concept} (segment_type: {result.get('segment_type')}, parent: {parent_concept_id}, context: {context_id})")
-        else:
-            logger.debug(f"Dimensional concept not found: company_cik={company_cik}, statement_type={statement_type}, concept={concept}, parent: {parent_concept_id}, context: {context_id}")
-        return result
+            return result
+
+        # Legacy rows written before dimension_signature existed: match on the
+        # parent+member identity only, so we REUSE (and stop creating new
+        # duplicates) rather than insert another row.
+        if dimension_signature is not None:
+            legacy_query = {
+                "cik": company_cik,
+                "statement_type": statement_type,
+                "concept": concept,
+                "dimension_concept": True,
+                "dimension_signature": {"$exists": False},
+            }
+            if parent_concept_id:
+                legacy_query["concept_id"] = parent_concept_id
+            return self.collection.find_one(legacy_query)
+        return None
 
     def find_by_concept_id(self, concept_id: ObjectId) -> Iterator[Dict[str, Any]]:
         """Find all dimensional concepts for a given concept_id."""

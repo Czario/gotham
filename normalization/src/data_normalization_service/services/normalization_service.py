@@ -18,7 +18,7 @@ from ..database import (
 )
 from ..core.config import AppConfig
 from ..core.concept_canonicalization import canonical_concept
-from ..core.row_identity import row_key_str
+from ..core.row_identity import row_key_str, dimension_signature as _dim_sig
 from ..core.logging_config import get_status_logger
 from ..utils.hierarchy import HierarchyManager
 from ..utils.progress import progress_wrapper, create_progress_bar
@@ -1099,25 +1099,34 @@ class FinancialNormalizationService:
             receipt["values_moved"] = moved_count
             receipt["duplicate_values_dropped"] = dropped
 
-        # 2) Re-parent the loser's dimensional children under the winner.
-        #    (Dimensional VALUES hang off the dimensional concept id, which is
-        #    unchanged, so they are not touched.)
-        child = concept_repo.collection.update_many(
-            {
-                "cik": cik,
-                "statement_type": statement_type,
-                "concept_id": loser["_id"],
-                "dimension_concept": True,
-            },
-            {
-                "$set": {
-                    "concept_id": winner_id,
-                    "parent_concept": to_concept,
-                    "parent_path": winner.get("path"),
-                }
-            },
-        )
-        receipt["dimensional_children_moved"] = getattr(child, "modified_count", 0)
+        # 2) Re-parent the loser's dimensional children under the winner, and
+        #    re-path them under the winner's path so they are not orphaned by
+        #    the loser row's deletion.  (Dimensional VALUES hang off the
+        #    dimensional concept id, which is unchanged, so they are not
+        #    touched.)
+        loser_path = str(loser.get("path") or "")
+        winner_path = str(winner.get("path") or "")
+        moved_children = 0
+        for child in concept_repo.collection.find({
+            "cik": cik,
+            "statement_type": statement_type,
+            "concept_id": loser["_id"],
+            "dimension_concept": True,
+        }):
+            fields = {
+                "concept_id": winner_id,
+                "parent_concept": to_concept,
+                "parent_path": winner_path or None,
+            }
+            child_path = str(child.get("path") or "")
+            if loser_path and winner_path and child_path.startswith(loser_path + "."):
+                new_path = winner_path + child_path[len(loser_path):]
+                fields["path"] = new_path
+                fields["hierarchy_level"] = len(new_path.split(".")) - 1
+                fields["level"] = fields["hierarchy_level"]
+            concept_repo.collection.update_one({"_id": child["_id"]}, {"$set": fields})
+            moved_children += 1
+        receipt["dimensional_children_moved"] = moved_children
 
         # 3) Decision store: members of the loser now resolve to the winner.
         receipt["alias_rows_repointed"] = self._repoint_concept_aliases(
@@ -1387,7 +1396,32 @@ class FinancialNormalizationService:
                     {'$set': {'accession_number': filing.accession_number}}
                 )
             else:
-                logger.debug(f"Value already exists for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}, skipping insertion")
+                # The DB keeps ONE value per concept per period by design.  If a
+                # second fact for the same period carries a materially different
+                # value (e.g. a beginning- vs end-of-period instant that mapped
+                # to the same period), say so loudly instead of dropping it
+                # silently.
+                existing_val = existing_value.get('value')
+                try:
+                    differs = existing_val is not None and abs(
+                        float(existing_val) - float(value)
+                    ) > max(abs(float(value)) * 1e-6, 1.0)
+                except (TypeError, ValueError):
+                    differs = existing_val != value
+                if differs:
+                    logger.warning(
+                        "Same-period value differs for concept %s (period %s): "
+                        "stored=%s new=%s (item period=%s) — keeping stored "
+                        "(one value per concept per period by design)",
+                        concept_id,
+                        clean_reporting_period.get('period_date', 'unknown'),
+                        existing_val, value, item.get('period'),
+                    )
+                else:
+                    logger.debug(
+                        f"Value already exists for concept {concept_id}, period "
+                        f"{clean_reporting_period.get('period_date', 'unknown')}, skipping insertion"
+                    )
             return existing_value['_id']
         
         # Extract metadata from metadata-only dimensional facts
@@ -2167,9 +2201,18 @@ class FinancialNormalizationService:
             logger.debug(f"Found dimensional concept in cache: {concept}")
             return self.concept_cache[cache_key]
         
-        # Always check database first for existing dimensional concept
-        context_id = dimension_data.get('context_id')
-        existing = concept_repo.find_dimensional_existing(company_cik, statement_type, segment_type, concept, concept_id, context_id)
+        # Always check database first for existing dimensional concept.
+        # Identity is (parent concept, member, dimensional slice) — NOT the
+        # filing-specific context_id, which previously created a NEW row for the
+        # same member under the same parent on every filing (duplicate rows that
+        # then shared a path).
+        _signature = _dim_sig(
+            dimension_data.get('dimensions'), dimension_data.get('dimension_details')
+        )
+        existing = concept_repo.find_dimensional_existing(
+            company_cik, statement_type, segment_type, concept, concept_id,
+            dimension_signature=_signature,
+        )
         if existing:
             dimensional_concept_id = existing['_id']
             logger.debug(f"Reusing existing dimensional concept: {concept} (ID: {dimensional_concept_id})")
@@ -2633,6 +2676,9 @@ class FinancialNormalizationService:
             parent_concept.get('concept') if parent_concept else None
         ) or dimension_data.get('concept_name')
         dimensional_concept_doc.parent_path = parent_concept_path or None
+        dimensional_concept_doc.dimension_signature = _dim_sig(
+            dimension_data.get('dimensions'), dimension_data.get('dimension_details')
+        )
         dimensional_concept_doc.row_key = row_key_str(
             {
                 "cik": company_cik,

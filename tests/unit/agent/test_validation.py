@@ -143,6 +143,18 @@ def test_duplicate_concept_is_medium():
     assert dup and dup[0].severity == MEDIUM and not dup[0].is_blocking
 
 
+def test_same_concept_different_periods_is_not_a_duplicate():
+    """Beginning/end-of-period balances (e.g. cash) are legitimate."""
+    items = [
+        _item("us-gaap:CashAndCashEquivalentsAtCarryingValue", 1, path="001", order_key="a",
+              period="2023-09-30 00:00:00 to 2023-09-30 00:00:00"),
+        _item("us-gaap:CashAndCashEquivalentsAtCarryingValue", 2, path="002", order_key="b",
+              period="2024-09-28 00:00:00 to 2024-09-28 00:00:00"),
+    ]
+    findings = check_structure(_bundle(items=items))
+    assert not [f for f in findings if f.type == "duplicate_concept"]
+
+
 def test_missing_hierarchy_path_is_medium():
     items = [_item("us-gaap:Revenues", 1, path=None, order_key=None)]
     findings = check_structure(_bundle(items=items))

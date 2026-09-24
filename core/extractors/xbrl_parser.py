@@ -96,10 +96,23 @@ class FinancialLineItem:
     calculations: Dict[str, Any] = field(default_factory=dict)  # Calculation relationships
     children: List['FinancialLineItem'] = field(default_factory=list)
 
+def _filing_date_from_accession(accession_number: str) -> Optional[str]:
+    """Approximate a filing date from an SEC accession number.
+
+    Accessions are ``{filer}-{YY}-{serial}``; the serial is NOT a date.  Returns
+    Jan 1 of the accession's year (the URL detector only needs pre/post-2019),
+    or ``None`` when the accession does not match.
+    """
+    match = re.search(r"-(\d{2})-\d{6}$", str(accession_number or ""))
+    if not match:
+        return None
+    return f"20{match.group(1)}-01-01"
+
+
 class FlexibleXBRLExtractor:
     """Enhanced XBRL extractor supporting multiple taxonomies and international standards"""
     
-    def __init__(self, taxonomy_preference: Optional[List[str]] = None, enable_enhanced_dimensions: bool = True, company_info: Optional[Dict] = None, filing_form_type: Optional[str] = None):
+    def __init__(self, taxonomy_preference: Optional[List[str]] = None, enable_enhanced_dimensions: bool = True, company_info: Optional[Dict] = None, filing_form_type: Optional[str] = None, filing_date: Optional[str] = None):
         """Initialize with taxonomy preference order and enhanced dimensional support"""
         
         # Initialize Arelle controller normally
@@ -133,6 +146,10 @@ class FlexibleXBRLExtractor:
 
         # Filing form type for period filtering (10-Q, 10-K, etc.)
         self.target_form_type = filing_form_type
+
+        # Authoritative filing date (YYYY-MM-DD) from the SEC submissions API.
+        # When absent the date is approximated from the accession number.
+        self.filing_date = filing_date
 
         # Cache for discovered taxonomies and concepts
         self.discovered_taxonomies = set()
@@ -196,15 +213,16 @@ class FlexibleXBRLExtractor:
                 logger.debug(f"Could not extract CIK or accession number from URL: {filing_url}")
                 return filing_url
             
-            # Extract filing date from accession number (YY-MMDDXX format)
-            date_match = re.search(r'\d{2}-(\d{6})', accession_number)
-            filing_date = None
-            if date_match:
-                date_part = date_match.group(1)
-                year = "20" + date_part[:2]
-                month = date_part[2:4]
-                day = date_part[4:6]
-                filing_date = f"{year}-{month}-{day}"
+            # Filing date: prefer the authoritative value from the SEC API.
+            # The accession is ``{filer}-{YY}-{serial}``; the serial is NOT a
+            # date.  A previous regex matched the CIK/accession boundary and
+            # produced a bogus year (e.g. 2000 for a 2020 filing), which sent
+            # modern filings down the legacy path and falsely reported
+            # "no XBRL".  Use the real date, or at worst Jan 1 of the
+            # accession's year (the detector only needs pre/post-2019).
+            filing_date = self.filing_date
+            if not filing_date:
+                filing_date = _filing_date_from_accession(accession_number)
             
             # Use SECURLDetector to find the optimal XBRL file
             logger.debug(f"Using SECURLDetector for CIK={cik}, Accession={accession_number}")
@@ -297,7 +315,19 @@ class FlexibleXBRLExtractor:
             used_url = optimal_url
             for attempt, candidate_url in enumerate(candidates_to_try):
                 logger.debug(f"Loading XBRL document (attempt {attempt + 1}/{len(candidates_to_try)}): {candidate_url}")
-                model = self.model_manager.load(candidate_url)
+                # Transient SEC failures (503/network) are common on long
+                # backfills; retry before abandoning a candidate.
+                model = None
+                for _retry in range(3):
+                    try:
+                        model = self.model_manager.load(candidate_url)
+                    except Exception as load_exc:  # noqa: BLE001
+                        logger.warning(f"   Arelle load error ({load_exc}) for {candidate_url}")
+                        model = None
+                    if model:
+                        break
+                    if _retry < 2:
+                        time.sleep(1.5 * (_retry + 1))
                 if not model:
                     logger.warning(f"   Arelle failed to load: {candidate_url}")
                     continue
@@ -1537,10 +1567,26 @@ class FlexibleXBRLExtractor:
             scored_facts.append((score, fact, duration_months))
         
         if not scored_facts:
-            logger.debug(f"No facts passed validation for {facts[0].qname if facts else 'unknown'} - falling back to first fact")
+            logger.debug(f"No facts passed validation for {facts[0].qname if facts else 'unknown'} - falling back to best undimensioned/latest fact")
             if facts and "DepreciationDepletionAndAmortization" in str(facts[0].qname):
-                logger.warning(f"FALLBACK for Depreciation: Using first fact with context {facts[0].contextID}")
-            return facts[0] if facts else None
+                logger.warning(f"FALLBACK for Depreciation: using fallback fact with context {facts[0].contextID}")
+            # Never fall back to an arbitrary fact: prefer the consolidated
+            # (undimensioned) fact, then the most recent period.  Picking
+            # ``facts[0]`` previously returned a dimensional member value
+            # (e.g. "Products" revenue) as the line item's total.
+            def _fallback_rank(f):
+                ctx = f.context
+                dims = getattr(ctx, "qnameDims", None)
+                has_dims = 1 if (dims is not None and len(dims) > 0) else 0
+                end = getattr(ctx, "endDatetime", None) or getattr(ctx, "instantDatetime", None)
+                try:
+                    ordinal = end.toordinal()
+                except Exception:
+                    ordinal = 0
+                # Prefer undimensioned (consolidated) facts, then the latest period.
+                return (0 if has_dims else 1, ordinal, str(getattr(f, "contextID", "")))
+
+            return max(facts, key=_fallback_rank) if facts else None
         
         # Log period filtering results for debugging
         best_fact_info = max(scored_facts, key=lambda x: x[0])

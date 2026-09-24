@@ -36,7 +36,13 @@ def _wire(service, mocker, *, loser, winner, values_moved=5, children_moved=0,
           deleted=1):
     concept_repo = Mock()
     concept_repo.find_existing.side_effect = [loser, winner]
-    concept_repo.collection.update_many.return_value = Mock(modified_count=children_moved)
+    # Dimensional children are iterated as documents now (they are re-pathed,
+    # not just re-parented with a bulk update).
+    concept_repo.collection.find.return_value = [
+        {"_id": ObjectId(), "concept": f"m{i}", "path": f"001.00{i + 1}",
+         "dimension_concept": True}
+        for i in range(children_moved)
+    ]
     concept_repo.collection.delete_one.return_value = Mock(deleted_count=deleted)
 
     value_repo = Mock()
@@ -100,7 +106,7 @@ def test_promotion_creates_the_winner_when_absent(mocker):
     concept_repo = Mock()
     # loser found, winner missing, winner found after creation
     concept_repo.find_existing.side_effect = [loser, None, winner]
-    concept_repo.collection.update_many.return_value = Mock(modified_count=0)
+    concept_repo.collection.find.return_value = []
     concept_repo.collection.delete_one.return_value = Mock(deleted_count=1)
     value_repo = Mock()
     value_repo.collection.update_many.return_value = Mock(modified_count=0)
@@ -194,3 +200,34 @@ def test_promotion_is_scoped_to_the_given_form_type(mocker):
 
     service._get_concept_repo_by_form_type.assert_called_with("10-Q")
     service._get_value_repo_by_form_type.assert_called_with("10-Q")
+
+
+def test_promotion_repaths_dimensional_children_under_the_winner(mocker):
+    """Children must be re-pathed, not just re-parented, or the loser row's
+    deletion orphans them (regression: capex merge left 002.005.00x orphans)."""
+    service = _service(mocker)
+    loser = {"_id": ObjectId(), "concept": OLD_TAG, "path": "002.005"}
+    winner = {"_id": ObjectId(), "concept": NEW_TAG, "path": "005.006"}
+    child = {"_id": ObjectId(), "concept": "aapl:RetailMember",
+             "path": "002.005.001", "dimension_concept": True}
+
+    concept_repo = Mock()
+    concept_repo.find_existing.side_effect = [loser, winner]
+    concept_repo.collection.find.return_value = [child]
+    concept_repo.collection.delete_one.return_value = Mock(deleted_count=1)
+    value_repo = Mock()
+    value_repo.collection.update_many.return_value = Mock(modified_count=0)
+    mocker.patch.object(service, "_get_concept_repo_by_form_type", return_value=concept_repo)
+    mocker.patch.object(service, "_get_value_repo_by_form_type", return_value=value_repo)
+    service._concept_alias_store = Mock()
+    service._concept_alias_store.promote.return_value = 0
+
+    receipt = service.promote_concept("0000320193", "cashflow", "10-K", OLD_TAG, NEW_TAG)
+
+    assert receipt["dimensional_children_moved"] == 1
+    update = concept_repo.collection.update_one.call_args
+    assert update[0][0] == {"_id": child["_id"]}
+    fields = update[0][1]["$set"]
+    assert fields["path"] == "005.006.001"
+    assert fields["parent_path"] == "005.006"
+    assert fields["concept_id"] == winner["_id"]

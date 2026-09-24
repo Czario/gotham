@@ -49,19 +49,26 @@ def check_structure(bundle: Any) -> list[Finding]:
             continue
         concept_names.append(concept)
 
-    # Same concept twice in one statement → the persistence mapping is keyed by
-    # concept name, so the second row's values would be dropped.
-    for concept, count in Counter(concept_names).items():
+    # Same concept twice in ONE period → the persistence mapping builds values
+    # per period, so the later row would be dropped.  A concept legitimately
+    # appears more than once across DIFFERENT periods (e.g. beginning- and
+    # end-of-period cash in a cash-flow statement), which is not a duplicate.
+    period_counts = Counter(
+        (item.get("concept"), item.get("period"))
+        for item in concepts
+        if item.get("concept")
+    )
+    for (concept, period), count in period_counts.items():
         if count > 1:
             findings.append(
                 Finding(
                     "duplicate_concept",
                     MEDIUM,
-                    f"{st}: concept '{concept}' appears {count} times in one statement "
-                    f"(later rows may not persist)",
+                    f"{st}: concept '{concept}' appears {count} times in the same "
+                    f"period '{period}' (later rows may not persist)",
                     statement_type=st,
                     concept=concept,
-                    evidence={"count": count},
+                    evidence={"count": count, "period": period},
                 )
             )
 

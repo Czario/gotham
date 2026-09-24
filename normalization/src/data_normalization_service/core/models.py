@@ -60,6 +60,11 @@ class ConceptDocument:
     fact_label: Optional[str] = None
     dimensions: Optional[Dict[str, Any]] = None
     dimension_details: Optional[Dict[str, Any]] = None
+    # Order-independent signature of the dimensional slice.  Part of the
+    # dimensional concept IDENTITY (parent + member + slice), so the same member
+    # under the same parent is reused instead of duplicated per filing
+    # (context_id is filing-specific and must not be part of the identity).
+    dimension_signature: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for MongoDB insertion."""
@@ -94,6 +99,7 @@ class ConceptDocument:
                 "fact_label": self.fact_label,
                 "dimensions": self.dimensions,
                 "dimension_details": self.dimension_details,
+                "dimension_signature": self.dimension_signature,
                 "parent_concept": self.parent_concept,
                 "parent_path": self.parent_path,
                 "row_key": self.row_key,

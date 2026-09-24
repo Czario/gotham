@@ -63,6 +63,27 @@ class SECURLDetector:
             'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive'
         })
+        # Retry transient SEC failures (503 Service Unavailable, 429 rate limit,
+        # 5xx).  Previously a single 503 could make a filing look like it had no
+        # XBRL, and the company-mode pipeline never retries a filing.
+        try:
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+
+            _retry = Retry(
+                total=4,
+                connect=4,
+                read=4,
+                backoff_factor=0.5,
+                status_forcelist=(429, 500, 502, 503, 504),
+                allowed_methods=frozenset(["GET", "HEAD"]),
+                respect_retry_after_header=True,
+            )
+            _adapter = HTTPAdapter(max_retries=_retry)
+            self.session.mount("https://", _adapter)
+            self.session.mount("http://", _adapter)
+        except Exception:  # noqa: BLE001 — retries are best-effort
+            pass
     
     def detect_filing_urls(self, cik: str, accession_number: str, filing_date: str) -> Dict[str, Union[str, bool, None]]:
         """

@@ -28,7 +28,10 @@ class TestTokenizer:
 
 
 class TestKeywordMatching:
-    # Names that must NOT be excluded (previously false-positives)
+    # Names that must NOT be matched by the KEYWORD matcher (previously
+    # false-positives from substrings like 'change'/'life').  Note: some of these
+    # (e.g. ForeignExchangeContractMember) ARE excluded, but by the explicit
+    # EXCLUDED_MEMBERS set — never by a broad keyword.
     @pytest.mark.parametrize("name", [
         "us-gaap:ForeignExchangeContractMember",
         "us-gaap:ExchangeTradedMember",
@@ -56,7 +59,7 @@ class TestKeywordMatching:
 
 
 class TestShouldExcludeMainFact:
-    def test_foreign_exchange_main_fact_kept(self):
+    def test_foreign_exchange_main_fact_excluded(self):
         fact = {
             "concept": "us-gaap:DerivativeFairValue",
             "dimensions": [
@@ -65,7 +68,7 @@ class TestShouldExcludeMainFact:
                  "label": "Foreign Exchange Contract"}
             ],
         }
-        assert F.should_exclude_main_fact(fact) is False
+        assert F.should_exclude_main_fact(fact) is True
 
     def test_forecast_main_fact_excluded(self):
         fact = {
@@ -80,7 +83,7 @@ class TestShouldExcludeMainFact:
 
 
 class TestShouldExcludeDimensionalFact:
-    def test_exchange_dimensional_fact_kept(self):
+    def test_exchange_dimensional_fact_excluded(self):
         df = {
             "dimensions": {"DerivativeInstrumentAxis": "ForeignExchangeContractMember"},
             "dimension_details": {
@@ -89,7 +92,28 @@ class TestShouldExcludeDimensionalFact:
                 }
             },
         }
-        assert F.should_exclude_dimensional_fact(df) is False
+        assert F.should_exclude_dimensional_fact(df) is True
+
+    def test_interest_rate_contract_member_excluded(self):
+        df = {
+            "dimensions": {"DerivativeInstrumentAxis": "us-gaap:InterestRateContractMember"},
+            "dimension_details": {
+                "DerivativeInstrumentAxis": {
+                    "member_qname": "us-gaap:InterestRateContractMember",
+                    "member_label": "Interest Rate Contract Member",
+                }
+            },
+        }
+        assert F.should_exclude_dimensional_fact(df) is True
+
+    def test_aoci_reclassification_member_excluded(self):
+        df = {
+            "dimensions": {
+                "StatementEquityComponentsAxis":
+                    "us-gaap:ReclassificationOutOfAccumulatedOtherComprehensiveIncomeMember"
+            },
+        }
+        assert F.should_exclude_dimensional_fact(df) is True
 
     def test_forecast_dimensional_fact_excluded_by_label(self):
         df = {

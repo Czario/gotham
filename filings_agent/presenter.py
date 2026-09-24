@@ -26,6 +26,7 @@ NODE_LABELS: dict[str, str] = {
     "validate_node": "validate",
     "agent_review_node": "review",
     "repair_node": "repair",
+    "hierarchy_agent_node": "hierarchy",
     "resolve_hierarchy_node": "hierarchy",
     "hierarchy_review_node": "hierarchy review",
     "concept_resolve_node": "concepts",
@@ -46,6 +47,7 @@ STEP_LABELS: dict[str, str] = {
     "validate_node": "validate",
     "agent_review_node": "review",
     "repair_node": "repair",
+    "hierarchy_agent_node": "hierarchy",
     "resolve_hierarchy_node": "hierarchy",
     "hierarchy_review_node": "hierarchy review",
     "concept_resolve_node": "concepts",
@@ -63,7 +65,7 @@ STEP_LABELS: dict[str, str] = {
 # Filing-scoped stages shown in the "✓a → ✓b → ▶c" progress line.
 _FILING_STAGES = {
     "normalize_bundle_node", "validate_node", "agent_review_node", "repair_node",
-    "resolve_hierarchy_node", "hierarchy_review_node", "concept_resolve_node",
+    "hierarchy_agent_node",
     "validate_after_repair_node", "validate_final_node",
     "decide_node", "persist_node", "extract_guidance_node", "save_guidance_node",
 }
@@ -193,6 +195,20 @@ def format_step_line(node_name: str, state: dict) -> Optional[str]:
             lines[0] = f"{_prefix('repair')}nothing to repair"
         return "\n".join(lines)
 
+    if node_name == "hierarchy_agent_node":
+        plan = state.get("hierarchy_plan") or {}
+        seeded = plan.get("seeded_statement_types") or []
+        updates = plan.get("existing_updates") or []
+        line = (
+            f"{_prefix('hierarchy')}{plan.get('resolved_concepts', 0)} concept(s) decided"
+            f"  ·  by {plan.get('decided_by') or 'agent'}"
+        )
+        extra = []
+        if seeded:
+            extra.append(f"  │  seeded hierarchy for: {', '.join(seeded)}")
+        if updates:
+            extra.append(f"  │  re-pathed {len(updates)} existing row(s)")
+        return line + ("\n" + "\n".join(extra) if extra else "")
     if node_name == "resolve_hierarchy_node":
         plan = state.get("hierarchy_plan") or {}
         seeded = plan.get("seeded_statement_types") or []
@@ -555,6 +571,16 @@ class StepPresenter:
             applied = actions.get("applied", 0)
             return f"applied {applied}/{proposed}", ok
 
+        if node_name == "hierarchy_agent_node":
+            plan = state.get("hierarchy_plan") or {}
+            bits = [f"{_plural(int(plan.get('resolved_concepts', 0) or 0), 'concept')} placed"]
+            if plan.get("seeded_statement_types"):
+                bits.append("seeded")
+            bits.append(f"by {plan.get('decided_by') or 'agent'}")
+            repathed = len(plan.get("existing_updates") or [])
+            if repathed:
+                bits.append(f"{_plural(repathed, 'row')} re-pathed")
+            return "  ·  ".join(bits), ok
         if node_name == "resolve_hierarchy_node":
             plan = state.get("hierarchy_plan") or {}
             sources = plan.get("sources") or {}

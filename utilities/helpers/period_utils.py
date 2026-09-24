@@ -41,7 +41,14 @@ class PeriodConfig:
     
     # Tolerance settings - STRICT MODE: Only exact 3-month periods allowed
     DEFAULT_DURATION_TOLERANCE = 0.1  # Very strict tolerance (0.1 months = ~3 days)
-    QUARTERLY_STRICT_TOLERANCE = 0.05  # Ultra strict for quarterly (0.05 months = ~1.5 days)
+    # Tolerance for a "quarterly" duration.  A 13-week quarter is ~2.99 months
+    # and a 14-week quarter (Apple and most retailers) is ~3.22 months, so a
+    # day-tight tolerance (0.05) rejected every 14-week quarter.  That made
+    # ``_select_best_primary_fact`` fall back to an arbitrary fact — e.g. the
+    # dimensional "Products" revenue (96.4B) instead of total net sales
+    # (117.2B).  0.35 months (~10.6 days) accepts 14-week quarters while still
+    # rejecting cumulative 6/9/12-month periods.
+    QUARTERLY_STRICT_TOLERANCE = 0.35
     ANNUAL_DURATION_TOLERANCE = 1.0
     DATE_TOLERANCE_DAYS = 7
     FISCAL_YEAR_TOLERANCE_DAYS = 7
