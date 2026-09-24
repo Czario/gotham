@@ -1,0 +1,547 @@
+"""LLM factory — returns either an Ollama, Groq, Gemini, or DeepSeek client.
+
+Provider is selected via the ``LLM_PROVIDER`` env var (``"ollama"`` default,
+``"groq"``, ``"gemini"``, or ``"deepseek"``). Call sites use a uniform interface::
+
+    from filings_agent.llm import build_llm
+    llm = build_llm(format_json=True)
+    response: str = llm.invoke(prompt)
+
+Both backends are wrapped so ``llm.invoke(str) -> str`` works identically.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import threading
+import time
+from collections import deque
+from typing import Any
+
+from filings_agent.config import (
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_REQUEST_TIMEOUT,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GEMINI_REQUEST_TIMEOUT,
+    GROQ_API_KEY,
+    GROQ_BASE_URL,
+    GROQ_MODEL,
+    GROQ_REQUEST_TIMEOUT,
+    GROQ_RPM,
+    GROQ_TPM,
+    LLM_CACHE_DIR,
+    LLM_CACHE_ENABLED,
+    LLM_PROVIDER,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
+    OLLAMA_NUM_CTX,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class _GroqRateLimiter:
+    """Thread-safe sliding-window rate limiter for Groq API (RPM + TPM budgets).
+
+    Enforces two independent 60-second sliding-window budgets:
+    * ``rpm`` — maximum requests per minute.
+    * ``tpm`` — maximum tokens per minute (input + output combined).
+
+    Call :meth:`acquire` *before* each request.  It blocks until both budgets
+    allow the request through, then records the reservation.  After the API
+    returns the real token count, call :meth:`update_actual` so the running
+    token total stays accurate for subsequent requests.
+    """
+
+    _WINDOW: float = 60.0  # sliding window in seconds
+
+    def __init__(self, rpm: int, tpm: int) -> None:
+        self._rpm = rpm
+        self._tpm = tpm
+        self._lock = threading.Lock()
+        self._req_times: deque[float] = deque()      # request timestamps
+        self._tok_log: list[list] = []               # mutable [timestamp, token_count] pairs
+
+    def _expire(self, now: float) -> None:
+        """Drop entries older than the sliding window."""
+        cutoff = now - self._WINDOW
+        while self._req_times and self._req_times[0] < cutoff:
+            self._req_times.popleft()
+        self._tok_log = [e for e in self._tok_log if e[0] >= cutoff]
+
+    def acquire(self, estimated_tokens: int) -> list:
+        """Block until the RPM and TPM budgets allow a new request.
+
+        Returns a mutable ``[timestamp, token_count]`` entry that can be
+        corrected later via :meth:`update_actual`.
+        """
+        entry: list = [0.0, estimated_tokens]
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._expire(now)
+                current_rpm = len(self._req_times)
+                current_tpm = sum(e[1] for e in self._tok_log)
+                rpm_ok = current_rpm < self._rpm
+                tpm_ok = current_tpm + estimated_tokens <= self._tpm
+                if rpm_ok and tpm_ok:
+                    entry[0] = now
+                    self._req_times.append(now)
+                    self._tok_log.append(entry)
+                    return entry
+                # Calculate minimum sleep to free up budget
+                wait = 0.1
+                if not rpm_ok and self._req_times:
+                    wait = max(wait, self._WINDOW - (now - self._req_times[0]) + 0.1)
+                if not tpm_ok:
+                    need = current_tpm + estimated_tokens - self._tpm
+                    drained = 0
+                    for e in self._tok_log:
+                        drained += e[1]
+                        if drained >= need:
+                            wait = max(wait, self._WINDOW - (now - e[0]) + 0.1)
+                            break
+                logger.info(
+                    "Groq rate limit: waiting %.1fs "
+                    "(window=%d req/%d tok, budget=%d rpm/%d tpm)",
+                    wait, current_rpm, current_tpm, self._rpm, self._tpm,
+                )
+            time.sleep(wait)
+
+    def update_actual(self, entry: list, actual_tokens: int) -> None:
+        """Replace the estimated token count in *entry* with the real API count."""
+        with self._lock:
+            entry[1] = actual_tokens
+
+
+# Module-level singleton — shared across all _GroqInvokeAdapter instances so
+# concurrent calls from parallel ticker workers respect the same budget.
+_groq_rate_limiter = _GroqRateLimiter(rpm=GROQ_RPM, tpm=GROQ_TPM)
+
+
+# One diskcache handle per directory, shared by every _CachedLLM instance.  The
+# agent loop calls build_chat_llm() once per filing *per node*, so opening a
+# fresh SQLite-backed Cache on each call would leak handles and invite
+# "database is locked" errors once filings run concurrently.
+_cache_pool: dict[str, Any] = {}
+_cache_pool_lock = threading.Lock()
+
+
+def _get_cache(cache_dir: str) -> Any:
+    """Return the process-wide disk cache for *cache_dir*, opening it once."""
+    import diskcache  # imported lazily so non-dev envs need not install it
+
+    with _cache_pool_lock:
+        cache = _cache_pool.get(cache_dir)
+        if cache is None:
+            cache = diskcache.Cache(cache_dir)
+            _cache_pool[cache_dir] = cache
+        return cache
+
+
+class _CachedLLM:
+    """Transparent disk-cache wrapper for any LLM exposing an ``invoke()`` method.
+
+    Handles both call styles used in this repo:
+
+    * text models — ``build_llm`` → ``invoke("prompt")`` → ``str``;
+    * tool-calling chat models — ``build_chat_llm`` → ``bind_tools(...)`` →
+      ``invoke([messages])`` → ``AIMessage``.  :meth:`bind_tools` returns
+      another ``_CachedLLM`` around the bound model so the agent loop keeps
+      caching, and any other attribute (``with_structured_output``, …) is
+      delegated to the wrapped model by ``__getattr__``.
+
+    Responses are cached to ``LLM_CACHE_DIR`` (default ``.llm_cache/``) keyed
+    by ``sha256("{provider}:{model}\n{prompt}")``.  The cache persists across
+    runs and is never invalidated automatically — delete the directory to reset.
+
+    This is a **development tool** only.  Never enable in production
+    (``LLM_CACHE`` env var must be explicitly set to ``1`` / ``true``).
+    """
+
+    def __init__(self, llm: Any, model_tag: str, cache_dir: str) -> None:
+        self._llm = llm
+        self._model_tag = model_tag
+        self._cache_dir = cache_dir
+        self._cache = _get_cache(cache_dir)
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate anything we do not cache (with_structured_output, streaming,
+        # …) to the wrapped model.  Underscore names raise instead of delegating
+        # so a missing private attribute can never recurse into __getattr__.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._llm, name)
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> "_CachedLLM":
+        """Bind a toolset, keeping the cache in front of the bound model."""
+        return _CachedLLM(
+            self._llm.bind_tools(tools, **kwargs), self._model_tag, self._cache_dir
+        )
+
+    def _cache_key(self, prompt: Any) -> str:
+        payload = f"{self._model_tag}\n{prompt}"
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+    def invoke(self, prompt: Any) -> Any:
+        key = self._cache_key(prompt)
+        if key in self._cache:
+            logger.debug("LLM cache HIT  [%s] key=%s", self._model_tag, key[:12])
+            return self._cache[key]
+        logger.debug("LLM cache MISS [%s] key=%s", self._model_tag, key[:12])
+        response = self._llm.invoke(prompt)
+        self._cache[key] = response
+        return response
+
+
+class _GroqInvokeAdapter:
+    """Groq adapter with rate limiting and token-usage logging."""
+
+    def __init__(self, chat_model: Any) -> None:
+        self._chat = chat_model
+
+    def invoke(self, prompt: str) -> str:
+        # Estimate token cost: chars→tokens (÷4) plus a conservative output budget.
+        # The real count corrects the reservation once the API responds.
+        estimated_tokens = len(prompt) // 4 + 800
+        token_entry = _groq_rate_limiter.acquire(estimated_tokens)
+        _t0 = time.perf_counter()
+        try:
+            msg = self._chat.invoke(prompt)
+        except Exception:
+            # Release the reservation on error so the budget isn't permanently consumed.
+            _groq_rate_limiter.update_actual(token_entry, 0)
+            raise
+        _elapsed = time.perf_counter() - _t0
+        # Log and correct token budget with actual usage.
+        usage = getattr(msg, "response_metadata", {}).get("token_usage") or {}
+        if usage:
+            logger.debug(
+                "groq tokens — prompt: %s  completion: %s  total: %s  (%.1fs)",
+                usage.get("prompt_tokens", "?"),
+                usage.get("completion_tokens", "?"),
+                usage.get("total_tokens", "?"),
+                _elapsed,
+            )
+            actual_tokens = usage.get("total_tokens", estimated_tokens)
+            _groq_rate_limiter.update_actual(token_entry, actual_tokens)
+        else:
+            logger.debug("groq invoke took %.1fs", _elapsed)
+        content = getattr(msg, "content", msg)
+        return content if isinstance(content, str) else str(content)
+
+
+class _OpenAIInvokeAdapter:
+    """Simple pass-through adapter for OpenAI-compatible APIs (DeepSeek, etc.).
+
+    Unlike _GroqInvokeAdapter, this adapter does NOT apply rate limiting —
+    cloud providers handle their own rate limiting, and this adapter should
+    never block on a rate-limit semaphore designed for a different provider.
+    """
+
+    def __init__(self, chat_model: Any) -> None:
+        self._chat = chat_model
+
+    def invoke(self, prompt: str) -> str:
+        _t0 = time.perf_counter()
+        msg = self._chat.invoke(prompt)
+        _elapsed = time.perf_counter() - _t0
+        content = getattr(msg, "content", msg)
+        if usage := getattr(msg, "response_metadata", {}).get("token_usage"):
+            logger.debug(
+                "openai tokens — prompt: %s  completion: %s  total: %s  (%.1fs)",
+                usage.get("prompt_tokens", "?"),
+                usage.get("completion_tokens", "?"),
+                usage.get("total_tokens", "?"),
+                _elapsed,
+            )
+        else:
+            logger.debug("openai invoke took %.1fs", _elapsed)
+        return content if isinstance(content, str) else str(content)
+
+
+class _GeminiInvokeAdapter:
+    """Gemini adapter built on the official ``google-genai`` SDK.
+
+    Wraps ``client.models.generate_content`` so that ``invoke(str) -> str``
+    matches the uniform interface used by the rest of the pipeline. JSON mode
+    is requested via ``response_mime_type="application/json"``; the expected
+    schema (when provided) is embedded in the prompt by the caller, mirroring
+    the Groq adapter's behaviour.
+    """
+
+    def __init__(self, client: Any, model: str, config: Any) -> None:
+        self._client = client
+        self._model = model
+        self._config = config
+
+    def invoke(self, prompt: str) -> str:
+        _t0 = time.perf_counter()
+        response = self._client.models.generate_content(
+            model=self._model,
+            contents=prompt,
+            config=self._config,
+        )
+        _elapsed = time.perf_counter() - _t0
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None:
+            logger.debug(
+                "gemini tokens — prompt: %s  candidates: %s  total: %s  (%.1fs)",
+                getattr(usage, "prompt_token_count", "?"),
+                getattr(usage, "candidates_token_count", "?"),
+                getattr(usage, "total_token_count", "?"),
+                _elapsed,
+            )
+        else:
+            logger.debug("gemini invoke took %.1fs", _elapsed)
+        text = getattr(response, "text", None)
+        return text if isinstance(text, str) else str(text)
+
+
+def build_llm(
+    *,
+    format_json: bool = False,
+    json_schema: dict | None = None,
+    request_timeout: float | None = None,
+    max_retries: int = 2,
+    provider: str | None = None,
+    model: str | None = None,
+) -> Any:
+    """Build an LLM client for the configured provider.
+
+    Args:
+        format_json: When True, instruct the backend to return strict JSON.
+            For Ollama this sets ``format="json"``; for Groq this enables
+            ``response_format={"type": "json_object"}``.
+        json_schema: Optional JSON Schema dict describing the expected output shape.
+            For Ollama, enforces the exact output structure at the model level
+            (passed as ``format=<schema>``). For Groq (llama-4-scout), falls back
+            to ``json_object`` mode — scout does not support strict schema
+            enforcement at the API level; the schema is embedded in the prompt.
+            When provided, takes precedence over ``format_json``.
+        request_timeout: Per-request HTTP timeout in seconds. Falls back to
+            sensible per-provider defaults when None.
+        max_retries: How many times ChatOpenAI-backed providers (groq/deepseek)
+            retry a failed/timed-out request.  The LangChain default of 2 means
+            a hung request rides out ``timeout × 3`` — a multi-minute stall
+            (observed live: a 120s derive call taking 5m01s).  Callers that own
+            their own retry loop (e.g. the derivation pass) pass 0 so the stall
+            is bounded by a single timeout.
+        provider: Explicit provider override (``"ollama"``, ``"groq"`` or
+            ``"gemini"``). When given, takes precedence over the
+            ``LLM_PROVIDER`` env var. Used by the extraction node to escalate
+            to a cloud provider on retry attempts.
+        model: Explicit model override for the effective provider (e.g. the
+            section indexer routing to a fast model).  When None, the
+            provider's configured default model is used.
+    """
+    effective_provider = (provider or LLM_PROVIDER).strip().lower()
+    if effective_provider == "groq":
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "LLM_PROVIDER=groq requires the langchain-openai package. "
+                "Install it with: uv add langchain-openai"
+            ) from exc
+        if not GROQ_API_KEY:
+            raise ValueError("LLM_PROVIDER=groq but GROQ_API_KEY is not set")
+        kwargs: dict[str, Any] = {
+            "model": model or GROQ_MODEL,
+            "temperature": 0,
+            "api_key": GROQ_API_KEY,
+            "base_url": GROQ_BASE_URL,
+            "timeout": request_timeout if request_timeout is not None else GROQ_REQUEST_TIMEOUT,
+            "max_retries": max_retries,
+        }
+        if json_schema is not None or format_json:
+            # llama-4-scout supports json_object but not strict json_schema mode.
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        llm: Any = _GroqInvokeAdapter(ChatOpenAI(**kwargs))
+        if LLM_CACHE_ENABLED:
+            llm = _CachedLLM(llm, f"groq:{GROQ_MODEL}", LLM_CACHE_DIR)
+        return llm
+
+    if effective_provider == "deepseek":
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "LLM_PROVIDER=deepseek requires the langchain-openai package. "
+                "Install it with: uv add langchain-openai"
+            ) from exc
+        if not DEEPSEEK_API_KEY:
+            raise ValueError("LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY is not set")
+        kwargs = {
+            "model": model or DEEPSEEK_MODEL,
+            "temperature": 0,
+            "api_key": DEEPSEEK_API_KEY,
+            "base_url": DEEPSEEK_BASE_URL,
+            "timeout": request_timeout if request_timeout is not None else DEEPSEEK_REQUEST_TIMEOUT,
+            "max_retries": max_retries,
+        }
+        if json_schema is not None or format_json:
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        llm = _OpenAIInvokeAdapter(ChatOpenAI(**kwargs))
+        if LLM_CACHE_ENABLED:
+            llm = _CachedLLM(llm, f"deepseek:{DEEPSEEK_MODEL}", LLM_CACHE_DIR)
+        return llm
+
+    if effective_provider == "gemini":
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "LLM_PROVIDER=gemini requires the google-genai package. "
+                "Install it with: uv add google-genai"
+            ) from exc
+        if not GEMINI_API_KEY:
+            raise ValueError("LLM_PROVIDER=gemini but GEMINI_API_KEY is not set")
+        timeout_s = (
+            request_timeout if request_timeout is not None else GEMINI_REQUEST_TIMEOUT
+        )
+        client = genai.Client(
+            api_key=GEMINI_API_KEY,
+            # google-genai expects the HTTP timeout in milliseconds.
+            http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
+        )
+        effective_model = model or GEMINI_MODEL
+        config_kwargs: dict[str, Any] = {"temperature": 0}
+        if json_schema is not None or format_json:
+            # gemini-2.5 supports native JSON mode. The schema (when present) is
+            # embedded in the prompt by the caller, mirroring the Groq adapter.
+            config_kwargs["response_mime_type"] = "application/json"
+        gen_config = types.GenerateContentConfig(**config_kwargs)
+        llm = _GeminiInvokeAdapter(client, effective_model, gen_config)
+        if LLM_CACHE_ENABLED:
+            llm = _CachedLLM(llm, f"gemini:{GEMINI_MODEL}", LLM_CACHE_DIR)
+        return llm
+
+    # Default: Ollama
+    from langchain_ollama import OllamaLLM
+
+    kwargs = {
+        "base_url": OLLAMA_BASE_URL,
+        "model": model or OLLAMA_MODEL,
+        "temperature": 0,
+        "num_ctx": OLLAMA_NUM_CTX,
+    }
+    if json_schema is not None:
+        kwargs["format"] = json_schema  # strict schema enforcement at model level
+    elif format_json:
+        kwargs["format"] = "json"
+    if request_timeout is not None:
+        kwargs["client_kwargs"] = {"timeout": request_timeout}
+    llm = OllamaLLM(**kwargs)
+    if LLM_CACHE_ENABLED:
+        llm = _CachedLLM(llm, f"ollama:{OLLAMA_MODEL}", LLM_CACHE_DIR)
+    return llm
+
+
+def _configured_chat_retries() -> int:
+    """Chat-model retry count, read at call time.
+
+    Read off the config module rather than bound at import so a test (or an
+    operator reloading config) can change it without reimporting this module.
+    """
+    from filings_agent import config
+
+    try:
+        return int(getattr(config, "LLM_CHAT_MAX_RETRIES", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def build_chat_llm(
+    *,
+    request_timeout: float | None = None,
+    provider: str | None = None,
+    max_retries: int | None = None,
+) -> Any:
+    """Build a chat model capable of tool calling (``.bind_tools()``).
+
+    Returns a LangChain chat model that supports the tool-calling interface
+    used by the agent-based extraction path.  Unlike :func:`build_llm`, the
+    returned object is a raw chat model (``ChatOpenAI``, ``ChatOllama``,
+    etc.) — not wrapped in a string-in/string-out adapter.
+
+    ``max_retries`` bounds provider retries.  It defaults to
+    ``LLM_CHAT_MAX_RETRIES`` (1), because the hierarchy agent is authoritative
+    and the failure policy blocks the filing: a single unretried timeout costs a
+    whole filing.  The LangChain default of 2 is deliberately not used — it lets
+    a hung request ride out ``timeout × 3`` (DeepSeek: 120s × 3 = 6 min) inside a
+    single agent step, observed live as 30–136s steps.  Set
+    ``LLM_CHAT_MAX_RETRIES=0`` for a hard single-timeout bound.
+
+    Gemini uses the native ``google-genai`` SDK which does not expose a
+    LangChain-compatible chat model.  Agent extraction falls back to
+    simple text mode when Gemini is the configured provider.
+    """
+    effective_provider = (provider or LLM_PROVIDER).strip().lower()
+    retries = _configured_chat_retries() if max_retries is None else max_retries
+
+    if effective_provider in ("groq", "deepseek"):
+        try:
+            from langchain_openai import ChatOpenAI
+        except ImportError as exc:
+            raise ImportError(
+                f"LLM_PROVIDER={effective_provider} requires langchain-openai."
+            ) from exc
+
+        if effective_provider == "groq":
+            if not GROQ_API_KEY:
+                raise ValueError("LLM_PROVIDER=groq but GROQ_API_KEY is not set")
+            model = GROQ_MODEL
+            base_url = GROQ_BASE_URL
+            api_key = GROQ_API_KEY
+            timeout = (
+                request_timeout if request_timeout is not None
+                else GROQ_REQUEST_TIMEOUT
+            )
+        else:
+            if not DEEPSEEK_API_KEY:
+                raise ValueError("LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY is not set")
+            model = DEEPSEEK_MODEL
+            base_url = DEEPSEEK_BASE_URL
+            api_key = DEEPSEEK_API_KEY
+            timeout = (
+                request_timeout if request_timeout is not None
+                else DEEPSEEK_REQUEST_TIMEOUT
+            )
+
+        chat = ChatOpenAI(
+            model=model,
+            temperature=0,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            max_retries=retries,
+        )
+        if LLM_CACHE_ENABLED:
+            chat = _CachedLLM(chat, f"{effective_provider}:{model}", LLM_CACHE_DIR)
+        return chat
+
+    if effective_provider == "gemini":
+        # google-genai does not expose a LangChain chat model.  Agent
+        # extraction is not available with Gemini — switch to groq/deepseek/ollama.
+        raise ValueError(
+            "Agent pipeline is not available with the Gemini provider. "
+            "Switch to groq, deepseek, or ollama."
+        )
+
+    # Ollama (default)
+    from langchain_ollama import ChatOllama
+
+    chat = ChatOllama(
+        base_url=OLLAMA_BASE_URL,
+        model=OLLAMA_MODEL,
+        temperature=0,
+        num_ctx=OLLAMA_NUM_CTX,
+    )
+    if LLM_CACHE_ENABLED:
+        chat = _CachedLLM(chat, f"ollama:{OLLAMA_MODEL}", LLM_CACHE_DIR)
+    return chat

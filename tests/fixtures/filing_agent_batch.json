@@ -1,0 +1,232 @@
+[
+  {
+    "cik": "0000000001",
+    "ticker": "SMOKE",
+    "company_name": "Filings Agent Smoke Test Co.",
+    "form_type": "10-K",
+    "accession_number": "0000000001-25-000001",
+    "filing_doc": {
+      "form_type": "10-K",
+      "accession_number": "0000000001-25-000001"
+    },
+    "company_doc": {
+      "cik": "0000000001",
+      "name": "Filings Agent Smoke Test Co."
+    },
+    "statement_docs": [
+      {
+        "cik": "0000000001",
+        "statement_type": "income",
+        "reporting_period": {
+          "end_date": "2025-12-31",
+          "fiscal_year": 2025
+        },
+        "data": [
+          {
+            "concept": "us-gaap:IncomeStatementAbstract",
+            "label": "Income Statement",
+            "value": null,
+            "period": "2025-01-01 00:00:00 to 2025-12-31 00:00:00",
+            "level": 0,
+            "order": 0,
+            "abstract": true
+          },
+          {
+            "concept": "us-gaap:Revenues",
+            "label": "Revenue",
+            "value": 1000000.0,
+            "period": "2025-01-01 00:00:00 to 2025-12-31 00:00:00",
+            "level": 1,
+            "order": 1,
+            "abstract": false,
+            "fact_id": "fact-revenue",
+            "decimals": "-3",
+            "unit": "USD"
+          },
+          {
+            "concept": "us-gaap:CostOfRevenue",
+            "label": "Cost of revenue",
+            "value": 400000.0,
+            "period": "2025-01-01 00:00:00 to 2025-12-31 00:00:00",
+            "level": 1,
+            "order": 2,
+            "abstract": false,
+            "fact_id": "fact-cor",
+            "decimals": "-3",
+            "unit": "USD"
+          },
+          {
+            "concept": "us-gaap:GrossProfit",
+            "label": "Gross profit",
+            "value": 600000.0,
+            "period": "2025-01-01 00:00:00 to 2025-12-31 00:00:00",
+            "level": 1,
+            "order": 3,
+            "abstract": false,
+            "fact_id": "fact-gp",
+            "decimals": "-3",
+            "unit": "USD"
+          }
+        ]
+      },
+      {
+        "cik": "0000000001",
+        "statement_type": "balancesheet",
+        "reporting_period": {
+          "end_date": "2025-12-31",
+          "fiscal_year": 2025
+        },
+        "data": [
+          {
+            "concept": "us-gaap:StatementOfFinancialPositionAbstract",
+            "label": "Balance Sheet",
+            "value": null,
+            "period": "2025-12-31",
+            "level": 0,
+            "order": 0,
+            "abstract": true
+          },
+          {
+            "concept": "us-gaap:Assets",
+            "label": "Total assets",
+            "value": 5000000.0,
+            "period": "2025-12-31",
+            "level": 1,
+            "order": 1,
+            "abstract": false,
+            "fact_id": "fact-assets",
+            "decimals": "-3",
+            "unit": "USD"
+          },
+          {
+            "concept": "us-gaap:Liabilities",
+            "label": "Total liabilities",
+            "value": 2000000.0,
+            "period": "2025-12-31",
+            "level": 1,
+            "order": 2,
+            "abstract": false,
+            "fact_id": "fact-liab",
+            "decimals": "-3",
+            "unit": "USD"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "cik": "0000000001",
+    "ticker": "SMOKE",
+    "company_name": "Filings Agent Smoke Test Co.",
+    "form_type": "10-K",
+    "accession_number": "0000000001-24-000001",
+    "filing_doc": {
+      "form_type": "10-K",
+      "accession_number": "0000000001-24-000001"
+    },
+    "company_doc": {
+      "cik": "0000000001",
+      "name": "Filings Agent Smoke Test Co."
+    },
+    "statement_docs": [
+      {
+        "cik": "0000000001",
+        "statement_type": "income",
+        "reporting_period": {
+          "end_date": "2024-12-31",
+          "fiscal_year": 2024
+        },
+        "data": [
+          {
+            "concept": "us-gaap:IncomeStatementAbstract",
+            "label": "Income Statement",
+            "value": null,
+            "period": "2024-01-01 00:00:00 to 2024-12-31 00:00:00",
+            "level": 0,
+            "order": 0,
+            "abstract": true
+          },
+          {
+            "concept": "us-gaap:Revenues",
+            "label": "Revenue",
+            "value": 1000000.0,
+            "period": "2024-01-01 00:00:00 to 2024-12-31 00:00:00",
+            "level": 1,
+            "order": 1,
+            "abstract": false,
+            "fact_id": "fact-revenue",
+            "decimals": "-3",
+            "unit": "USD"
+          },
+          {
+            "concept": "us-gaap:CostOfRevenue",
+            "label": "Cost of revenue",
+            "value": 400000.0,
+            "period": "2024-01-01 00:00:00 to 2024-12-31 00:00:00",
+            "level": 1,
+            "order": 2,
+            "abstract": false,
+            "fact_id": "fact-cor",
+            "decimals": "-3",
+            "unit": "USD"
+          },
+          {
+            "concept": "us-gaap:GrossProfit",
+            "label": "Gross profit",
+            "value": 600000.0,
+            "period": "2024-01-01 00:00:00 to 2024-12-31 00:00:00",
+            "level": 1,
+            "order": 3,
+            "abstract": false,
+            "fact_id": "fact-gp",
+            "decimals": "-3",
+            "unit": "USD"
+          }
+        ]
+      },
+      {
+        "cik": "0000000001",
+        "statement_type": "balancesheet",
+        "reporting_period": {
+          "end_date": "2024-12-31",
+          "fiscal_year": 2024
+        },
+        "data": [
+          {
+            "concept": "us-gaap:StatementOfFinancialPositionAbstract",
+            "label": "Balance Sheet",
+            "value": null,
+            "period": "2024-12-31",
+            "level": 0,
+            "order": 0,
+            "abstract": true
+          },
+          {
+            "concept": "us-gaap:Assets",
+            "label": "Total assets",
+            "value": 5000000.0,
+            "period": "2024-12-31",
+            "level": 1,
+            "order": 1,
+            "abstract": false,
+            "fact_id": "fact-assets",
+            "decimals": "-3",
+            "unit": "USD"
+          },
+          {
+            "concept": "us-gaap:Liabilities",
+            "label": "Total liabilities",
+            "value": 2000000.0,
+            "period": "2024-12-31",
+            "level": 1,
+            "order": 2,
+            "abstract": false,
+            "fact_id": "fact-liab",
+            "decimals": "-3",
+            "unit": "USD"
+          }
+        ]
+      }
+    ]
+  }
+]
