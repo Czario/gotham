@@ -12,7 +12,6 @@ from typing import Any, Callable
 
 from ..agent.loop import run_agent_loop
 from ..agent.tools import build_review_tools
-from ..review.corrections import CorrectionGate
 
 logger = logging.getLogger(__name__)
 

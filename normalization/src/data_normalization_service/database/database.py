@@ -114,15 +114,25 @@ class ConceptRepository:
             self._collection = self.db_connection.target_db[self.collection_name]
         return self._collection
 
-    def find_existing(self, company_cik: str, statement_type: str, concept: str, dimension_concept: bool = False) -> Optional[Dict[str, Any]]:
-        """Find existing concept (regular or dimensional)."""
-        logger.debug(f"Querying concept: company_cik={company_cik}, statement_type={statement_type}, concept={concept}, dimension_concept={dimension_concept}")
-        result = self.collection.find_one({
+    def find_existing(self, company_cik: str, statement_type: str, concept: str, dimension_concept: bool = False, parent_concept: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Find existing concept (regular or dimensional).
+
+        ``parent_concept`` scopes the lookup for ``custom:`` grouping headers:
+        the SAME header name legitimately exists under several parents (e.g.
+        ``custom:ProductSegmentation`` under Revenue AND Cost of Revenue), so
+        matching on name alone collapses them into one row and orphans every
+        parent but the last writer.
+        """
+        logger.debug(f"Querying concept: company_cik={company_cik}, statement_type={statement_type}, concept={concept}, dimension_concept={dimension_concept}, parent_concept={parent_concept}")
+        query: Dict[str, Any] = {
             "cik": company_cik,
             "statement_type": statement_type,
             "concept": concept,
             "dimension_concept": dimension_concept
-        })
+        }
+        if parent_concept is not None:
+            query["parent_concept"] = parent_concept
+        result = self.collection.find_one(query)
         if result:
             logger.debug(f"Found existing concept: {concept}")
         else:
@@ -206,13 +216,16 @@ class ConceptRepository:
         
         return result
 
-    def find_dimensional_existing(self, company_cik: str, statement_type: str, segment_type: str, concept: str, parent_concept_id: Optional[ObjectId] = None, context_id: Optional[str] = None, dimension_signature: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def find_dimensional_existing(self, company_cik: str, statement_type: str, segment_type: str, concept: str, parent_concept_id: Optional[ObjectId] = None, context_id: Optional[str] = None, dimension_signature: Optional[str] = None, parent_header: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Find an existing dimensional concept.
 
         Identity is ``(cik, statement_type, parent concept, member, dimensional
-        slice)``.  ``context_id`` is deliberately NOT used: it is
+        slice, parent_header)``.  ``context_id`` is deliberately NOT used: it is
         filing-specific, so including it created a new row for the same member
         on every filing (duplicate rows that then shared a path).
+        Including ``parent_header`` ensures the same member routed through
+        different custom grouping headers (e.g. custom:ProductSegmentation vs.
+        bare) is treated as a distinct document.
         """
         query = {
             "cik": company_cik,
@@ -224,6 +237,32 @@ class ConceptRepository:
             query["concept_id"] = parent_concept_id
         if dimension_signature is not None:
             query["dimension_signature"] = dimension_signature
+        # Scope by parent_header: None means bare (no grouping header) — use $exists: False
+        # so legacy bare docs (no parent_header field) are still found correctly.
+        if parent_header:
+            query["parent_header"] = parent_header
+        else:
+            query["parent_header"] = {"$in": [None, ""], "$exists": True}
+            # Also accept docs that simply have no parent_header field (legacy)
+            query_no_field = {k: v for k, v in query.items() if k != "parent_header"}
+            query_no_field["parent_header"] = {"$exists": False}
+            result = self.collection.find_one(query) or self.collection.find_one(query_no_field)
+            if result:
+                return result
+            # Legacy fallback with dimension_signature missing
+            if dimension_signature is not None:
+                lq = {
+                    "cik": company_cik,
+                    "statement_type": statement_type,
+                    "concept": concept,
+                    "dimension_concept": True,
+                    "dimension_signature": {"$exists": False},
+                    "parent_header": {"$exists": False},
+                }
+                if parent_concept_id:
+                    lq["concept_id"] = parent_concept_id
+                return self.collection.find_one(lq)
+            return None
 
         result = self.collection.find_one(query)
         if result:
@@ -242,6 +281,8 @@ class ConceptRepository:
             }
             if parent_concept_id:
                 legacy_query["concept_id"] = parent_concept_id
+            if parent_header:
+                legacy_query["parent_header"] = parent_header
             return self.collection.find_one(legacy_query)
         return None
 
@@ -396,12 +437,18 @@ class ConceptRepository:
                 concept_doc.context_id
             )
         else:
-            # For regular concepts, simple name-based matching
+            # For regular concepts, simple name-based matching.  Custom
+            # grouping headers are additionally scoped by their parent.
             existing_concept = self.find_existing(
                 concept_doc.company_cik,
                 concept_doc.statement_type,
                 concept_doc.concept,
-                concept_doc.dimension_concept
+                concept_doc.dimension_concept,
+                parent_concept=(
+                    concept_doc.parent_concept
+                    if concept_doc.concept.startswith("custom:")
+                    else None
+                ),
             )
         
         if existing_concept:

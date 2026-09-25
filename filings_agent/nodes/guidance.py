@@ -120,7 +120,7 @@ def make_guidance_extract_node(
                 tools = build_mda_tools(text)
                 system_prompt = (
                     GUIDANCE_SYSTEM_PROMPT
-                    + f"\n\nFILING PERIOD (the guidance covers periods AFTER this one):\n"
+                    + "\n\nFILING PERIOD (the guidance covers periods AFTER this one):\n"
                     + f"  form: {state.get('form_type') or '?'}\n"
                     + f"  period_type: {period.period_type}\n"
                     + f"  period_end: {period.period_end.isoformat()}\n"

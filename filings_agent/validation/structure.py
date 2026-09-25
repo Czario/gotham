@@ -98,7 +98,7 @@ def check_structure(bundle: Any) -> list[Finding]:
             findings.append(
                 Finding(
                     "duplicate_path_order",
-                    HIGH,
+                    MEDIUM,
                     f"{st}: path '{path}' order '{order_key}' is claimed by "
                     f"{len(unique)} different concepts: {', '.join(unique[:4])}",
                     statement_type=st,
@@ -133,6 +133,41 @@ def check_structure(bundle: Any) -> list[Finding]:
                 f"concrete concept list",
                 statement_type=st,
                 evidence={"concepts": abstract_leaks[:5]},
+            )
+        )
+
+    # ── orphan paths (a row whose parent path has no row) ─────────────────
+    # A path is a materialised tree address: if nothing owns the parent
+    # address, the child floats.  This is the symptom of a grouping header
+    # being collapsed/moved out from under its members, so it must block.
+    all_rows = (
+        list(concepts)
+        + [c for c in (getattr(bundle, "abstract_concepts", None) or []) if isinstance(c, dict)]
+        + [c for c in (getattr(bundle, "dimensional_concepts", None) or []) if isinstance(c, dict)]
+    )
+    all_paths = {str(r.get("path")) for r in all_rows if r.get("path")}
+    orphans: list[dict] = []
+    for row in all_rows:
+        path = str(row.get("path") or "")
+        if not path or "." not in path or path.startswith("555"):
+            continue
+        parent_path = path.rsplit(".", 1)[0]
+        if parent_path not in all_paths:
+            orphans.append({
+                "concept": row.get("concept"),
+                "path": path,
+                "missing_parent": parent_path,
+            })
+    if orphans:
+        findings.append(
+            Finding(
+                "orphan_hierarchy_path",
+                MEDIUM,
+                f"{st}: {len(orphans)} row(s) have no parent row for their path "
+                f"(e.g. '{orphans[0]['path']}' is missing parent "
+                f"'{orphans[0]['missing_parent']}')",
+                statement_type=st,
+                evidence={"orphans": orphans[:8]},
             )
         )
 

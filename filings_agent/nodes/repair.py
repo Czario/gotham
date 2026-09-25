@@ -6,7 +6,7 @@ repair provenance, then the graph re-runs validation before persistence.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Callable
 
 from ..review.corrections import CorrectionGate, apply_decisions_to_bundles
 

@@ -688,6 +688,7 @@ class FinancialNormalizationService:
         promoted_concepts = [
             _promote(item, i) for i, item in enumerate(all_concepts_to_persist)
         ]
+        promoted_ids: list = []
         for item in promoted_concepts:
             # Preserve abstract=True for custom: grouping headers; force False for everything else.
             if not item.get("concept", "").startswith("custom:"):
@@ -695,8 +696,34 @@ class FinancialNormalizationService:
             concept_id = self._get_or_create_concept(
                 statement.company_cik, statement.statement_type, item, filing.form_type
             )
+            promoted_ids.append(concept_id)
             if concept_id:
                 concept_mapping[item['concept']] = concept_id
+
+        # Parent linkage can only be resolved after every row exists (a parent
+        # may be created after its child).  Without this a moved/duplicated
+        # parent silently orphans its subtree, because the tree would then be
+        # reconstructable only by string-prefix on ``path``.
+        path_by_concept = {
+            item['concept']: item.get('path')
+            for item in promoted_concepts
+            if item.get('concept') and item.get('path')
+        }
+        for item, concept_id in zip(promoted_concepts, promoted_ids):
+            parent = item.get('parent_concept')
+            if not concept_id or not parent:
+                continue
+            parent_id = concept_mapping.get(parent)
+            if parent_id is None:
+                continue
+            concept_repo.collection.update_one(
+                {'_id': concept_id},
+                {'$set': {
+                    'parent_concept': parent,
+                    'parent_concept_id': parent_id,
+                    'parent_path': path_by_concept.get(parent),
+                }},
+            )
 
         logger.info(f"Promotion: promoted {len(promoted_concepts)} concept(s) (abstract wrappers skipped)")
 
@@ -723,6 +750,7 @@ class FinancialNormalizationService:
                         form_type=filing.form_type,
                         assigned_path=dim.get('path'),
                         assigned_order_key=dim.get('order_key'),
+                        parent_header=dim.get('parent_header'),  # NEW: grouping header awareness
                     )
                     dimensional_concept_mapping[(dim['parent_concept'], dim['concept'])] = dim_concept_id
                 except Exception as e:
@@ -886,6 +914,15 @@ class FinancialNormalizationService:
         if not item.get("concept", "").startswith("custom:"):
             item['abstract'] = False
 
+        # ``custom:`` grouping headers are identified by (name, parent): the same
+        # header exists under several line items, so name-only matching would
+        # collapse them into a single row and orphan every other parent.
+        parent_scope = (
+            item.get('parent_concept')
+            if item.get('concept', '').startswith('custom:')
+            else None
+        )
+
         concept_key = ConceptKey(cik, statement_type, item['concept'])
         
         # Get the appropriate concept repository based on form type
@@ -914,7 +951,7 @@ class FinancialNormalizationService:
                     f"Alias reuse: {item['concept']} -> {alias_target} "
                     f"(ID: {concept_id}), skipping separate creation"
                 )
-                self.concept_cache[(concept_key, form_type)] = concept_id
+                self.concept_cache[(concept_key, form_type, parent_scope)] = concept_id
                 return concept_id
             # Target concept is gone (deleted/migrated): fall through and treat
             # the incoming concept normally below.
@@ -923,8 +960,8 @@ class FinancialNormalizationService:
                 f"— creating '{item['concept']}' as its own concept"
             )
         
-        # Check cache first (make cache form-type specific)
-        cache_key = (concept_key, form_type)
+        # Check cache first (make cache form-type specific; headers also scoped by parent)
+        cache_key = (concept_key, form_type, parent_scope)
         if cache_key in self.concept_cache:
             logger.debug(f"Found concept in cache: {item['concept']}")
             return self.concept_cache[cache_key]
@@ -935,7 +972,8 @@ class FinancialNormalizationService:
             cik, 
             statement_type, 
             item['concept'],
-            dimension_concept=item.get('dimension', False)
+            dimension_concept=item.get('dimension', False),
+            parent_concept=parent_scope,
         )
         if existing:
             concept_id = existing['_id']
@@ -1269,7 +1307,10 @@ class FinancialNormalizationService:
             path=item.get('path'),  # Preserve hierarchy path for correct placement
             order_key=item.get('order_key'),  # Preserve order for correct hierarchy position
             abstract=is_abstract,  # True for custom: grouping headers, False for all others
-            dimension=item.get('dimension', False)
+            dimension=item.get('dimension', False),
+            parent_concept=item.get('parent_concept'),
+            parent_path=item.get('parent_path'),
+            parent_concept_id=item.get('parent_concept_id'),
         )
 
         
@@ -1286,7 +1327,12 @@ class FinancialNormalizationService:
                 cik, 
                 statement_type, 
                 item['concept'],
-                dimension_concept=item.get('dimension', False)
+                dimension_concept=item.get('dimension', False),
+                parent_concept=(
+                    item.get('parent_concept')
+                    if item['concept'].startswith('custom:')
+                    else None
+                ),
             )
             if existing:
                 logger.warning(f"Using existing concept for {item['concept']} after failed creation")
@@ -2175,6 +2221,7 @@ class FinancialNormalizationService:
         form_type: str = '10-K',
         assigned_path: Optional[str] = None,
         assigned_order_key: Optional[str] = None,
+        parent_header: Optional[str] = None,
     ) -> ObjectId:
         """
         Get existing dimensional concept or create new one using the appropriate repository based on form type.
@@ -2189,8 +2236,10 @@ class FinancialNormalizationService:
         # Determine segment type and identifier
         segment_type, concept = self._determine_segment_info(dimension_data)
         
-        # Create cache key for dimensional concepts with form type and parent concept ID
-        dimensional_key = ConceptKey(company_cik, statement_type, f"dim_{concept}_{concept_id}")
+        # Create cache key for dimensional concepts with form type and parent concept ID.
+        # Include parent_header so the same member under different grouping headers
+        # (e.g. ProductMember via custom:ProductSegmentation vs. bare) gets separate slots.
+        dimensional_key = ConceptKey(company_cik, statement_type, f"dim_{concept}_{concept_id}_{parent_header or ''}")
         cache_key = (dimensional_key, form_type)
         
         # Get the appropriate concept repository based on form type
@@ -2212,6 +2261,7 @@ class FinancialNormalizationService:
         existing = concept_repo.find_dimensional_existing(
             company_cik, statement_type, segment_type, concept, concept_id,
             dimension_signature=_signature,
+            parent_header=parent_header,
         )
         if existing:
             dimensional_concept_id = existing['_id']
@@ -2231,6 +2281,10 @@ class FinancialNormalizationService:
                 updates['level'] = updates['hierarchy_level']
             if assigned_order_key and existing.get('order_key') != assigned_order_key:
                 updates['order_key'] = assigned_order_key
+            # Persist parent_header if provided (so future lookups can distinguish
+            # members under different grouping headers).
+            if parent_header and not existing.get('parent_header'):
+                updates['parent_header'] = parent_header
             if updates:
                 concept_repo.collection.update_one({'_id': dimensional_concept_id}, {'$set': updates})
         else:
@@ -2239,6 +2293,7 @@ class FinancialNormalizationService:
             dimensional_concept_id = self._create_dimensional_concept(
                 concept_id, company_cik, statement_type, dimension_data, segment_type, concept, form_type,
                 assigned_path=assigned_path, assigned_order_key=assigned_order_key,
+                parent_header=parent_header,
             )
         
         # Cache the result
@@ -2568,6 +2623,7 @@ class FinancialNormalizationService:
         form_type: str = '10-K',
         assigned_path: Optional[str] = None,
         assigned_order_key: Optional[str] = None,
+        parent_header: Optional[str] = None,
     ) -> ObjectId:
         """Create a new dimensional concept document using the appropriate repository based on form type."""
         # Get the appropriate concept repository based on form type
@@ -2676,6 +2732,10 @@ class FinancialNormalizationService:
             parent_concept.get('concept') if parent_concept else None
         ) or dimension_data.get('concept_name')
         dimensional_concept_doc.parent_path = parent_concept_path or None
+        # Stamp parent_header so dim members under custom grouping headers
+        # are identifiable as distinct from bare members under the same parent.
+        if parent_header:
+            dimensional_concept_doc.parent_header = parent_header
         dimensional_concept_doc.dimension_signature = _dim_sig(
             dimension_data.get('dimensions'), dimension_data.get('dimension_details')
         )

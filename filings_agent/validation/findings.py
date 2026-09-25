@@ -24,6 +24,21 @@ ABSENCE_ONLY_TYPES = frozenset({
     "empty_statement",
 })
 
+# Hierarchy finding types: structural/hierarchy placement issues must NEVER stop
+# the process or block writing to the database. The hierarchy agent attempts to fix
+# them, but remaining hierarchy issues are advisory and non-blocking.
+HIERARCHY_FINDING_TYPES = frozenset({
+    "duplicate_path_order",
+    "orphan_hierarchy_path",
+    "missing_hierarchy_path",
+    "negative_hierarchy_level",
+    "missing_concept_name",
+    "abstract_in_concrete_set",
+    "duplicate_concept",
+})
+
+NON_BLOCKING_TYPES = ABSENCE_ONLY_TYPES | HIERARCHY_FINDING_TYPES
+
 
 @dataclass
 class Finding:
@@ -39,7 +54,7 @@ class Finding:
     @property
     def is_blocking(self) -> bool:
         """True when this finding must refuse persistence (under STRICT_ACCURACY)."""
-        return self.severity == HIGH and self.type not in ABSENCE_ONLY_TYPES
+        return self.severity == HIGH and self.type not in NON_BLOCKING_TYPES
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -60,7 +75,7 @@ def blocking_findings(findings: Iterable[dict]) -> list[dict]:
     """Return the findings that must refuse persistence."""
     return [
         f for f in findings
-        if f.get("severity") == HIGH and f.get("type") not in ABSENCE_ONLY_TYPES
+        if f.get("severity") == HIGH and f.get("type") not in NON_BLOCKING_TYPES
     ]
 
 

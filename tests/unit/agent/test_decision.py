@@ -71,14 +71,35 @@ def math_finding(statement_type="income", concept="us-gaap:GrossProfit"):
 
 def structural_finding(statement_type="balancesheet"):
     return {
-        "type": "duplicate_path_order",
+        "type": "corrupt_statement",
         "severity": "high",
+        "message": "corrupt data",
+        "statement_type": statement_type,
+    }
+
+
+def hierarchy_finding(statement_type="balancesheet"):
+    return {
+        "type": "duplicate_path_order",
+        "severity": "medium",
         "message": "duplicate path",
         "statement_type": statement_type,
     }
 
 
 # ── ceiling ─────────────────────────────────────────────────────────────────
+
+
+def test_ceiling_never_blocks_on_hierarchy_findings():
+    income = bundle("income")
+    balance = bundle("balancesheet")
+    permitted, blocked, drops = compute_ceiling(
+        [income, balance],
+        [hierarchy_finding("income"), hierarchy_finding("balancesheet")],
+    )
+    assert permitted == ["income", "balancesheet"]
+    assert blocked == []
+    assert drops == {}
 
 
 def test_ceiling_blocks_statement_level_and_excludes_concept_level():

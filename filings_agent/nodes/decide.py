@@ -14,8 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
-from ..decision import (
-    ACTION_SKIP,
+from filings_agent.decision import (
     WriteDecision,
     apply_agent_plan,
     needs_agent_decision,
@@ -51,9 +50,9 @@ def _ask_decision_agent(
     on_event: Any,
 ) -> Any:
     """Ask the LLM judge for a write plan (returns a dict or None)."""
-    from ..agent.loop import run_agent_loop
-    from ..agent.prompts import DECISION_FINALIZE_DESCRIPTION, decision_system_prompt_TEMPLATE
-    from ..agent.tools import build_review_tools
+    from filings_agent.agent.loop import run_agent_loop
+    from filings_agent.agent.prompts import DECISION_FINALIZE_DESCRIPTION, decision_system_prompt_TEMPLATE
+    from filings_agent.agent.tools import build_review_tools
 
     tools = [
         tool
@@ -92,7 +91,7 @@ def make_decide_node(
     """Build the ``decide`` node."""
 
     def decide_node(state: dict) -> dict:
-        from .. import config
+        from filings_agent import config
 
         strict = config.STRICT_ACCURACY if strict_accuracy is None else strict_accuracy
         bundles = state.get("bundles") or []
@@ -103,7 +102,7 @@ def make_decide_node(
 
         if needs_agent_decision(policy, enabled=config.AGENT_DECISION_ENABLED):
             try:
-                from ..hooks import report_call
+                from filings_agent.hooks import report_call
 
                 report_call(
                     f"  [decide]  consulting decision judge — "

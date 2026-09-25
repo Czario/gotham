@@ -226,7 +226,12 @@ class DuplicatePreventionManager:
                 concept_doc.company_cik,
                 concept_doc.statement_type,
                 concept_doc.concept,
-                dimension_concept=concept_doc.dimension_concept
+                dimension_concept=concept_doc.dimension_concept,
+                parent_concept=(
+                    concept_doc.parent_concept
+                    if concept_doc.concept.startswith("custom:")
+                    else None
+                ),
             )
 
             if existing_by_name:

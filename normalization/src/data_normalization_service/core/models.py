@@ -50,6 +50,8 @@ class ConceptDocument:
     # that boundary.  See ``core/row_identity.py``.
     parent_concept: Optional[str] = None  # the parent's concept name
     parent_path: Optional[str] = None  # the parent's materialised path
+    parent_concept_id: Optional[ObjectId] = None  # the parent row's _id (all rows)
+    parent_header: Optional[str] = None  # grouping header this row falls under, if any
     row_key: Optional[str] = None  # canonical identity tuple, flattened
     
     # New dimensional data fields from updated source structure
@@ -82,7 +84,20 @@ class ConceptDocument:
             "dimension": self.dimension,
             "dimension_concept": self.dimension_concept
         }
-        
+
+        # Parent linkage applies to EVERY row (main line items, custom: grouping
+        # headers and dimensional members).  Without it a moved parent silently
+        # orphans its children, because the tree is otherwise reconstructable
+        # only by string-prefix on ``path``.
+        if self.parent_concept is not None:
+            result["parent_concept"] = self.parent_concept
+        if self.parent_path is not None:
+            result["parent_path"] = self.parent_path
+        if self.parent_concept_id is not None:
+            result["parent_concept_id"] = self.parent_concept_id
+        if self.parent_header is not None:
+            result["parent_header"] = self.parent_header
+
         # Add dimensional-specific fields if this is a dimensional concept
         if self.dimension_concept:
             if self.concept_id is not None:

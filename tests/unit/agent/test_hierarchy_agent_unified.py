@@ -186,3 +186,116 @@ def test_unified_node_records_newest_tag_promotion():
     assert len(promos) == 1
     assert promos[0]["from_concept"] == "us-gaap:Revenues"
     assert promos[0]["to_concept"] == "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+
+
+def test_materialize_preserves_order_field_over_alphabetical():
+    # Z-concept comes first in reading order (order 1); A-concept comes second (order 2)
+    # Alphabetical sorting would put A at 001 and Z at 002.
+    rows, _ = _materialize([
+        {"concept": "us-gaap:ZRevenues", "parent": None, "order": 1},
+        {"concept": "us-gaap:ACostOfRevenue", "parent": None, "order": 2},
+    ], [], {})
+    by = {r["concept"]: r for r in rows}
+    assert by["us-gaap:ZRevenues"]["path"] == "001"
+    assert by["us-gaap:ACostOfRevenue"]["path"] == "002"
+
+
+def test_materialize_promotes_custom_headers_from_dims():
+    rows, dims = _materialize(
+        [{"concept": "us-gaap:Revenues", "parent": None, "order": 1}],
+        [
+            {"member": "custom:ProductSegmentation", "parent": "us-gaap:Revenues", "abstract": True, "order": 1},
+            {"member": "aapl:IPhoneMember", "parent": "custom:ProductSegmentation", "order": 1},
+        ],
+        {},
+    )
+    row_by = {r["concept"]: r for r in rows}
+    assert "custom:ProductSegmentation" in row_by
+    assert row_by["custom:ProductSegmentation"]["path"] == "001.001"
+    assert len(dims) == 1
+    assert dims[0]["concept"] == "aapl:IPhoneMember"
+    assert dims[0]["path"] == "001.001.001"
+
+
+
+def test_materialize_keeps_same_header_under_each_parent():
+    """Regression: a grouping header (custom:ProductSegmentation) must exist
+    once PER PARENT.  Name-only identity used to collapse the two into one row
+    and orphan every parent but the last writer."""
+    rows, dims = _materialize(
+        [
+            {"concept": "us-gaap:Revenues", "parent": None, "order": 1},
+            {"concept": "us-gaap:CostOfGoodsAndServicesSold", "parent": None, "order": 2},
+        ],
+        [
+            {"concept": "custom:ProductSegmentation", "parent": "us-gaap:Revenues",
+             "abstract": True, "order": 1},
+            {"concept": "aapl:IPhoneMember", "parent_concept": "us-gaap:Revenues",
+             "parent_header": "custom:ProductSegmentation", "order": 1},
+            {"concept": "custom:ProductSegmentation", "parent": "us-gaap:CostOfGoodsAndServicesSold",
+             "abstract": True, "order": 1},
+            {"concept": "us-gaap:ProductMember", "parent_concept": "us-gaap:CostOfGoodsAndServicesSold",
+             "parent_header": "custom:ProductSegmentation", "order": 1},
+        ],
+        {},
+    )
+    headers = [r for r in rows if r["concept"] == "custom:ProductSegmentation"]
+    assert len(headers) == 2, "same header under two parents must not collapse"
+    assert {h["path"] for h in headers} == {"001.001", "002.001"}
+    by_concept = {d["concept"]: d for d in dims}
+    assert by_concept["aapl:IPhoneMember"]["path"].startswith("001.001.")
+    assert by_concept["us-gaap:ProductMember"]["path"].startswith("002.001.")
+
+
+def test_materialize_never_reuses_a_stored_path_held_by_an_absent_row():
+    """Regression: a newly-added row must not steal the slot of an existing
+    row the agent did not re-propose (that is how duplicate paths appear)."""
+    rows, _ = _materialize(
+        [{"concept": "us-gaap:Revenues", "parent": None, "order": 1},
+         {"concept": "us-gaap:GrossProfit", "parent": None, "order": 2}],
+        [],
+        {"us-gaap:Revenues": "001"},
+        occupied_paths={"001", "002"},
+    )
+    by = {r["concept"]: r for r in rows}
+    assert by["us-gaap:Revenues"]["path"] == "001"   # keeps its stored slot
+    assert by["us-gaap:GrossProfit"]["path"] == "003"  # cannot take 002
+
+
+def test_query_hierarchy_diff_and_header_consistency_lint():
+    from filings_agent.tools.hierarchy_tools import build_unified_hierarchy_tools
+
+    stored = [
+        {"concept": "us-gaap:Revenues", "path": "001", "parent_concept": None, "dimension_concept": False},
+        {"concept": "custom:ProductSegmentation", "path": "001.001", "parent_concept": "us-gaap:Revenues", "abstract": True, "dimension_concept": False},
+        {"concept": "aapl:IPhoneMember", "path": "001.001.001", "parent_concept": "us-gaap:Revenues", "dimension_concept": True},
+    ]
+    filing = [
+        {"concept": "us-gaap:Revenues", "dimension_concept": False},
+        {"concept": "aapl:IPhoneMember", "dimension_concept": True},
+        {"concept": "us-gaap:CostOfRevenue", "dimension_concept": False},  # new line item
+    ]
+    proposal = {}
+    tools = build_unified_hierarchy_tools(stored, filing, proposal)
+    tools_by_name = {t.name: t for t in tools}
+
+    assert "query_hierarchy_diff" in tools_by_name
+    diff_output = tools_by_name["query_hierarchy_diff"].invoke({})
+    assert "MATCHED" in diff_output
+    assert "us-gaap:Revenues" in diff_output
+    assert "NEW INCOMING CONCEPTS" in diff_output
+    assert "us-gaap:CostOfRevenue" in diff_output
+    assert "EXISTING STORED GROUPING HEADERS" in diff_output
+    assert "custom:ProductSegmentation" in diff_output
+
+    # Test linter catches duplicate header spelling
+    tools_by_name["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "us-gaap:Revenues", "parent": None, "order": 1},
+            {"concept": "custom:ProductSegment", "parent": "us-gaap:Revenues", "order": 1}, # typo/inconsistent header
+        ]),
+        "dims_json": "[]",
+    })
+    lint_report = tools_by_name["lint_hierarchy"].invoke({})
+    assert "Reuse existing header name" in lint_report
+
