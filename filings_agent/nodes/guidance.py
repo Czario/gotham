@@ -72,7 +72,7 @@ def make_guidance_extract_node(
         from .. import config
         from ..agent.guidance import normalize_guidance_records
         from ..agent.loop import run_agent_loop
-        from ..agent.mda_tools import build_mda_tools
+        from ..tools.guidance_tools import build_mda_tools
         from ..agent.prompts import (
             GUIDANCE_FINALIZE_DESCRIPTION,
             GUIDANCE_SYSTEM_PROMPT,

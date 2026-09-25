@@ -108,19 +108,6 @@ GUIDANCE_MAX_RECORDS: int = int(os.getenv("GUIDANCE_MAX_RECORDS", "15"))
 # Cap on the MD&A text handed to the guidance agent.
 GUIDANCE_MAX_CHARS: int = int(os.getenv("GUIDANCE_MAX_CHARS", "200000"))
 
-# ── Hierarchy: who decides ─────────────────────────────────────────────────
-# The agent owns the hierarchy. When on (default), EVERY statement is reviewed
-# by the agent — not only seeds, new concepts and anomalies. Set to 0 to let
-# clean reuses skip the LLM call (the previous behaviour).
-HIERARCHY_AGENT_ALWAYS: bool = os.getenv("HIERARCHY_AGENT_ALWAYS", "1").strip().lower() not in {
-    "0", "false", "no", "off", ""
-}
-# What happens when the agent cannot produce a valid hierarchy for a statement:
-#   "block"    — persist nothing; no hierarchy ships without agent approval.
-#   "fallback" — keep the deterministic resolver plan (previous behaviour).
-HIERARCHY_AGENT_FAILURE_POLICY: str = (
-    os.getenv("HIERARCHY_AGENT_FAILURE_POLICY", "block").strip().lower()
-)
 
 # ── Advisory long-term memory (optional) ───────────────────────────────────
 # Unlike the earning_agent, this is OPTIONAL and defaults to off so importing

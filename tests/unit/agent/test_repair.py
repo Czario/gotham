@@ -10,7 +10,7 @@ from data_normalization_service.core.models import Filing, FinancialStatement, S
 from filings_agent.graph import build_filing_graph
 from filings_agent.review.corrections import CorrectionGate, apply_decisions_to_bundles
 from filings_agent.state import new_state
-from filings_agent.agent.tools import build_review_tools
+from filings_agent.tools.review_tools import build_review_tools
 
 
 def item(concept, value, **overrides):

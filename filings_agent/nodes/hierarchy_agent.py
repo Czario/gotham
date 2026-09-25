@@ -13,10 +13,12 @@ import logging
 from collections import defaultdict
 from typing import Any, Callable, Optional
 
+import time
+
 from ..agent.hierarchy_prompts import AGENTIC_HIERARCHY_SYSTEM_PROMPT
-from ..agent.hierarchy_tools import build_unified_hierarchy_tools
+from ..tools.hierarchy_tools import build_unified_hierarchy_tools
 from ..agent.loop import run_agent_loop
-from ..hooks import report_call
+from ..hooks import report_call, report_detail
 
 logger = logging.getLogger(__name__)
 
@@ -403,12 +405,14 @@ def make_hierarchy_agent_node(
         all_promotions: list[dict] = []
 
         for bundle in bundles:
+            stmt_t0 = time.perf_counter()
+            stmt_type = getattr(bundle, "statement_type", "?")
             stored, stored_paths, occupied_paths, identity_paths = _stored_rows_for(norm_service, bundle)
             filing_rows = _filing_rows_for(bundle)
             if not filing_rows and not stored:
                 continue
             if not stored:
-                seeded.append(getattr(bundle, "statement_type", "?"))
+                seeded.append(stmt_type)
 
             # ── Fast-path: skip LLM when all filing concepts are already stored ─────
             # Compute the diff deterministically. If there are no new concepts,
@@ -419,10 +423,11 @@ def make_hierarchy_agent_node(
             new_concepts = filing_names - stored_names
             if stored and not new_concepts:
                 # All concepts are known — reuse stored paths verbatim.
+                stmt_dur = time.perf_counter() - stmt_t0
                 report_call(
-                    f"  [hierarchy agent]  ⚡ {getattr(bundle, 'statement_type', '?')}: "
-                    f"all {len(filing_names)} concept(s) matched stored — skipping LLM"
+                    f"  [hierarchy]  • {stmt_type}: ⚡ fast-path (0 new concepts — reusing stored hierarchy)  {stmt_dur:.2f}s"
                 )
+                report_detail(f"{stmt_type}: fast-path")
                 proposal["rows"] = [
                     {
                         "concept": r["concept"],
@@ -444,6 +449,16 @@ def make_hierarchy_agent_node(
                 ]
             else:
                 # New concepts found (or fresh seed) — invoke the LLM agent.
+                if not stored:
+                    report_call(
+                        f"  [hierarchy]  • {stmt_type}: fresh seed (0 stored) → running hierarchy agent"
+                    )
+                else:
+                    report_call(
+                        f"  [hierarchy]  • {stmt_type}: {len(new_concepts)} new concept(s) detected ({len(stored)} stored) → running hierarchy agent"
+                    )
+                report_detail(f"{stmt_type}: running agent...")
+
                 tools = build_unified_hierarchy_tools(
                     stored,
                     filing_rows,
@@ -452,13 +467,24 @@ def make_hierarchy_agent_node(
                     form_type=getattr(bundle, "form_type", ""),
                     company_cik=getattr(bundle, "company_cik", ""),
                 )
-                task = (
-                    f"Decide the COMPLETE hierarchy for {getattr(bundle, 'statement_type', '?')} "
-                    f"for CIK {getattr(bundle, 'company_cik', '?')} "
-                    f"({getattr(bundle, 'form_type', '?')}). Stored rows: {len(stored)}. "
-                    f"Filing rows: {len(filing_rows)}. Merges, then the full tree, then lint, "
-                    f"then finalize."
-                )
+                if not stored:
+                    task = (
+                        f"FRESH SEED for {getattr(bundle, 'statement_type', '?')} "
+                        f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
+                        f"No existing hierarchy is stored in DB. Inspect filing line items via query_filing_hierarchy(), "
+                        f"then call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint, "
+                        f"and finalize."
+                    )
+                else:
+                    task = (
+                        f"INCREMENTAL UPDATE for {getattr(bundle, 'statement_type', '?')} "
+                        f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
+                        f"Stored rows: {len(stored)}, Filing rows: {len(filing_rows)}. "
+                        f"Call query_hierarchy_diff() to inspect the delta between filing and stored tree. "
+                        f"If any new concept is an alias, call decide_mapping(). "
+                        f"Then call propose_hierarchy(rows_json, dims_json) specifying the new concepts to insert "
+                        f"(they will automatically merge with stored rows), and finalize."
+                    )
                 try:
                     _ = run_agent_loop(
                         AGENTIC_HIERARCHY_SYSTEM_PROMPT,
@@ -466,7 +492,7 @@ def make_hierarchy_agent_node(
                         tools,
                         ticker=str(state.get("ticker") or state.get("cik") or "?"),
                         finalize_name="finalize_hierarchy",
-                        finalize_description="Call when the full hierarchy is decided. Pass a JSON object {\"confirmed\": true, \"notes\": \"...\"}.",
+                        finalize_description="Call when the full hierarchy is decided. Pass {\"status\": \"done\"}.",
                         chat_llm=chat_llm,
                         on_event=on_event,
                     )
@@ -475,7 +501,7 @@ def make_hierarchy_agent_node(
                                    bundle.company_cik, bundle.statement_type, exc)
 
             if not proposal.get("rows"):
-                report_call(f"  [hierarchy agent]  ! {bundle.statement_type}: no tree proposed, using fallback")
+                report_call(f"  [hierarchy]  ! {bundle.statement_type}: no tree proposed, using fallback")
                 logger.warning("hierarchy agent proposed no tree for %s/%s; falling back to filing rows",
                                bundle.company_cik, bundle.statement_type)
                 if stored:
@@ -695,6 +721,12 @@ def make_hierarchy_agent_node(
             all_promotions.extend(promotions)
             reasoned_about += 1
             bundle._agent_updates = existing_updates
+            if not (stored and not new_concepts):
+                stmt_dur = time.perf_counter() - stmt_t0
+                report_call(
+                    f"  [hierarchy]  ✓ {stmt_type} hierarchy resolved in {stmt_dur:.1f}s ({len(rows)} rows, {len(existing_updates)} re-pathed)"
+                )
+                report_detail(f"{stmt_type}: done")
 
         plan = {
             "decided_by": "agent",
@@ -708,7 +740,7 @@ def make_hierarchy_agent_node(
             ),
         }
         report_call(
-            f"  [hierarchy agent]  ✓ {reasoned_about} statement(s), {total_updates} stored row update(s)"
+            f"  [hierarchy]  ✓ {reasoned_about} statement(s) processed ({total_updates} stored row update(s))"
         )
         return {**state, "hierarchy_plan": plan, "concept_promotions": all_promotions, "status": "hierarchy_agent_done"}
 

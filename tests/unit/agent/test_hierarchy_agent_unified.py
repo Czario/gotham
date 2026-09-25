@@ -297,5 +297,54 @@ def test_query_hierarchy_diff_and_header_consistency_lint():
         "dims_json": "[]",
     })
     lint_report = tools_by_name["lint_hierarchy"].invoke({})
-    assert "Reuse existing header name" in lint_report
+    assert "Reuse existing header" in lint_report
+
+
+def test_propose_hierarchy_incremental_additions_merge():
+    from filings_agent.tools.hierarchy_tools import build_unified_hierarchy_tools
+
+    stored = [
+        {"concept": "us-gaap:Revenues", "path": "001", "parent_concept": None, "dimension_concept": False},
+        {"concept": "us-gaap:CostOfRevenue", "path": "002", "parent_concept": None, "dimension_concept": False},
+        {"concept": "aapl:IPhoneMember", "path": "001.001", "parent_concept": "us-gaap:Revenues", "dimension_concept": True},
+    ]
+    filing = [
+        {"concept": "us-gaap:Revenues", "dimension_concept": False},
+        {"concept": "us-gaap:CostOfRevenue", "dimension_concept": False},
+        {"concept": "us-gaap:GrossProfit", "dimension_concept": False},  # new line item
+        {"concept": "aapl:IPhoneMember", "dimension_concept": True},
+        {"concept": "aapl:MacMember", "dimension_concept": True},        # new dim
+    ]
+    proposal = {}
+    tools = build_unified_hierarchy_tools(stored, filing, proposal)
+    tools_by_name = {t.name: t for t in tools}
+
+    # Verify query_stored_hierarchy and query_filing_hierarchy are NOT in tool list for incremental update
+    assert "query_stored_hierarchy" not in tools_by_name
+    assert "query_filing_hierarchy" not in tools_by_name
+    assert "query_hierarchy_diff" in tools_by_name
+
+    # Agent passes ONLY the NEW items in propose_hierarchy
+    res = tools_by_name["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "us-gaap:GrossProfit", "parent": None, "order": 3},
+        ]),
+        "dims_json": json.dumps([
+            {"concept": "aapl:MacMember", "parent_concept": "us-gaap:Revenues", "order": 2},
+        ]),
+    })
+
+    assert "OK" in res
+    row_concepts = [r["concept"] for r in proposal["rows"]]
+    # Stored rows must be retained, and new row appended
+    assert "us-gaap:Revenues" in row_concepts
+    assert "us-gaap:CostOfRevenue" in row_concepts
+    assert "us-gaap:GrossProfit" in row_concepts
+    assert len(proposal["rows"]) == 3
+
+    dim_concepts = [d["concept"] for d in proposal["dims"]]
+    assert "aapl:IPhoneMember" in dim_concepts
+    assert "aapl:MacMember" in dim_concepts
+    assert len(proposal["dims"]) == 2
+
 

@@ -52,7 +52,7 @@ def _ask_decision_agent(
     """Ask the LLM judge for a write plan (returns a dict or None)."""
     from filings_agent.agent.loop import run_agent_loop
     from filings_agent.agent.prompts import DECISION_FINALIZE_DESCRIPTION, decision_system_prompt_TEMPLATE
-    from filings_agent.agent.tools import build_review_tools
+    from filings_agent.tools.review_tools import build_review_tools
 
     tools = [
         tool

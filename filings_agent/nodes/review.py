@@ -11,7 +11,7 @@ import logging
 from typing import Any, Callable
 
 from ..agent.loop import run_agent_loop
-from ..agent.tools import build_review_tools
+from ..tools.review_tools import build_review_tools
 
 logger = logging.getLogger(__name__)
 

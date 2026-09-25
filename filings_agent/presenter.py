@@ -755,8 +755,30 @@ class StepPresenter:
 
     def call_callback(self, message: str) -> None:
         text = str(message or "").rstrip()
-        if text and self.detailed:
+        if text:
             self.write(text)
+
+    def detail_callback(self, detail: str) -> None:
+        """Update live status in the filing bar when an agent step/tool runs."""
+        text = str(detail or "").strip()
+        if not text or self._stage_writer is None:
+            return
+        with self._lock:
+            filing = self._filing or {}
+            ticker = filing.get("ticker") or filing.get("cik") or "?"
+            form = filing.get("form_type") or ""
+            current = self._current or "agent"
+            short_cur = _SHORT_STAGE.get(current, current[:4])
+            trail = [
+                f"{'✓' if ok else '✗'}{self._stage_token(label, ok)}"
+                for label, ok in self._completed[-3:]
+            ]
+        trail_str = (" " + " ".join(trail)) if trail else ""
+        stage_desc = f"{ticker:<6} {str(form):<5}{trail_str} ▶{short_cur}: {text}"
+        try:
+            self._stage_writer(stage_desc)
+        except Exception:  # noqa: BLE001
+            pass
 
     def close(self, summary: str = "") -> None:
         if summary:
@@ -767,13 +789,16 @@ class StepPresenter:
         """Compose onto the current hook callbacks."""
         from .hooks import (
             get_call_callback,
+            get_detail_callback,
             get_node_callback,
             set_call_callback,
+            set_detail_callback,
             set_node_callback,
         )
 
         previous_node = get_node_callback()
         previous_call = get_call_callback()
+        previous_detail = get_detail_callback()
 
         def _node(*args: Any, **kwargs: Any) -> None:
             self.node_callback(*args, **kwargs)
@@ -785,17 +810,24 @@ class StepPresenter:
             if previous_call is not None:
                 previous_call(message)
 
+        def _detail(detail: str) -> None:
+            self.detail_callback(detail)
+            if previous_detail is not None:
+                previous_detail(detail)
+
         set_node_callback(_node)
         set_call_callback(_call)
+        set_detail_callback(_detail)
         self._attached = True
         return self
 
     def detach(self) -> None:
-        from .hooks import set_call_callback, set_node_callback
+        from .hooks import set_call_callback, set_detail_callback, set_node_callback
 
         if self._attached:
             set_node_callback(None)
             set_call_callback(None)
+            set_detail_callback(None)
             self._attached = False
 
 

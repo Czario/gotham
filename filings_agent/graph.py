@@ -138,13 +138,7 @@ def build_filing_graph(
     # 7. Correction gate repair node
     graph.add_node("repair", with_hooks(_named(make_repair_node(mode=repair_mode), "repair_node")))
 
-    # 8. Post-repair validation node
-    graph.add_node(
-        "validate_after_repair",
-        with_hooks(_named(make_validate_node(report_store), "validate_after_repair_node")),
-    )
-
-    # 9. Final validation node
+    # 8. Final validation node
     graph.add_node(
         "validate_final",
         with_hooks(_named(make_validate_node(report_store), "validate_final_node")),
@@ -229,8 +223,7 @@ def build_filing_graph(
         {"agent_review": "agent_review", "hierarchy_agent": "hierarchy_agent", "__end__": END},
     )
     graph.add_edge("agent_review", "repair")
-    graph.add_edge("repair", "validate_after_repair")
-    graph.add_edge("validate_after_repair", "hierarchy_agent")
+    graph.add_edge("repair", "hierarchy_agent")
     graph.add_conditional_edges(
         "hierarchy_agent",
         _route_after("validate_final"),

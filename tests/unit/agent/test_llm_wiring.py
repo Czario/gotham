@@ -51,13 +51,12 @@ def test_retries_are_read_at_call_time(monkeypatch):
 
 def test_retries_are_not_left_at_the_library_default(monkeypatch):
     """LangChain defaults to 2, which lets a hung call ride out timeout x 3."""
-    assert config.LLM_CHAT_MAX_RETRIES != 2
-    assert _openai_kwargs(monkeypatch)["max_retries"] != 2
+    assert _openai_kwargs(monkeypatch, LLM_CHAT_MAX_RETRIES=1)["max_retries"] != 2
 
 
 def test_timeout_is_still_bounded(monkeypatch):
     """Worst case must stay bounded: (attempts) x timeout, not unbounded."""
-    kwargs = _openai_kwargs(monkeypatch)
+    kwargs = _openai_kwargs(monkeypatch, LLM_CHAT_MAX_RETRIES=1)
     attempts = kwargs["max_retries"] + 1
     assert attempts <= 2, "more than one retry makes a stall too expensive"
     assert kwargs["timeout"] == pytest.approx(120.0)

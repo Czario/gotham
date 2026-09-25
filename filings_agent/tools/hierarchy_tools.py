@@ -135,48 +135,42 @@ def build_unified_hierarchy_tools(
                 cand_str = f" -> candidates to merge with: {cands}" if cands else " -> new line item to place"
                 lines.append(f"  [NEW LINE ITEM] {fmt_row(r)}{cand_str}")
             for r in new_dims:
-                lines.append(f"  [NEW DIM MEMBER] {fmt_row(r)}")
+                parent_c = r.get("parent_concept") or r.get("parent")
+                extra = []
+                if parent_c:
+                    extra.append(f"parent line: {parent_c}")
+                    matching_headers = [
+                        sh.get("concept") for sh in stored_headers
+                        if (sh.get("parent_concept") == parent_c or sh.get("parent") == parent_c)
+                    ]
+                    if matching_headers:
+                        extra.append(f"existing headers: {matching_headers}")
+                extra_str = f" ({'; '.join(extra)})" if extra else ""
+                lines.append(f"  [NEW DIM MEMBER] {fmt_row(r)}{extra_str}")
             lines.append("")
 
         lines.append(f"MATCHED CONCEPTS ({len(matched_main) + len(matched_dims)}) — ALREADY IN STORED HIERARCHY:")
         for r in matched_main:
             stored_r = stored_main_map.get(r["concept"])
-            stored_path = stored_r.get("path") if stored_r else "-"
-            stored_parent = stored_r.get("parent_concept") if stored_r else "-"
-            lines.append(f"  {str(stored_path):<14} {r.get('concept')} (stored parent={stored_parent})")
+            if stored_r:
+                lines.append(f"  {fmt_row(stored_r)}")
+            else:
+                lines.append(f"  {r.get('concept')}")
         for r in matched_dims:
             stored_d = stored_dims_map.get(r["concept"])
-            stored_path = stored_d.get("path") if stored_d else "-"
-            stored_parent = stored_d.get("parent_concept") if stored_d else "-"
-            lines.append(f"  {str(stored_path):<14} {r.get('concept')} [dim] (stored parent={stored_parent})")
+            if stored_d:
+                lines.append(f"  {fmt_row(stored_d)}")
+            else:
+                lines.append(f"  {r.get('concept')} [dim]")
+
+        if stored_absent:
+            lines.append("")
+            lines.append(f"STORED CONCEPTS ABSENT FROM THIS FILING ({len(stored_absent)}):")
+            for r in stored_absent:
+                lines.append(f"  {fmt_row(r)}")
 
         return "\n".join(lines)
 
-    @tool
-    def query_concept_candidates(concept: str) -> str:
-        """List stored concepts whose name/label overlaps a given concept — the
-        only valid targets for decide_mapping(..., same_as=...)."""
-        q = (concept or "").lower().strip()
-        if not q:
-            return "Usage: pass a concept name to search."
-        hits = [
-            r for r in stored_rows
-            if q in str(r.get("concept", "")).lower() or q in str(r.get("label", "")).lower()
-        ]
-        if not hits:
-            return f"No stored concept overlaps '{concept}'."
-        return "CANDIDATES:\n" + "\n".join(fmt_row(r) for r in hits[:40])
-
-    @tool
-    def suggest_hierarchy() -> str:
-        """Return a NON-AUTHORITATIVE reference layout. You are free to ignore
-        it — this is only a starting point."""
-        if not filing_rows:
-            return "Nothing to suggest (no filing rows)."
-        return (
-            "Reference (primary lines at root in reading order; members nested "
-            "under their parent):\n" + "\n".join(fmt_row(r) for r in filing_rows[:120])
-        )
 
     @tool
     def decide_mapping(concept_json: str) -> str:
@@ -196,7 +190,7 @@ def build_unified_hierarchy_tools(
             if same_as not in stored_names:
                 return (
                     f"Error: '{same_as}' is not a stored concept. Choose null or one "
-                    f"of the stored names (query_stored_hierarchy / query_concept_candidates)."
+                    f"of the stored names (query_stored_hierarchy / query_hierarchy_diff)."
                 )
         if keep_tag not in ("stored", "incoming"):
             return "Error: keep_tag must be 'stored' or 'incoming'."
@@ -211,17 +205,137 @@ def build_unified_hierarchy_tools(
             return f"OK — '{concept}' will become the surviving name; '{same_as}' is retired."
         return f"OK — '{concept}' merges into existing '{same_as}'."
 
+    def _merge_proposal_with_stored(
+        parsed_rows: list[dict], parsed_dims: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
+        if not stored_rows:
+            return parsed_rows, parsed_dims
+
+        # 1. Base main rows from stored
+        merged_away = {
+            m.get("same_as")
+            for m in (proposal.get("merges") or {}).values()
+            if isinstance(m, dict) and m.get("same_as")
+        }
+        stored_main = [
+            {
+                "concept": s["concept"],
+                "parent": s.get("parent_concept") or s.get("parent"),
+                "label": s.get("label"),
+                "order": s.get("order"),
+                "order_key": s.get("order_key"),
+                "level": s.get("level", 0),
+                "abstract": s.get("abstract", False),
+            }
+            for s in stored_rows
+            if not s.get("dimension_concept") and s.get("concept") and s["concept"] not in merged_away
+        ]
+        stored_main_concepts = {s["concept"] for s in stored_main}
+        parsed_row_concepts = {
+            r.get("concept") for r in parsed_rows if isinstance(r, dict) and r.get("concept")
+        }
+
+        # If agent supplied all active stored concepts, treat as full replacement tree
+        if stored_main_concepts and stored_main_concepts.issubset(parsed_row_concepts):
+            final_rows = parsed_rows
+        else:
+            # Incremental: retain stored, apply overrides, append new concepts
+            overrides = {
+                r.get("concept"): r for r in parsed_rows if isinstance(r, dict) and r.get("concept")
+            }
+            merged = []
+            for s in stored_main:
+                c = s["concept"]
+                if c in overrides:
+                    merged_row = dict(s)
+                    merged_row.update(overrides[c])
+                    merged.append(merged_row)
+                else:
+                    merged.append(s)
+            for r in parsed_rows:
+                if isinstance(r, dict) and r.get("concept") and r["concept"] not in stored_main_concepts:
+                    merged.append(r)
+            final_rows = merged
+
+        # 2. Base dimensional members from stored
+        stored_dims = [
+            {
+                "concept": s.get("concept") or s.get("member"),
+                "parent_concept": s.get("parent_concept") or s.get("parent"),
+                "label": s.get("label"),
+                "segment_type": s.get("segment_type"),
+                "parent_header": s.get("parent_header"),
+                "order": s.get("order"),
+                "order_key": s.get("order_key"),
+            }
+            for s in stored_rows
+            if s.get("dimension_concept") and (s.get("concept") or s.get("member"))
+        ]
+        stored_dim_concepts = {d["concept"] for d in stored_dims}
+        parsed_dim_concepts = {
+            d.get("concept") or d.get("member")
+            for d in parsed_dims
+            if isinstance(d, dict) and (d.get("concept") or d.get("member"))
+        }
+
+        if stored_dim_concepts and stored_dim_concepts.issubset(parsed_dim_concepts):
+            final_dims = parsed_dims
+        else:
+            dim_overrides = {
+                (d.get("parent_concept") or d.get("parent"), d.get("concept") or d.get("member")): d
+                for d in parsed_dims
+                if isinstance(d, dict)
+            }
+            merged_dims = []
+            for sd in stored_dims:
+                key = (sd.get("parent_concept"), sd["concept"])
+                if key in dim_overrides:
+                    merged_dim = dict(sd)
+                    merged_dim.update(dim_overrides[key])
+                    merged_dims.append(merged_dim)
+                else:
+                    merged_dims.append(sd)
+            for pd in parsed_dims:
+                c = pd.get("concept") or pd.get("member")
+                parent_c = pd.get("parent_concept") or pd.get("parent")
+                key = (parent_c, c)
+                if key not in {(d.get("parent_concept"), d.get("concept")) for d in merged_dims}:
+                    norm_dim = dict(pd)
+                    if "member" in norm_dim and "concept" not in norm_dim:
+                        norm_dim["concept"] = norm_dim.pop("member")
+                    if "parent" in norm_dim and "parent_concept" not in norm_dim:
+                        norm_dim["parent_concept"] = norm_dim.pop("parent")
+                    merged_dims.append(norm_dim)
+            final_dims = merged_dims
+
+        return final_rows, final_dims
+
     @tool
     def propose_hierarchy(rows_json: str, dims_json: str) -> str:
-        """Submit the full tree."""
-        for label, raw in (("rows", rows_json), ("dims", dims_json)):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                return f"Invalid JSON in {label}: {exc}"
-            if not isinstance(parsed, list):
-                return f"Error: {label}_json must be a JSON array."
-            proposal[label] = parsed
+        """Submit the tree proposal.
+        - In an INCREMENTAL UPDATE: pass ONLY the new incoming concepts and any modifications
+          in rows_json and dims_json. They will automatically merge with the existing stored tree.
+          You may also pass the complete tree if preferred.
+        - In a FRESH SEED: pass the complete tree per universal blueprint."""
+        try:
+            parsed_rows = json.loads(rows_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid JSON in rows: {exc}"
+        if not isinstance(parsed_rows, list):
+            return "Error: rows_json must be a JSON array."
+
+        try:
+            parsed_dims = json.loads(dims_json)
+        except json.JSONDecodeError as exc:
+            return f"Invalid JSON in dims: {exc}"
+        if not isinstance(parsed_dims, list):
+            return "Error: dims_json must be a JSON array."
+
+        if stored_rows:
+            proposal["rows"], proposal["dims"] = _merge_proposal_with_stored(parsed_rows, parsed_dims)
+        else:
+            proposal["rows"] = parsed_rows
+            proposal["dims"] = parsed_dims
 
         row_concepts = {r.get("concept") for r in proposal["rows"] if isinstance(r, dict)}
         unknown = [c for c in row_concepts if c not in known_names and not str(c).startswith("custom:")]
@@ -231,14 +345,20 @@ def build_unified_hierarchy_tools(
                 f"Warning: these concepts are neither stored nor in the filing "
                 f"(they may still be custom headers): {sorted_unknown[:10]}"
             )
+        lint_report = _run_linter()
+        if lint_report != "OK — no structural issues found.":
+            return (
+                f"Recorded {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s).\n"
+                f"{lint_report}\n"
+                "Please fix these findings with a revised propose_hierarchy(), or call finalize_hierarchy() if intentional."
+            )
         return (
+            f"OK — hierarchy verified with 0 issues. "
             f"Recorded {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s). "
-            "Call lint_hierarchy() to review, fix what you want, then finalize_hierarchy()."
+            "Call finalize_hierarchy() to complete."
         )
 
-    @tool
-    def lint_hierarchy() -> str:
-        """Report structural issues in your CURRENT proposal."""
+    def _run_linter() -> str:
         rows = [r for r in proposal.get("rows", []) if isinstance(r, dict)]
         problems: list[str] = []
 
@@ -284,8 +404,12 @@ def build_unified_hierarchy_tools(
             if pc:
                 dims_by_pc[str(pc)].append(d)
         for pc, d_list in dims_by_pc.items():
-            if len(d_list) > 3 and not any(d.get("parent_header") for d in d_list):
-                problems.append(f"{pc}: {len(d_list)} dimensional members are flat without grouping headers. Define custom:ProductSegmentation / custom:GeographicSegmentation in rows_json and assign parent_header in dims_json.")
+            if len(d_list) >= 3 and not any(d.get("parent_header") for d in d_list):
+                problems.append(
+                    f"{pc}: {len(d_list)} dimensional members are flat without grouping headers. "
+                    f"Define custom:ProductSegmentation or custom:GeographicSegmentation in rows_json "
+                    f"(with parent='{pc}') and assign parent_header in dims_json."
+                )
 
         # Check header naming consistency against stored grouping headers
         stored_headers = {str(r.get("concept")) for r in stored_rows if str(r.get("concept", "")).startswith("custom:")}
@@ -306,12 +430,19 @@ def build_unified_hierarchy_tools(
             return "OK — no structural issues found."
         return "FINDINGS:\n" + "\n".join(f"  - {x}" for x in problems)
 
+    @tool
+    def lint_hierarchy() -> str:
+        """Report structural issues in your CURRENT proposal."""
+        return _run_linter()
+
+    if not stored_rows:
+        return [
+            query_filing_hierarchy,
+            propose_hierarchy,
+            lint_hierarchy,
+        ]
     return [
-        query_stored_hierarchy,
-        query_filing_hierarchy,
         query_hierarchy_diff,
-        query_concept_candidates,
-        suggest_hierarchy,
         decide_mapping,
         propose_hierarchy,
         lint_hierarchy,

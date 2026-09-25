@@ -123,14 +123,14 @@ def test_assets_equal_liabilities_and_equity():
 # ── structure ───────────────────────────────────────────────────────────────
 
 
-def test_duplicate_path_order_is_high():
+def test_duplicate_path_order_is_non_blocking():
     items = [
         _item("us-gaap:Revenues", 1, path="001", order_key="a"),
         _item("us-gaap:CostOfRevenue", 2, path="001", order_key="a"),
     ]
     findings = check_structure(_bundle(items=items))
     dup = [f for f in findings if f.type == "duplicate_path_order"]
-    assert dup and dup[0].severity == HIGH and dup[0].is_blocking
+    assert dup and dup[0].severity == MEDIUM and not dup[0].is_blocking
 
 
 def test_duplicate_concept_is_medium():
