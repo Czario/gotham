@@ -116,70 +116,6 @@ class DuplicatePreventionManager:
             total_checked=len(concepts)
         )
     
-    def validate_and_adjust_concept(self, concept_doc: ConceptDocument) -> ConceptDocument:
-        """
-        Validate and adjust concept to prevent duplicates by finding next available order_key.
-        
-        Args:
-            concept_doc: Concept document to validate and potentially adjust
-            
-        Returns:
-            ConceptDocument with adjusted order_key if needed
-        """
-        if not concept_doc.path or not concept_doc.order_key:
-            logger.warning(f"Concept {concept_doc.concept} missing path or order_key")
-            return concept_doc  # Let other validation handle this
-        
-        # Check if this path-order combination already exists
-        existing = self.concept_repo.collection.find_one({
-            "cik": concept_doc.company_cik,
-            "statement_type": concept_doc.statement_type,
-            "path": concept_doc.path,
-            "order_key": concept_doc.order_key
-        })
-        
-        if existing and existing.get('concept') != concept_doc.concept:
-            logger.debug(
-                f"Path-order combination already exists! "
-                f"Path: {concept_doc.path}, Order: {concept_doc.order_key} "
-                f"Existing: {existing.get('concept')}, New: {concept_doc.concept}"
-            )
-            
-            # Find next available order_key for this path
-            next_order_key = self._find_next_available_order_key(
-                concept_doc.company_cik,
-                concept_doc.statement_type, 
-                concept_doc.path,
-                concept_doc.order_key
-            )
-            
-            logger.debug(f"Adjusted order_key from '{concept_doc.order_key}' to '{next_order_key}' for concept {concept_doc.concept}")
-            
-            # Create new concept doc with adjusted order_key, preserving all fields
-            adjusted_concept = ConceptDocument(
-                company_cik=concept_doc.company_cik,
-                statement_type=concept_doc.statement_type,
-                concept=concept_doc.concept,
-                label=concept_doc.label,
-                path=concept_doc.path,
-                order_key=next_order_key,
-                abstract=concept_doc.abstract,
-                dimension=concept_doc.dimension,
-                dimension_concept=concept_doc.dimension_concept,
-                concept_id=concept_doc.concept_id,
-                segment_type=concept_doc.segment_type,
-                context_id=concept_doc.context_id,
-                unit_id=concept_doc.unit_id,
-                period=concept_doc.period,
-                concept_name=concept_doc.concept_name,
-                fact_label=concept_doc.fact_label,
-                dimensions=concept_doc.dimensions,
-                dimension_details=concept_doc.dimension_details
-            )
-            return adjusted_concept
-            
-        return concept_doc
-    
     def safe_insert_concept(self, concept_doc: ConceptDocument) -> Optional[ObjectId]:
         """
         Safely insert a concept with automatic order_key adjustment to prevent duplicates.
@@ -238,13 +174,13 @@ class DuplicatePreventionManager:
                 logger.debug(f"Concept {concept_doc.concept} already exists (ID: {existing_by_name['_id']}), reusing it instead of creating new")
                 return existing_by_name['_id']
         
-        # If concept doesn't exist by name, validate and adjust to prevent path-order conflicts
-        adjusted_concept = self.validate_and_adjust_concept(concept_doc)
-        
+        # The hierarchy agent owns placement and its check_hierarchy() critic has
+        # already verified the tree.  Persist is a dumb writer here: insert
+        # exactly what the agent placed — no deterministic order_key rewriting.
         try:
-            return self.concept_repo.insert(adjusted_concept)
+            return self.concept_repo.insert(concept_doc)
         except Exception as e:
-            logger.error(f"Failed to insert concept {adjusted_concept.concept}: {e}")
+            logger.error(f"Failed to insert concept {concept_doc.concept}: {e}")
             return None
     
     def resolve_duplicates(self, company_cik: str, statement_type: str, 
@@ -301,39 +237,6 @@ class DuplicatePreventionManager:
         logger.info(f"Resolved {resolved_count} duplicate concepts")
         return resolved_count
     
-    def _find_next_available_order_key(self, company_cik: str, statement_type: str, 
-                                      path: str, current_order_key: str) -> str:
-        """
-        Find the next available order_key for a given path to ensure sequential insertion.
-        
-        Args:
-            company_cik: Company identifier
-            statement_type: Statement type
-            path: The path where we want to insert
-            current_order_key: The originally requested order_key
-            
-        Returns:
-            Next available order_key that maintains sequence
-        """
-        # Get all existing order_keys for this path
-        existing_concepts = list(self.concept_repo.collection.find({
-            "cik": company_cik,
-            "statement_type": statement_type,
-            "path": path
-        }, {"order_key": 1}).sort("order_key", 1))
-        
-        used_keys = {concept.get('order_key', '') for concept in existing_concepts if concept.get('order_key')}
-        
-        # Start from the current order key and find the next available one
-        base_key = current_order_key
-        
-        # If the base key is available, use it
-        if base_key not in used_keys:
-            return base_key
-        
-        # Find the next available key sequentially
-        return self._generate_next_order_key(base_key, used_keys)
-
     def _generate_next_order_key(self, base_key: str, used_keys: set) -> str:
         """
         Generate the next available order key lexicographically.

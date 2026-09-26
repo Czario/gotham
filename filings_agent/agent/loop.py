@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 _TOOL_RESULT_CAPS: dict[str, int] = {
     "read_lines": 60_000,
     "search": 16_000,
+    # Hierarchy tools return the FULL tree; truncating mid-tree corrupts the
+    # agent's context, so these get the same generous cap as document reads.
+    "query_stored_hierarchy": 60_000,
+    "query_filing_hierarchy": 60_000,
+    "query_hierarchy_diff": 60_000,
+    "preview_hierarchy": 60_000,
+    "lint_hierarchy": 16_000,
 }
 _DEFAULT_TOOL_RESULT_CAP = 8_000
 
@@ -73,6 +80,13 @@ def _summarize_tool_result(tool_name: str, result: Any, dur: float) -> str:
         if tool_name == "query_filing_hierarchy":
             lines = [l for l in result.strip().split("\n") if l.strip()]
             return f"✓ query_filing_hierarchy in {dur_str} ({len(lines)} lines)"
+        if tool_name == "query_stored_hierarchy":
+            lines = [l for l in result.strip().split("\n") if l.strip()]
+            return f"✓ query_stored_hierarchy in {dur_str} ({len(lines)} lines)"
+        if tool_name == "preview_hierarchy":
+            ok = "no duplicate paths" in result
+            status = "✓ clean" if ok else "⚠ check failures"
+            return f"✓ preview_hierarchy in {dur_str} — {status}"
         if tool_name == "decide_mapping":
             first_line = result.strip().split("\n")[0]
             return f"✓ decide_mapping in {dur_str} — {first_line}"

@@ -76,6 +76,8 @@ def test_graph_runs_normalize_then_persist():
         "blocking_findings": 0,
         "dropped_concepts": {},
         "promotions": [],
+        "write_errors": [],
+        "sign_fixes": [],
         "action": "write",
         "decided_by": "policy",
         "decision_reason": "validation passed",
@@ -119,15 +121,17 @@ def test_no_bundles_short_circuits_before_persist():
     assert svc.persist_calls == []  # persist never ran
 
 
-def test_persist_writing_nothing_marks_failed():
+def test_persist_writing_nothing_is_non_fatal():
+    """A statement that writes nothing must not block the filing."""
     svc = FakeNormService(persist_ok=False)
     graph = build_filing_graph(svc)
 
     final = graph.invoke(_state())
 
-    assert final["status"] == "failed"
-    assert final["error"] == "persist wrote no statements"
-    assert len(svc.persist_calls) == 2  # attempted, wrote nothing
+    assert final["status"] == "skipped"           # never "failed"
+    assert final["error"] is None
+    assert final["persist_receipt"]["statements_written"] == 0
+    assert len(svc.persist_calls) == 2            # attempted, wrote nothing
 
 
 def test_node_exception_is_converted_to_failed_status():
@@ -161,3 +165,74 @@ def test_state_summary_is_log_friendly():
     assert summary["bundles"] == 2
     assert summary["statement_docs"] == 2
     assert "bundles_" not in summary  # no raw payloads
+
+
+# ── hierarchy / write defects must never block the DB write ─────────────────
+
+
+def test_statement_write_exception_is_non_fatal_and_skips_only_that_statement():
+    """A raise while writing one statement must not fail the filing — the other
+    statements are still written and the defect is reported in the receipt."""
+    class _Bundle:
+        def __init__(self, statement_type):
+            self.statement_type = statement_type
+
+    class _OneStatementRaises(FakeNormService):
+        def normalize_statement_to_bundle(self, statement_doc, filing_doc, company_doc):
+            self.normalize_calls.append(statement_doc)
+            return _Bundle(statement_doc["statement_type"])
+
+        def persist_statement_bundle(self, bundle, *, enforce_allowed_types=True, **kwargs):
+            self.persist_calls.append((bundle, enforce_allowed_types))
+            if bundle.statement_type == "income":
+                raise ValueError("hierarchy placement blew up")
+            return True
+
+    svc = _OneStatementRaises()
+    graph = build_filing_graph(svc)
+    final = graph.invoke(_state())
+
+    assert final["status"] == "saved"                       # NOT failed
+    assert final["persist_receipt"]["statements_written"] == 1
+    errors = final["persist_receipt"]["write_errors"]
+    assert len(errors) == 1
+    assert errors[0]["statement_type"] == "income"
+    assert "hierarchy placement blew up" in errors[0]["error"]
+
+
+def test_per_concept_write_defects_are_surfaced_not_blocking():
+    """Per-item defects recorded by the service end up in the receipt while the
+    statement still counts as written."""
+    class _RecordsDefect(FakeNormService):
+        def persist_statement_bundle(self, bundle, *, enforce_allowed_types=True, **kwargs):
+            self.persist_calls.append((bundle, enforce_allowed_types))
+            # The real service records defects here instead of raising.
+            self.last_write_failures = [{"concept": "us-gaap:Weird", "stage": "concept",
+                                         "error": "insert rejected"}]
+            return True
+
+    svc = _RecordsDefect()
+    final = build_filing_graph(svc).invoke(_state())
+
+    assert final["status"] == "saved"
+    assert final["persist_receipt"]["statements_written"] == 2
+    assert [e["concept"] for e in final["persist_receipt"]["write_errors"]] == [
+        "us-gaap:Weird", "us-gaap:Weird",
+    ]
+
+
+def test_hierarchy_node_failure_degrades_instead_of_blocking(monkeypatch):
+    """If the hierarchy node raises, the graph must still reach persist."""
+    from filings_agent.nodes import hierarchy_agent as ha
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("stored tree unreadable")
+
+    monkeypatch.setattr(ha, "_stored_rows_for", _boom)
+
+    svc = FakeNormService()
+    final = build_filing_graph(svc).invoke(_state())
+
+    assert final["status"] == "saved"
+    assert len(svc.persist_calls) == 2
+    assert (final.get("hierarchy_plan") or {}).get("decided_by") == "degraded"

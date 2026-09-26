@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # ── node → short human label ────────────────────────────────────────────────
 NODE_LABELS: dict[str, str] = {
     "normalize_bundle_node": "normalize",
+    "sign_fix_node": "signs",
     "validate_node": "validate",
     "agent_review_node": "review",
     "repair_node": "repair",
@@ -44,6 +45,7 @@ NODE_LABELS: dict[str, str] = {
 # Step names printed in the per-filing step list (start → end).
 STEP_LABELS: dict[str, str] = {
     "normalize_bundle_node": "normalize",
+    "sign_fix_node": "signs",
     "validate_node": "validate",
     "agent_review_node": "review",
     "repair_node": "repair",
@@ -64,13 +66,13 @@ STEP_LABELS: dict[str, str] = {
 
 # Filing-scoped stages shown in the "✓a → ✓b → ▶c" progress line.
 _FILING_STAGES = {
-    "normalize_bundle_node", "validate_node", "agent_review_node", "repair_node",
+    "normalize_bundle_node", "sign_fix_node", "validate_node", "agent_review_node", "repair_node",
     "hierarchy_agent_node",
     "validate_after_repair_node", "validate_final_node",
     "decide_node", "persist_node", "extract_guidance_node", "save_guidance_node",
 }
 _SHORT_STAGE = {
-    "normalize": "norm", "validate": "valid", "re-validate": "re-val",
+    "normalize": "norm", "signs": "signs", "validate": "valid", "re-validate": "re-val",
     "final validate": "final", "review": "review", "repair": "repair",
     "hierarchy": "hier", "decide": "decide", "persist": "write",
     "guidance": "guid", "guidance save": "guid-save",
@@ -227,6 +229,22 @@ def format_step_line(node_name: str, state: dict) -> Optional[str]:
         if conflicts:
             extra.append(f"  │  {len(conflicts)} path conflict(s) resolved")
         return "\n".join([line] + extra)
+
+    if node_name == "sign_fix_node":
+        fixes = state.get("sign_fixes") or []
+        unresolved = state.get("sign_fix_unresolved") or []
+        if not fixes and not unresolved:
+            return f"{_prefix('signs')}sign conventions already satisfied"
+        lines = [f"{_prefix('signs')}{len(fixes)} sign(s) fixed"]
+        for fix in fixes[:5]:
+            lines.append(
+                f"  │  {fix.get('statement_type')} {fix.get('concept')}  "
+                f"{_money(fix.get('old_value'))} → {_money(fix.get('new_value'))}  "
+                f"({fix.get('required_sign')})"
+            )
+        if unresolved:
+            lines.append(f"  │  ⚠ {len(unresolved)} unresolved sign violation(s)")
+        return "\n".join(lines)
 
     if node_name == "decide_node":
         decision = state.get("decision") or {}
@@ -570,6 +588,15 @@ class StepPresenter:
                 return None, ok
             applied = actions.get("applied", 0)
             return f"applied {applied}/{proposed}", ok
+
+        if node_name == "sign_fix_node":
+            fixes = state.get("sign_fixes") or []
+            unresolved = state.get("sign_fix_unresolved") or []
+            if not fixes and not unresolved:
+                return None, ok          # nothing to say
+            if unresolved:
+                return f"{len(fixes)} fixed · ⚠ {len(unresolved)} unresolved", False
+            return _plural(len(fixes), "sign") + " fixed", ok
 
         if node_name == "hierarchy_agent_node":
             plan = state.get("hierarchy_plan") or {}

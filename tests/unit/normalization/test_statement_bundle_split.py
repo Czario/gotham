@@ -230,3 +230,42 @@ def test_legacy_path_builds_bundle_from_models_and_persists(service):
     service._process_financial_statement_with_filing(statement, filing)
 
     assert calls == ["company", "concept", "value"]
+
+
+# ── write defects are recorded, never fatal (hierarchy must not block writes) ─
+
+
+def test_persist_records_concept_defect_and_still_writes_the_statement(service):
+    """A concept that cannot be placed is skipped and reported — the statement
+    still writes (returns True) instead of raising."""
+    bundle = service.normalize_statement_to_bundle(
+        _statement_doc(), FILING_DOC, COMPANY_DOC
+    )
+    service, calls = _recording_service(service)
+    service._get_or_create_concept = Mock(
+        side_effect=ValueError("Failed to create or find concept us-gaap:Revenues")
+    )
+
+    written = service.persist_statement_bundle(bundle)
+
+    assert written is True                       # statement is NOT lost
+    assert service.last_write_failures == [{
+        "concept": "us-gaap:Revenues",
+        "stage": "concept",
+        "error": "Failed to create or find concept us-gaap:Revenues",
+    }]
+    assert "value" not in calls                  # no value written for an unplaced concept
+
+
+def test_persist_records_value_defect_and_keeps_the_row(service):
+    bundle = service.normalize_statement_to_bundle(
+        _statement_doc(), FILING_DOC, COMPANY_DOC
+    )
+    service, calls = _recording_service(service)
+    service._create_value_record = Mock(side_effect=RuntimeError("dup key"))
+
+    written = service.persist_statement_bundle(bundle)
+
+    assert written is True
+    assert [f["stage"] for f in service.last_write_failures] == ["value"]
+    assert service.last_write_failures[0]["concept"] == "us-gaap:Revenues"

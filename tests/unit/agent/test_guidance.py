@@ -445,7 +445,7 @@ def test_graph_runs_guidance_after_successful_save(monkeypatch):
     assert final["guidance_save"]["upserted"] == 1
 
 
-def test_graph_skips_guidance_when_persist_fails(monkeypatch):
+def test_graph_skips_guidance_when_persist_writes_nothing(monkeypatch):
     from filings_agent.graph import build_filing_graph
 
     called = []
@@ -463,7 +463,7 @@ def test_graph_skips_guidance_when_persist_fails(monkeypatch):
 
     final = graph.invoke(_graph_state())
 
-    assert final["status"] == "failed"
+    assert final["status"] == "skipped"           # non-fatal, guidance skipped
     assert called == []
     assert not final.get("guidance_records")
 

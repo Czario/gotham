@@ -35,7 +35,8 @@ def _order_key(position: int) -> str:
 
 def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str],
                  occupied_paths: Optional[set] = None,
-                 identity_paths: Optional[dict] = None) -> tuple[list[dict], list[dict]]:
+                 identity_paths: Optional[dict] = None,
+                 identity_order_keys: Optional[dict] = None) -> tuple[list[dict], list[dict]]:
     """Encode the model's STRUCTURE decisions (parent/position/hide) into path
     strings.  The model's own ``path``/``order_key`` fields are ignored except
     that ``hide`` (or an explicit path "555") means the supplementary bucket —
@@ -45,7 +46,12 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
     (main rows, dimensional members and grouping headers).  It is reserved up
     front so a newly-added row can never steal the slot of an existing row the
     agent did not re-propose; existing concepts additionally reuse their own
-    stored path so paths stay stable across filings."""
+    stored path so paths stay stable across filings.
+
+    ``path`` is an opaque parent/child identity (prefix = nesting).  Sibling
+    ORDER is carried by ``order_key`` — the numeric part of a path is not a
+    position and may not match it after a mid-tree insertion; consumers sort
+    by ``order_key``, never by path number."""
     norm_rows: list[dict] = []
     norm_dims: list[dict] = []
 
@@ -155,6 +161,20 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
                         pass
         return default_idx
 
+    def _explicit_pos(r: dict) -> Optional[int]:
+        for k in ("position", "order", "index"):
+            val = r.get(k)
+            if val is not None:
+                if isinstance(val, (int, float)):
+                    return int(val)
+                if isinstance(val, str):
+                    parts = val.split(".")
+                    try:
+                        return int(parts[-1])
+                    except (ValueError, TypeError):
+                        pass
+        return None
+
     def _is_555(r: dict) -> bool:
         return bool(r.get("hide")) or str(r.get("path") or "") == "555"
 
@@ -175,12 +195,26 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
             return stored_paths[parent]
         return ""
 
+    def _sibling_rank(r: dict) -> tuple:
+        pos = _explicit_pos(r)
+        if pos is not None:
+            return (0, pos, row_seq.get(id(r), 0))
+        # No explicit position: keep the row's input order (the merged list is
+        # already in stored tree order), so existing siblings are never re-keyed.
+        return (1, row_seq.get(id(r), 0), 0)
+
     def _walk(parent: Optional[str], ancestors: frozenset = frozenset()) -> None:
         base = _base(parent)
-        children = sorted(
-            by_parent.get(parent, []),
-            key=lambda r: (_pos(r, row_seq.get(id(r), 0)), row_seq.get(id(r), 0)),
-        )
+        children = sorted(by_parent.get(parent, []), key=_sibling_rank)
+        # order_keys that will be kept by stored rows (no explicit position),
+        # so a newly-inserted sibling can never collide with them.
+        local_order: set[str] = set()
+        for r in children:
+            if _is_555(r) or _explicit_pos(r) is not None:
+                continue
+            ok = (identity_order_keys or {}).get((r["concept"], r.get("parent"), False))
+            if ok and str(ok):
+                local_order.add(str(ok))
         for idx, r in enumerate(children):
             if _is_555(r):
                 r["path"] = "555"
@@ -190,12 +224,13 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
                 stored = stored_paths.get(r["concept"]) if stored_paths else None
                 if stored is None and identity_paths:
                     stored = identity_paths.get((r["concept"], r.get("parent"), False))
-                if (
+                reclaim = bool(
                     stored
                     and stored != "555"
                     and stored not in claimed
                     and (not base or str(stored).startswith(f"{base}."))
-                ):
+                )
+                if reclaim:
                     cand = str(stored)
                 else:
                     n = 1
@@ -205,8 +240,27 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
                             break
                         n += 1
                 r["path"] = cand
-                r["order_key"] = _order_key(idx)
                 r["level"] = len(cand.split(".")) - 1
+                if _explicit_pos(r) is not None:
+                    # Agent explicitly ordered this row: order_key follows its
+                    # position in the sorted sibling list.
+                    ok = _order_key(idx)
+                    while ok in local_order:
+                        idx += 1
+                        ok = _order_key(idx)
+                    r["order_key"] = ok
+                else:
+                    ok = (identity_order_keys or {}).get((r["concept"], r.get("parent"), False))
+                    if ok and str(ok):
+                        r["order_key"] = str(ok)
+                    else:
+                        k = idx
+                        ok2 = _order_key(k)
+                        while ok2 in local_order:
+                            k += 1
+                            ok2 = _order_key(k)
+                        r["order_key"] = ok2
+                local_order.add(str(r["order_key"]))
                 used.add(cand)
                 claimed.add(cand)
             path_by_concept.setdefault(r["concept"], str(r["path"]))
@@ -285,7 +339,13 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
                 pos_idx = dim_counters[base]
                 cand = f"{base}.{pos_idx:03d}" if base else f"{pos_idx:03d}"
         d["path"] = cand
-        d["order_key"] = _order_key(pos_idx - 1)
+        stored_dim_ok = (identity_order_keys or {}).get((
+            d.get("concept"), d.get("parent_concept"), True, d.get("parent_header")
+        ))
+        if stored_dim_ok and str(stored_dim_ok):
+            d["order_key"] = str(stored_dim_ok)
+        else:
+            d["order_key"] = _order_key(pos_idx - 1)
         d["level"] = len(cand.split(".")) - 1
         used.add(cand)
         claimed.add(cand)
@@ -296,15 +356,14 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
 def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[str, str], set, dict]:
     """Fetch all stored rows (main + dims) for this cik+statement.
 
-    Returns ``(stored, path_by_concept, occupied_paths, identity_paths)``.
-    ``occupied_paths`` is EVERY materialised path already stored so the
-    materialiser never hands an existing slot to a newly-added row, and
-    ``identity_paths`` maps ``(concept, parent_concept, dimension_concept)`` to
-    its stored path so an existing row reclaims its own slot on reprocessing.
+    Returns ``(stored, path_by_concept, occupied_paths, identity_paths,
+    identity_order_keys)``.  Rows are returned in stored tree order (siblings
+    by ``order_key``) so the agent and the encoder never fall back to Mongo's
+    arbitrary natural order.
     """
     resolver = getattr(norm_service, "_get_concept_repo_by_form_type", None)
     if not callable(resolver):
-        return [], {}, set(), {}
+        return [], {}, set(), {}, {}
     repo: Any = resolver(getattr(bundle, "form_type", None))
     try:
         main = list(repo.collection.find({
@@ -322,6 +381,13 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
         }))
     except Exception:
         dims = []
+    def _tree_key(s: dict) -> tuple:
+        p = str(s.get("path") or "")
+        parent = p.rsplit(".", 1)[0] if "." in p else ""
+        return (parent, str(s.get("order_key") or ""), p)
+
+    main.sort(key=_tree_key)
+    dims.sort(key=_tree_key)
     stored = main + dims
     path_by_concept: dict[str, str] = {}
     for s in main:
@@ -332,6 +398,7 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
         if s.get("path") and str(s["path"]) != "555"
     }
     identity_paths: dict[tuple, str] = {}
+    identity_order_keys: dict[tuple, str] = {}
     for s in stored:
         if not s.get("concept") or not s.get("path"):
             continue
@@ -345,7 +412,9 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
             s.get("parent_header"),  # None for non-header dims
         )
         identity_paths.setdefault(key, str(s["path"]))
-    return stored, path_by_concept, occupied, identity_paths
+        if s.get("order_key") is not None:
+            identity_order_keys.setdefault(key, str(s["order_key"]))
+    return stored, path_by_concept, occupied, identity_paths, identity_order_keys
 
 
 def _filing_rows_for(bundle: Any) -> list[dict]:
@@ -407,7 +476,7 @@ def make_hierarchy_agent_node(
         for bundle in bundles:
             stmt_t0 = time.perf_counter()
             stmt_type = getattr(bundle, "statement_type", "?")
-            stored, stored_paths, occupied_paths, identity_paths = _stored_rows_for(norm_service, bundle)
+            stored, stored_paths, occupied_paths, identity_paths, identity_order_keys = _stored_rows_for(norm_service, bundle)
             filing_rows = _filing_rows_for(bundle)
             if not filing_rows and not stored:
                 continue
@@ -422,31 +491,42 @@ def make_hierarchy_agent_node(
             filing_names = {r.get("concept") for r in filing_rows if r.get("concept")}
             new_concepts = filing_names - stored_names
             if stored and not new_concepts:
-                # All concepts are known — reuse stored paths verbatim.
+                # All concepts are known — reuse the stored hierarchy verbatim.
+                # No LLM and no encoding: the stored rows already carry their
+                # agent-approved path/order_key/parent, so reuse them as-is.
                 stmt_dur = time.perf_counter() - stmt_t0
                 report_call(
                     f"  [hierarchy]  • {stmt_type}: ⚡ fast-path (0 new concepts — reusing stored hierarchy)  {stmt_dur:.2f}s"
                 )
                 report_detail(f"{stmt_type}: fast-path")
-                proposal["rows"] = [
-                    {
-                        "concept": r["concept"],
-                        "parent": r.get("parent_concept"),
-                        "label": r.get("label"),
-                        "abstract": r.get("abstract", False),
-                    }
-                    for r in stored if not r.get("dimension_concept") and r.get("concept")
-                ]
-                proposal["dims"] = [
-                    {
-                        "concept": r["concept"],
-                        "parent_concept": r.get("parent_concept"),
-                        "label": r.get("label"),
-                        "segment_type": r.get("segment_type"),
-                        "parent_header": r.get("parent_header"),
-                    }
-                    for r in stored if r.get("dimension_concept") and r.get("concept")
-                ]
+                proposal["_preview"] = {
+                    "rows": [
+                        {
+                            "concept": s["concept"],
+                            "parent": s.get("parent_concept"),
+                            "label": s.get("label"),
+                            "abstract": s.get("abstract", False),
+                            "path": s.get("path"),
+                            "order_key": s.get("order_key"),
+                            "level": s.get("level", s.get("hierarchy_level", 0)),
+                        }
+                        for s in stored
+                        if not s.get("dimension_concept") and s.get("concept") and s.get("path")
+                    ],
+                    "dims": [
+                        {
+                            "concept": s["concept"],
+                            "parent_concept": s.get("parent_concept"),
+                            "label": s.get("label"),
+                            "segment_type": s.get("segment_type"),
+                            "parent_header": s.get("parent_header"),
+                            "path": s.get("path"),
+                            "order_key": s.get("order_key"),
+                        }
+                        for s in stored
+                        if s.get("dimension_concept") and s.get("concept") and s.get("path")
+                    ],
+                }
             else:
                 # New concepts found (or fresh seed) — invoke the LLM agent.
                 if not stored:
@@ -466,14 +546,20 @@ def make_hierarchy_agent_node(
                     statement_type=getattr(bundle, "statement_type", ""),
                     form_type=getattr(bundle, "form_type", ""),
                     company_cik=getattr(bundle, "company_cik", ""),
+                    stored_paths=stored_paths,
+                    occupied_paths=occupied_paths,
+                    identity_paths=identity_paths,
+                    identity_order_keys=identity_order_keys,
+                    materialize=_materialize,
                 )
                 if not stored:
                     task = (
                         f"FRESH SEED for {getattr(bundle, 'statement_type', '?')} "
                         f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
                         f"No existing hierarchy is stored in DB. Inspect filing line items via query_filing_hierarchy(), "
-                        f"then call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint, "
-                        f"and finalize."
+                        f"then call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint. "
+                        f"Call preview_hierarchy() to verify the materialized paths/order_keys, "
+                        f"fix anything wrong, then finalize."
                     )
                 else:
                     task = (
@@ -482,8 +568,10 @@ def make_hierarchy_agent_node(
                         f"Stored rows: {len(stored)}, Filing rows: {len(filing_rows)}. "
                         f"Call query_hierarchy_diff() to inspect the delta between filing and stored tree. "
                         f"If any new concept is an alias, call decide_mapping(). "
-                        f"Then call propose_hierarchy(rows_json, dims_json) specifying the new concepts to insert "
-                        f"(they will automatically merge with stored rows), and finalize."
+                        f"Then call propose_hierarchy(rows_json, dims_json) with the COMPLETE ordered tree "
+                        f"(every row gets an explicit position) so you own the full order. "
+                        f"Call preview_hierarchy() to verify the materialized paths/order_keys, "
+                        f"fix anything wrong, then finalize."
                     )
                 try:
                     _ = run_agent_loop(
@@ -500,64 +588,20 @@ def make_hierarchy_agent_node(
                     logger.warning("hierarchy agent failed for %s/%s: %s",
                                    bundle.company_cik, bundle.statement_type, exc)
 
-            if not proposal.get("rows"):
-                report_call(f"  [hierarchy]  ! {bundle.statement_type}: no tree proposed, using fallback")
-                logger.warning("hierarchy agent proposed no tree for %s/%s; falling back to filing rows",
-                               bundle.company_cik, bundle.statement_type)
-                if stored:
-                    proposal["rows"] = [
-                        {"concept": s["concept"], "parent": s.get("parent_concept"), "label": s.get("label")}
-                        for s in stored if not s.get("dimension_concept")
-                    ]
-                    stored_concepts = {s["concept"] for s in stored}
-                    for r in filing_rows:
-                        if not r.get("dimension_concept") and r["concept"] not in stored_concepts:
-                            proposal["rows"].append({
-                                "concept": r["concept"],
-                                "parent": r.get("parent_concept"),
-                                "label": r.get("label"),
-                            })
-                    proposal["dims"] = [
-                        {"concept": s["concept"], "parent_concept": s.get("parent_concept"), "label": s.get("label"), "segment_type": s.get("segment_type")}
-                        for s in stored if s.get("dimension_concept")
-                    ]
-                    for r in filing_rows:
-                        if r.get("dimension_concept") and r["concept"] not in stored_concepts:
-                            proposal["dims"].append({
-                                "concept": r["concept"],
-                                "parent_concept": r.get("parent_concept"),
-                                "label": r.get("label"),
-                                "segment_type": r.get("segment_type"),
-                            })
-                else:
-                    proposal["rows"] = [
-                        {"concept": r["concept"], "parent": r.get("parent_concept"), "label": r.get("label")}
-                        for r in filing_rows if not r.get("dimension_concept")
-                    ]
-                    proposal["dims"] = [
-                        {"concept": r["concept"], "parent_concept": r.get("parent_concept"), "label": r.get("label"), "segment_type": r.get("segment_type")}
-                        for r in filing_rows if r.get("dimension_concept")
-                    ]
-
-            # Reserve every already-stored path so a new row can never steal an
-            # existing slot — except the paths of concepts this filing MERGES
-            # into, which the incoming tag legitimately takes over.
-            merge_targets = {
-                m.get("same_as")
-                for m in (proposal.get("merges") or {}).values()
-                if isinstance(m, dict) and m.get("same_as")
-            }
-            reserved_paths = set(occupied_paths)
-            for target in merge_targets:
-                target_path = stored_paths.get(str(target))
-                if target_path:
-                    reserved_paths.discard(str(target_path))
-
-            rows, dims = _materialize(
-                proposal["rows"], proposal["dims"], stored_paths,
-                occupied_paths=reserved_paths,
-                identity_paths=identity_paths,
-            )
+            # The agent's tools (propose_hierarchy / preview_hierarchy) already
+            # materialized the final tree and the agent checked it.  Use that
+            # frozen payload verbatim — no deterministic encoding after the loop.
+            preview = proposal.get("_preview")
+            if not preview or not preview.get("rows"):
+                report_call(
+                    f"  [hierarchy]  ! {bundle.statement_type}: no agent-checked tree — skipping (nothing written)"
+                )
+                logger.error(
+                    "hierarchy agent produced no checked tree for %s/%s; skipping",
+                    bundle.company_cik, bundle.statement_type,
+                )
+                continue
+            rows, dims = preview["rows"], preview["dims"]
 
             # (parent_concept, concept) -> (path, order, parent_header) for dims
             # Key by (parent_concept, concept) since the incoming filing bundle dims
@@ -574,7 +618,7 @@ def make_hierarchy_agent_node(
             if abstracts is None:
                 abstracts = []
                 bundle.abstract_concepts = abstracts
-            plan_by_concept = {r.get("concept"): r for r in rows if r.get("concept")}
+            plan_by_concept = {(r.get("parent"), r.get("concept")): r for r in rows if r.get("concept")}
             # Grouping headers repeat by name across parents, so they must be
             # resolved by (concept, parent) instead of name alone.
             plan_header_by_parent = {
@@ -589,7 +633,14 @@ def make_hierarchy_agent_node(
                     planned = plan_header_by_parent.get((item["concept"], item.get("parent_concept")))
                 else:
                     target = item.get("_concept_target") or item["concept"]
-                    planned = plan_by_concept.get(target)
+                    planned = plan_by_concept.get((item.get("parent_concept"), target))
+                    if not planned:
+                        # Fallback: search plan_by_concept for ANY entry matching the target concept
+                        for (p, c), e in plan_by_concept.items():
+                            if c == target:
+                                planned = e
+                                break
+                
                 if planned and planned.get("path"):
                     item["path"] = planned["path"]
                     item["order_key"] = planned["order_key"]
@@ -670,18 +721,40 @@ def make_hierarchy_agent_node(
                 if not same_as:
                     continue
                 if m.get("keep_tag") == "incoming":
+                    # The loser's dimensional children must follow the surviving
+                    # row.  Use the paths the AGENT placed (via move_row +
+                    # preview); persist never computes them.
+                    preview_dims = (proposal.get("_preview") or {}).get("dims") or []
+                    child_plan: list[dict] = []
+                    for ch in (m.get("children") or []):
+                        child_name = ch.get("concept")
+                        placed = next(
+                            (
+                                d for d in preview_dims
+                                if d.get("concept") == child_name
+                                and (d.get("parent_concept") or d.get("parent")) == concept
+                            ),
+                            None,
+                        )
+                        child_plan.append({
+                            "concept": child_name,
+                            "path": (placed or {}).get("path"),
+                            "order_key": (placed or {}).get("order_key"),
+                            "parent_header": (placed or {}).get("parent_header"),
+                        })
                     promotions.append({
                         "cik": getattr(bundle, "company_cik", None),
                         "statement_type": getattr(bundle, "statement_type", None),
                         "form_type": getattr(bundle, "form_type", None),
                         "from_concept": same_as,
                         "to_concept": concept,
+                        "children": child_plan,
                     })
                 else:
-                    for item in list(concrete) + list(abstracts):
+                    all_items = list(concrete) + list(abstracts) + list(getattr(bundle, "dimensional_concepts", None) or [])
+                    for item in all_items:
                         if isinstance(item, dict) and item.get("concept") == concept:
                             item["_concept_target"] = same_as
-                            break
 
             # queue stored main-row path updates that the agent changed
             stored_by_concept: dict[str, dict] = {}
@@ -744,4 +817,31 @@ def make_hierarchy_agent_node(
         )
         return {**state, "hierarchy_plan": plan, "concept_promotions": all_promotions, "status": "hierarchy_agent_done"}
 
-    return hierarchy_agent_node
+    def _resilient_node(state: dict) -> dict:
+        """A hierarchy defect must never block the write.
+
+        Any unexpected failure (stored-tree read, tool build, materialisation,
+        agent loop) degrades to whatever placement the bundles already carry
+        and lets the write proceed.  The issue is reported loudly, never
+        hidden; ``status`` stays out of the short-circuit set.
+        """
+        try:
+            return hierarchy_agent_node(state)
+        except Exception as exc:  # noqa: BLE001 — hierarchy must not stop the write
+            logger.error(
+                "hierarchy agent node failed (%s); continuing with stored placement",
+                exc, exc_info=True,
+            )
+            report_call(
+                f"  [hierarchy]  ! hierarchy failed — writing with stored placement —"
+                f" {str(exc)[:120]}"
+            )
+            return {
+                **state,
+                "hierarchy_plan": state.get("hierarchy_plan")
+                or {"decided_by": "degraded", "existing_updates": [], "resolved_concepts": 0},
+                "concept_promotions": state.get("concept_promotions") or [],
+                "status": "hierarchy_agent_done",
+            }
+
+    return _resilient_node

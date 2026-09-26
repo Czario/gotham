@@ -615,6 +615,10 @@ class FinancialNormalizationService:
         if bundle is None:
             return False
 
+        # Recorded (never raised) per-item write defects for THIS call so the
+        # caller can surface them without the statement being lost.
+        self.last_write_failures: list[dict] = []
+
         # Companies are ensured before the statement-type filter (historical
         # behaviour).  A bundle with an empty company_doc is a safe no-op.
         self._ensure_company_in_target_from_dict(bundle.company_doc)
@@ -650,26 +654,18 @@ class FinancialNormalizationService:
         # fallback below preserves the P1/legacy behavior for direct callers
         # that bypass the graph.
         def _promote(item: dict, index: int) -> dict:
-            """Resolve an item's hierarchy placement (P5-resolved items keep theirs)."""
+            """Resolve an item's hierarchy placement.
+
+            The hierarchy agent owns placement.  A resolved item keeps the
+            agent's path/order_key/level.  An UNRESOLVED item is left unplaced
+            (path/order_key stay as-is, i.e. None) — the agent's structural
+            critic reports unplaced rows so they are fixed before finalize.
+            We never invent a path or copy a reference from another company
+            here: that silently corrupted the tree (wrong parents, duplicate
+            slots, broken parent references).
+            """
             promoted_item = item.copy()
-            if not item.get('_hierarchy_resolved'):
-                reference = concept_repo.find_concept_reference_for_hierarchy(
-                    statement.statement_type, item['concept'], dimension_concept=False
-                )
-                if reference:
-                    promoted_item['path'] = reference['path']
-                    promoted_item['order_key'] = reference['order_key']
-                else:
-                    promoted_item['path'] = f"{index + 1:03d}"
-                    promoted_item['order_key'] = (
-                        chr(ord('a') + (index % 26))
-                        if index < 26
-                        else f"{chr(ord('a') + (index // 26 - 1))}{chr(ord('a') + (index % 26))}"
-                    )
-                promoted_item['level'] = 1
-            else:
-                promoted_item['path'] = item.get('path')
-                promoted_item['order_key'] = item.get('order_key')
+            if item.get('_hierarchy_resolved'):
                 promoted_item['level'] = item.get(
                     'hierarchy_level', item.get('level', 0)
                 )
@@ -693,9 +689,19 @@ class FinancialNormalizationService:
             # Preserve abstract=True for custom: grouping headers; force False for everything else.
             if not item.get("concept", "").startswith("custom:"):
                 item["abstract"] = False
-            concept_id = self._get_or_create_concept(
-                statement.company_cik, statement.statement_type, item, filing.form_type
-            )
+            try:
+                concept_id = self._get_or_create_concept(
+                    statement.company_cik, statement.statement_type, item, filing.form_type
+                )
+            except Exception as exc:  # noqa: BLE001 — one bad row must not lose the statement
+                logger.error(
+                    "persist: could not place concept %r (%s); skipping its values",
+                    item.get("concept"), exc, exc_info=True,
+                )
+                self.last_write_failures.append(
+                    {"concept": item.get("concept"), "stage": "concept", "error": str(exc)}
+                )
+                concept_id = None
             promoted_ids.append(concept_id)
             if concept_id:
                 concept_mapping[item['concept']] = concept_id
@@ -716,14 +722,23 @@ class FinancialNormalizationService:
             parent_id = concept_mapping.get(parent)
             if parent_id is None:
                 continue
-            concept_repo.collection.update_one(
-                {'_id': concept_id},
-                {'$set': {
-                    'parent_concept': parent,
-                    'parent_concept_id': parent_id,
-                    'parent_path': path_by_concept.get(parent),
-                }},
-            )
+            try:
+                concept_repo.collection.update_one(
+                    {'_id': concept_id},
+                    {'$set': {
+                        'parent_concept': parent,
+                        'parent_concept_id': parent_id,
+                        'parent_path': path_by_concept.get(parent),
+                    }},
+                )
+            except Exception as exc:  # noqa: BLE001 — dangling link is reported, not fatal
+                logger.warning(
+                    "persist: could not link parent for %r -> %r: %s",
+                    item.get('concept'), parent, exc,
+                )
+                self.last_write_failures.append(
+                    {"concept": item.get('concept'), "stage": "parent_link", "error": str(exc)}
+                )
 
         logger.info(f"Promotion: promoted {len(promoted_concepts)} concept(s) (abstract wrappers skipped)")
 
@@ -767,23 +782,49 @@ class FinancialNormalizationService:
             time_period_values = self._extract_time_period_values(item)
             for _, value in time_period_values.items():
                 if value is not None:
-                    self._create_value_record(
+                    try:
+                        self._create_value_record(
+                            concept_id=concept_id,
+                            statement=statement,
+                            filing=filing,
+                            item=item,
+                            value=value,
+                            is_calculated=False,
+                            replace_existing=replace_existing,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — skip the value, keep the row
+                        logger.error(
+                            "persist: value write failed for %r: %s",
+                            item.get('concept'), exc, exc_info=True,
+                        )
+                        self.last_write_failures.append(
+                            {"concept": item.get('concept'), "stage": "value", "error": str(exc)}
+                        )
+            if 'dimensional_facts' in item:
+                try:
+                    self._process_dimensional_data_enhanced(
                         concept_id=concept_id,
                         statement=statement,
                         filing=filing,
                         item=item,
-                        value=value,
-                        is_calculated=False,
-                        replace_existing=replace_existing,
+                        dimensional_concept_mapping=dimensional_concept_mapping,
                     )
-            if 'dimensional_facts' in item:
-                self._process_dimensional_data_enhanced(
-                    concept_id=concept_id,
-                    statement=statement,
-                    filing=filing,
-                    item=item,
-                    dimensional_concept_mapping=dimensional_concept_mapping,
-                )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "persist: dimensional value write failed for %r: %s",
+                        item.get('concept'), exc, exc_info=True,
+                    )
+                    self.last_write_failures.append(
+                        {"concept": item.get('concept'), "stage": "dimensional", "error": str(exc)}
+                    )
+
+        if self.last_write_failures:
+            logger.error(
+                "persist: %s %s wrote with %d non-fatal item defect(s): %s",
+                statement.company_cik, statement.statement_type,
+                len(self.last_write_failures),
+                [f["concept"] for f in self.last_write_failures][:10],
+            )
 
         return True
 
@@ -814,7 +855,12 @@ class FinancialNormalizationService:
         self.persist_statement_bundle(bundle, enforce_allowed_types=False)
 
     def apply_hierarchy_updates(self, updates: list[dict]) -> None:
-        """Apply agent-approved repairs to existing concept hierarchy metadata."""
+        """Apply agent-approved repairs to existing concept hierarchy metadata.
+
+        The hierarchy agent owns these fields (path/order_key/parent/level) via
+        its tool calls; this is a dumb writer that persists exactly what the
+        agent finalized.
+        """
         for update in updates or []:
             concept_id = update.get('_id')
             if not concept_id:
@@ -824,7 +870,7 @@ class FinancialNormalizationService:
             )
             fields = {
                 key: update[key]
-                for key in ('path', 'order_key', 'hide', 'abstract', 'hierarchy_level', 'level')
+                for key in ('path', 'order_key', 'hide', 'abstract', 'hierarchy_level', 'level', 'parent_concept')
                 if update.get(key) is not None
             }
             if fields:
@@ -1040,6 +1086,7 @@ class FinancialNormalizationService:
         to_concept: str,
         *,
         winner_item: Optional[dict] = None,
+        children: Optional[list] = None,
     ) -> dict:
         """Newest-period concept wins: move ALL values of ``from_concept`` onto
         ``to_concept`` and hard-delete the ``from_concept`` concept row.
@@ -1070,6 +1117,7 @@ class FinancialNormalizationService:
             "values_moved": 0,
             "duplicate_values_dropped": 0,
             "dimensional_children_moved": 0,
+            "unplaced_children": [],
             "alias_rows_repointed": 0,
             "deleted": False,
             "skipped": None,
@@ -1096,22 +1144,28 @@ class FinancialNormalizationService:
         winner = concept_repo.find_existing(
             cik, statement_type, to_concept, dimension_concept=False
         )
+        winner_created = False
         if not winner:
             item = dict(winner_item or {})
             item.update(
                 {
                     "concept": to_concept,
                     "label": item.get("label") or loser.get("label"),
-                    "path": item.get("path") or loser.get("path"),
-                    "order_key": item.get("order_key") or loser.get("order_key"),
                     "abstract": False,
                     "dimension": loser.get("dimension", False),
                 }
             )
+            # The loser still occupies its (path, order_key) slot, and the
+            # insert guard rejects a second row in an occupied slot — so the
+            # winner is inserted unplaced and moved into the loser's slot once
+            # the loser row is deleted at step 4.
+            item.pop("path", None)
+            item.pop("order_key", None)
             winner_id = self._create_concept(cik, statement_type, item, form_type)
             winner = concept_repo.find_existing(
                 cik, statement_type, to_concept, dimension_concept=False
-            ) or {"_id": winner_id, "concept": to_concept, "path": item.get("path")}
+            ) or {"_id": winner_id, "concept": to_concept, "path": None}
+            winner_created = True
         winner_id = winner["_id"]
 
         # 1) MOVE values — repoint, never delete.  The value collection has a
@@ -1137,34 +1191,89 @@ class FinancialNormalizationService:
             receipt["values_moved"] = moved_count
             receipt["duplicate_values_dropped"] = dropped
 
-        # 2) Re-parent the loser's dimensional children under the winner, and
-        #    re-path them under the winner's path so they are not orphaned by
-        #    the loser row's deletion.  (Dimensional VALUES hang off the
-        #    dimensional concept id, which is unchanged, so they are not
-        #    touched.)
-        loser_path = str(loser.get("path") or "")
-        winner_path = str(winner.get("path") or "")
+        # 2) Re-parent the loser's dimensional children under the winner.  Their
+        #    new PATH is owned by the hierarchy agent (move_row + preview); this
+        #    is a mechanical identity repair only — it NEVER invents a path.  A
+        #    child the agent did not place keeps its existing path and is
+        #    reported loudly so it can be fixed.
+        # The winner will take over the loser's slot (see step 4b), so the
+        # children re-parent onto that same path.
+        winner_path = str(winner.get("path") or loser.get("path") or "")
+        plan_by_child: dict[str, dict] = {}
+        for ch in (children or []):
+            if isinstance(ch, dict) and ch.get("concept"):
+                plan_by_child.setdefault(str(ch["concept"]), ch)
         moved_children = 0
+        unplaced_children: list[str] = []
         for child in concept_repo.collection.find({
             "cik": cik,
             "statement_type": statement_type,
             "concept_id": loser["_id"],
             "dimension_concept": True,
         }):
+            plan = plan_by_child.get(str(child.get("concept")))
             fields = {
                 "concept_id": winner_id,
                 "parent_concept": to_concept,
                 "parent_path": winner_path or None,
             }
-            child_path = str(child.get("path") or "")
-            if loser_path and winner_path and child_path.startswith(loser_path + "."):
-                new_path = winner_path + child_path[len(loser_path):]
+            if plan and plan.get("path"):
+                new_path = str(plan["path"])
                 fields["path"] = new_path
                 fields["hierarchy_level"] = len(new_path.split(".")) - 1
                 fields["level"] = fields["hierarchy_level"]
+                if plan.get("order_key"):
+                    fields["order_key"] = plan["order_key"]
+                if plan.get("parent_header"):
+                    fields["parent_header"] = plan["parent_header"]
+            else:
+                unplaced_children.append(str(child.get("concept")))
             concept_repo.collection.update_one({"_id": child["_id"]}, {"$set": fields})
             moved_children += 1
         receipt["dimensional_children_moved"] = moved_children
+        if unplaced_children:
+            receipt["unplaced_children"] = unplaced_children
+            logger.error(
+                "Concept promotion %s -> %s left %d dimensional child(ren) "
+                "without an agent-placed path (kept their existing path): %s",
+                from_concept, to_concept, len(unplaced_children), unplaced_children,
+            )
+
+        # 2b) Non-dimensional rows hanging directly under the loser — most
+        #     importantly custom grouping headers, whose identity is keyed by
+        #     their parent — must follow the rename too.  Otherwise the parent
+        #     rename creates a fresh copy under the winner while a stale copy
+        #     keeps pointing at the retired name (duplicate path + broken
+        #     parent).  Purely mechanical: paths are never invented.
+        stale_deleted = 0
+        reparented = 0
+        for row in list(concept_repo.collection.find({
+            "cik": cik,
+            "statement_type": statement_type,
+            "parent_concept": from_concept,
+            "dimension_concept": {"$ne": True},
+        })):
+            fresh = concept_repo.collection.find_one({
+                "cik": cik,
+                "statement_type": statement_type,
+                "concept": row.get("concept"),
+                "parent_concept": to_concept,
+                "dimension_concept": {"$ne": True},
+            })
+            if fresh:
+                concept_repo.collection.delete_one({"_id": row["_id"]})
+                stale_deleted += 1
+            else:
+                concept_repo.collection.update_one(
+                    {"_id": row["_id"]},
+                    {"$set": {
+                        "parent_concept": to_concept,
+                        "parent_path": winner_path or None,
+                    }},
+                )
+                reparented += 1
+        receipt["children_reparented"] = reparented
+        receipt["stale_children_deleted"] = stale_deleted
 
         # 3) Decision store: members of the loser now resolve to the winner.
         receipt["alias_rows_repointed"] = self._repoint_concept_aliases(
@@ -1174,6 +1283,25 @@ class FinancialNormalizationService:
         # 4) Hard-delete the losing concept row (the only destructive step).
         deleted = concept_repo.collection.delete_one({"_id": loser["_id"]})
         receipt["deleted"] = bool(getattr(deleted, "deleted_count", 0))
+
+        # 4b) A freshly-created winner was inserted unplaced; the loser's slot
+        #     is free now, so hand it over so the line item keeps its position.
+        #     An already-existing winner keeps its own placement untouched.
+        if winner_created and loser.get("path"):
+            loser_path = str(loser["path"])
+            concept_repo.collection.update_one(
+                {"_id": winner_id},
+                {
+                    "$set": {
+                        "path": loser_path,
+                        "order_key": loser.get("order_key"),
+                        "hierarchy_level": len(loser_path.split(".")) - 1,
+                        "level": len(loser_path.split(".")) - 1,
+                        "parent_concept": loser.get("parent_concept"),
+                        "parent_path": loser.get("parent_path"),
+                    }
+                },
+            )
 
         # 5) Drop stale in-process concept-id cache entries for the loser.
         self._invalidate_concept_cache(cik, statement_type, from_concept, form_type)
@@ -2633,13 +2761,12 @@ class FinancialNormalizationService:
         parent_concept = concept_repo.collection.find_one({"_id": concept_id})
         parent_concept_path = parent_concept.get('path', '') if parent_concept else ''
         
-        # Generate path and order_key for this dimensional concept
-        if assigned_path and assigned_order_key:
-            path = assigned_path
-            order_key = assigned_order_key
-        else:
-            path = concept_repo.generate_dimensional_path(concept_id, segment_type, parent_concept_path)
-            order_key = concept_repo.get_next_dimensional_order_key(concept_id, segment_type)
+        # The hierarchy agent owns placement.  Use ONLY the agent-provided
+        # path/order_key — never invent one deterministically.  An unresolved
+        # member is left unplaced (None); the agent's check_hierarchy() critic
+        # reports it so it is fixed before finalize.
+        path = assigned_path
+        order_key = assigned_order_key
         
         # Create base dimensional concept document using ConceptDocument with dimension_concept=True
         dimensional_concept_doc = ConceptDocument(

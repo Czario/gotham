@@ -263,7 +263,10 @@ def _state(bundles, findings):
 def test_decide_node_records_the_policy_decision():
     store = FakeStore()
     events = []
-    node = make_decide_node(report_store=store, on_event=lambda e, **f: events.append((e, f)))
+    node = make_decide_node(
+        report_store=store, on_event=lambda e, **f: events.append((e, f)),
+        strict_accuracy=True,  # strict: blocking finding → skip
+    )
     out = node(_state([bundle("income")], [math_finding()]))
 
     assert out["status"] == "decided"
@@ -271,6 +274,17 @@ def test_decide_node_records_the_policy_decision():
     assert out["decision"] == out["write_plan"]
     assert store.decisions and store.decisions[0]["action"] == "skip"
     assert events and events[0][0] == "write_decision"
+
+
+def test_decide_node_never_blocks_by_default():
+    """Default is advisory: a high finding is recorded but the filing is written."""
+    store = FakeStore()
+    node = make_decide_node(report_store=store)
+    out = node(_state([bundle("income")], [math_finding()]))
+
+    assert out["status"] == "decided"
+    assert out["write_plan"]["action"] == ACTION_WRITE
+    assert store.decisions and store.decisions[0]["action"] == "write"
 
 
 class StubDecisionChat:
@@ -296,6 +310,7 @@ def test_decide_node_uses_the_agent_judge_when_enabled(monkeypatch):
     import filings_agent.config as config
 
     monkeypatch.setattr(config, "AGENT_DECISION_ENABLED", True)
+    monkeypatch.setattr(config, "STRICT_ACCURACY", True)  # strict → judge consulted
     node = make_decide_node(
         chat_llm=StubDecisionChat(
             '{"action":"write_partial","statements":["income"],'
@@ -313,6 +328,7 @@ def test_decide_node_falls_back_to_policy_when_judge_fails(monkeypatch):
     import filings_agent.config as config
 
     monkeypatch.setattr(config, "AGENT_DECISION_ENABLED", True)
+    monkeypatch.setattr(config, "STRICT_ACCURACY", True)  # strict → policy skip
 
     class Boom:
         def bind_tools(self, tools):

@@ -68,9 +68,11 @@ LLM_CACHE_ENABLED: bool = os.getenv("LLM_CACHE", "0").strip().lower() in {
 LLM_CACHE_DIR: str = os.getenv("LLM_CACHE_DIR", ".llm_cache")
 
 # ── Save gate ──────────────────────────────────────────────────────────────
-# When True (default), the persist node refuses to write a filing that still
-# has unresolved high-severity validation findings.
-STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "1").strip().lower() not in {
+# When True, the persist node refuses to write a filing that still has
+# unresolved high-severity validation findings.  Default is advisory (False):
+# findings are recorded, the validation ceiling still excludes provably-wrong
+# concepts, but a filing is NEVER blocked from being written.
+STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "0").strip().lower() not in {
     "0", "false", "no", "off", ""
 }
 

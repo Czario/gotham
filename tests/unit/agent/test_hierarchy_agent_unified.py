@@ -105,6 +105,11 @@ class _StubChat:
                           "args": {"rows_json": json.dumps(self.rows),
                                    "dims_json": json.dumps(self.dims)}, "id": "p1"})
             return AIMessage(content="", tool_calls=calls)
+        if self.step == 2:
+            # The agent must CHECK the materialized result before finalizing.
+            return AIMessage(content="", tool_calls=[
+                {"name": "preview_hierarchy", "args": {}, "id": "pv1"},
+            ])
         return AIMessage(content="", tool_calls=[
             {"name": "finalize_hierarchy",
              "args": {"result_json": json.dumps({"confirmed": True, "notes": "ok"})}, "id": "f1"},
@@ -302,7 +307,6 @@ def test_query_hierarchy_diff_and_header_consistency_lint():
 
 def test_propose_hierarchy_incremental_additions_merge():
     from filings_agent.tools.hierarchy_tools import build_unified_hierarchy_tools
-
     stored = [
         {"concept": "us-gaap:Revenues", "path": "001", "parent_concept": None, "dimension_concept": False},
         {"concept": "us-gaap:CostOfRevenue", "path": "002", "parent_concept": None, "dimension_concept": False},
@@ -319,12 +323,15 @@ def test_propose_hierarchy_incremental_additions_merge():
     tools = build_unified_hierarchy_tools(stored, filing, proposal)
     tools_by_name = {t.name: t for t in tools}
 
-    # Verify query_stored_hierarchy and query_filing_hierarchy are NOT in tool list for incremental update
-    assert "query_stored_hierarchy" not in tools_by_name
+    # query_stored_hierarchy is now exposed on incremental so the agent sees the
+    # full stored tree before re-proposing the complete ordered tree.
+    assert "query_stored_hierarchy" in tools_by_name
     assert "query_filing_hierarchy" not in tools_by_name
     assert "query_hierarchy_diff" in tools_by_name
+    assert "preview_hierarchy" in tools_by_name
 
-    # Agent passes ONLY the NEW items in propose_hierarchy
+    # Agent passes ONLY the NEW items in propose_hierarchy (partial merge);
+    # stored rows are merged back with explicit positional ranks.
     res = tools_by_name["propose_hierarchy"].invoke({
         "rows_json": json.dumps([
             {"concept": "us-gaap:GrossProfit", "parent": None, "order": 3},
@@ -335,16 +342,252 @@ def test_propose_hierarchy_incremental_additions_merge():
     })
 
     assert "OK" in res
+    # propose accumulates only what the agent passed (stored merge happens at
+    # preview time), and later revisions never erase earlier rows.
     row_concepts = [r["concept"] for r in proposal["rows"]]
-    # Stored rows must be retained, and new row appended
-    assert "us-gaap:Revenues" in row_concepts
-    assert "us-gaap:CostOfRevenue" in row_concepts
+    assert row_concepts == ["us-gaap:GrossProfit"]
+    dim_concepts = [d["concept"] for d in proposal["dims"]]
+    assert dim_concepts == ["aapl:MacMember"]
+
+    # A second (revision) call must NOT erase the first call's rows.
+    tools_by_name["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "us-gaap:CostOfRevenue", "parent": None, "order": 2},
+        ]),
+        "dims_json": "[]",
+    })
+    row_concepts = [r["concept"] for r in proposal["rows"]]
     assert "us-gaap:GrossProfit" in row_concepts
-    assert len(proposal["rows"]) == 3
+    assert "us-gaap:CostOfRevenue" in row_concepts
+    assert len(proposal["rows"]) == 2
 
     dim_concepts = [d["concept"] for d in proposal["dims"]]
-    assert "aapl:IPhoneMember" in dim_concepts
+    assert "aapl:IPhoneMember" not in dim_concepts
     assert "aapl:MacMember" in dim_concepts
-    assert len(proposal["dims"]) == 2
+    assert len(proposal["dims"]) == 1
 
 
+
+
+def _stored_context(docs):
+    """Mirror _stored_rows_for's sorted read + identity maps for a unit test."""
+    main = [d for d in docs if not d.get("dimension_concept")]
+    main.sort(key=lambda s: (
+        str(s.get("parent_concept") or ""),
+        str(s.get("order_key") or ""),
+        str(s.get("path") or ""),
+    ))
+    path_by_concept = {}
+    for s in main:
+        if s.get("concept") and s.get("path"):
+            path_by_concept.setdefault(s["concept"], str(s["path"]))
+    occupied = {str(s["path"]) for s in main if s.get("path") and str(s["path"]) != "555"}
+    identity_paths, identity_order_keys = {}, {}
+    for s in main:
+        if not s.get("concept") or not s.get("path"):
+            continue
+        key = (s["concept"], s.get("parent_concept"), False, s.get("parent_header"))
+        identity_paths.setdefault(key, str(s["path"]))
+        if s.get("order_key") is not None:
+            identity_order_keys.setdefault(key, str(s["order_key"]))
+    return main, path_by_concept, occupied, identity_paths, identity_order_keys
+
+
+def test_incremental_merge_preserves_stored_order_keys_no_drift():
+    """Regression: a new concept must never reshuffle existing siblings' order_keys.
+
+    This is the corruption the agent-owned hierarchy used to produce — existing
+    rows were re-keyed from Mongo's arbitrary find() order on the next filing.
+    """
+    from filings_agent.tools.hierarchy_tools import build_unified_hierarchy_tools
+
+    # Filing 1: seed three siblings under Revenues.
+    seed = [
+        {"concept": "us-gaap:Revenues", "parent": None, "order": 1},
+        {"concept": "us-gaap:ProductMember", "parent": "us-gaap:Revenues", "order": 1},
+        {"concept": "us-gaap:ServiceMember", "parent": "us-gaap:Revenues", "order": 2},
+        {"concept": "us-gaap:HardwareMember", "parent": "us-gaap:Revenues", "order": 3},
+    ]
+    rows1, _ = _materialize(seed, [], {})
+    docs = [
+        {"concept": r["concept"], "path": r["path"], "order_key": r["order_key"],
+         "parent_concept": r.get("parent"), "dimension_concept": False}
+        for r in rows1
+    ]
+
+    # Filing 2: partial merge adding a new sibling (stored rows have no explicit
+    # position, so they must keep their stored order_keys).
+    stored, sp, occ, idp, idok = _stored_context(docs)
+    filing = [{"concept": d["concept"]} for d in docs] + [{"concept": "us-gaap:CloudMember"}]
+    proposal = {"merges": {}, "rows": [], "dims": []}
+    tools = build_unified_hierarchy_tools(
+        stored, filing, proposal,
+        stored_paths=sp, occupied_paths=occ,
+        identity_paths=idp, identity_order_keys=idok,
+        materialize=_materialize,
+    )
+    tb = {t.name: t for t in tools}
+    assert "preview_hierarchy" in tb
+    assert "query_stored_hierarchy" in tb
+
+    tb["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "us-gaap:CloudMember", "parent": "us-gaap:Revenues", "order": 4},
+        ]),
+        "dims_json": "[]",
+    })
+    preview = tb["preview_hierarchy"].invoke({})
+    assert "no duplicate paths" in preview
+
+    rows = proposal["_preview"]["rows"]
+    by = {r["concept"]: r for r in rows}
+    # Existing siblings keep their stored order_keys (a, b, c) — no drift.
+    for d in docs:
+        if d["concept"] == "us-gaap:Revenues":
+            continue
+        assert by[d["concept"]]["order_key"] == d["order_key"], d["concept"]
+        assert by[d["concept"]]["path"] == d["path"], d["concept"]
+    # New sibling is appended (next free path slot) after the existing three.
+    assert by["us-gaap:CloudMember"]["path"] == "001.004"
+
+
+class _NoPreviewChat:
+    """Finalizes without ever calling preview_hierarchy (wrong)."""
+
+    def __init__(self):
+        self.step = 0
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        self.step += 1
+        if self.step == 1:
+            return AIMessage(content="", tool_calls=[
+                {"name": "propose_hierarchy",
+                 "args": {"rows_json": json.dumps([
+                     {"concept": "us-gaap:Revenues", "parent": None, "position": 0},
+                 ]), "dims_json": "[]"}, "id": "p1"},
+            ])
+        return AIMessage(content="", tool_calls=[
+            {"name": "finalize_hierarchy",
+             "args": {"result_json": json.dumps({"status": "done"})}, "id": "f1"},
+        ])
+
+
+def test_node_skips_bundle_when_agent_never_previews():
+    """The check step is mandatory: no preview_hierarchy() → nothing is written."""
+    bundle = _bundle([
+        {"concept": "us-gaap:Revenues", "label": "Revenue", "value": 100.0},
+    ])
+    node = make_hierarchy_agent_node(_Service([]), chat_llm=_NoPreviewChat())
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated",
+                "bundles": [bundle]})
+
+    assert out["status"] == "hierarchy_agent_done"
+    # The bundle must remain untouched — no path/order_key was ever assigned.
+    assert not bundle.concepts[0].get("_hierarchy_resolved")
+    assert not bundle.concepts[0].get("path")
+
+
+def test_agentic_critic_and_move_remove_tools():
+    """The agent gets a critic (check_hierarchy) + actions (move_row/remove_row):
+    it detects a spurious wrapper root and a missing parent, then fixes both."""
+    from filings_agent.tools.hierarchy_tools import build_unified_hierarchy_tools
+
+    proposal = {"merges": {}, "rows": [], "dims": []}
+    filing = [{"concept": c} for c in [
+        "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+        "us-gaap:NetIncomeLoss",
+        "us-gaap:DepreciationDepletionAndAmortization",
+    ]]
+    tools = build_unified_hierarchy_tools(
+        [], filing, proposal, statement_type="cashflow",
+        stored_paths={}, occupied_paths=set(), identity_paths={}, identity_order_keys={},
+        materialize=_materialize,
+    )
+    tb = {t.name: t for t in tools}
+    assert {"check_hierarchy", "move_row", "remove_row"} <= set(tb)
+
+    # Agent proposes a spurious whole-statement wrapper ROOT and a missing parent.
+    tb["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "custom:OperatingActivitiesSection", "parent": None, "order": 1, "abstract": True},
+            {"concept": "us-gaap:NetCashProvidedByUsedInOperatingActivities",
+             "parent": "custom:OperatingActivitiesSection", "order": 1},
+            {"concept": "us-gaap:DepreciationDepletionAndAmortization",
+             "parent": "us-gaap:GhostParent", "order": 2},
+        ]),
+        "dims_json": "[]",
+    })
+    report = tb["check_hierarchy"].invoke({})
+    assert "whole-statement wrapper" in report
+    assert "GhostParent" in report
+
+    # Agent fixes: remove the wrapper, move the rows to real placements.
+    tb["remove_row"].invoke({"row_json": json.dumps({"concept": "custom:OperatingActivitiesSection"})})
+    tb["move_row"].invoke({"row_json": json.dumps({
+        "concept": "us-gaap:NetCashProvidedByUsedInOperatingActivities", "parent": None, "position": 1,
+    })})
+    tb["move_row"].invoke({"row_json": json.dumps({
+        "concept": "us-gaap:DepreciationDepletionAndAmortization",
+        "parent": "us-gaap:NetCashProvidedByUsedInOperatingActivities", "position": 2,
+    })})
+
+    report2 = tb["check_hierarchy"].invoke({})
+    assert "whole-statement wrapper" not in report2
+    assert "GhostParent" not in report2
+
+
+def test_reproposal_does_not_resurrect_a_removed_row():
+    """Once the agent removes a row, a later propose_hierarchy() that still
+    lists it (e.g. copied from the bundle) must NOT add it back — otherwise the
+    agent thrashes remove→propose→remove. Re-adding is done via move_row."""
+    from filings_agent.tools.hierarchy_tools import build_unified_hierarchy_tools
+
+    proposal = {"merges": {}, "rows": [], "dims": []}
+    filing = [{"concept": c} for c in [
+        "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+        "custom:GeographicSegmentation",
+    ]]
+    tools = build_unified_hierarchy_tools(
+        [], filing, proposal, statement_type="income",
+        stored_paths={}, occupied_paths=set(), identity_paths={}, identity_order_keys={},
+        materialize=_materialize,
+    )
+    tb = {t.name: t for t in tools}
+
+    tb["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+             "parent": None, "order": 1, "abstract": True},
+            {"concept": "custom:GeographicSegmentation",
+             "parent": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "order": 1},
+        ]),
+        "dims_json": "[]",
+    })
+    tb["remove_row"].invoke({"row_json": json.dumps({"concept": "custom:GeographicSegmentation"})})
+
+    # A revision that still carries the removed row (the bundle's full list).
+    tb["propose_hierarchy"].invoke({
+        "rows_json": json.dumps([
+            {"concept": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+             "parent": None, "order": 1, "abstract": True},
+            {"concept": "custom:GeographicSegmentation",
+             "parent": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax", "order": 1},
+        ]),
+        "dims_json": "[]",
+    })
+    assert "custom:GeographicSegmentation" not in {
+        r.get("concept") for r in proposal["rows"]
+    }
+
+    # …but an explicit move_row() re-adds it deliberately.
+    tb["move_row"].invoke({"row_json": json.dumps({
+        "concept": "custom:GeographicSegmentation",
+        "parent": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+        "position": 1,
+    })})
+    assert "custom:GeographicSegmentation" in {
+        r.get("concept") for r in proposal["rows"]
+    }

@@ -43,6 +43,13 @@ class FilingAgentState(TypedDict):
     # ── P1 output: in-memory bundles (no DB writes yet) ────────────────────
     bundles: NotRequired[Optional[list]]
 
+    # ── sign conventions (post-extraction) ─────────────────────────────────
+    # In-memory sign corrections applied by the sign subagent before validation:
+    # [{statement_type, concept, old_value, new_value, required_sign, source}].
+    sign_fixes: NotRequired[Optional[list]]
+    # Covered rows the agent left unfixed (should be empty; reported, never blocking).
+    sign_fix_unresolved: NotRequired[Optional[list]]
+
     # ── validation / repair (P3/P4) ────────────────────────────────────────
     # [{type, severity, message, evidence}] — same shape as the earning_agent.
     findings: NotRequired[Optional[list]]

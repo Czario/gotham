@@ -100,7 +100,10 @@ def _state():
 # ── gate behaviour ──────────────────────────────────────────────────────────
 
 
-def test_gate_refuses_filing_with_high_finding():
+def test_gate_refuses_filing_with_high_finding(monkeypatch):
+    import filings_agent.config as cfg
+
+    monkeypatch.setattr(cfg, "STRICT_ACCURACY", True)  # strict gate under test
     svc = _FakeNormService([_bundle(_income_items(gp=999_999))])
     store = _FakeReportStore()
     graph = build_filing_graph(svc, report_store=store)

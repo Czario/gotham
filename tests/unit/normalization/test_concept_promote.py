@@ -33,16 +33,27 @@ def _service(mocker):
 
 
 def _wire(service, mocker, *, loser, winner, values_moved=5, children_moved=0,
-          deleted=1):
+          deleted=1, direct_children=None):
     concept_repo = Mock()
     concept_repo.find_existing.side_effect = [loser, winner]
     # Dimensional children are iterated as documents now (they are re-pathed,
-    # not just re-parented with a bulk update).
-    concept_repo.collection.find.return_value = [
+    # not just re-parented with a bulk update).  Direct (non-dimensional)
+    # children — grouping headers etc. — are a separate query.
+    dim_children = [
         {"_id": ObjectId(), "concept": f"m{i}", "path": f"001.00{i + 1}",
          "dimension_concept": True}
         for i in range(children_moved)
     ]
+    direct = list(direct_children or [])
+
+    def _find(query):
+        if query.get("dimension_concept") == {"$ne": True}:
+            return list(direct)
+        return list(dim_children)
+
+    concept_repo.collection.find.side_effect = _find
+    # No fresh duplicate under the winner unless a test says otherwise.
+    concept_repo.collection.find_one.return_value = None
     concept_repo.collection.delete_one.return_value = Mock(deleted_count=deleted)
 
     value_repo = Mock()
@@ -97,11 +108,15 @@ def test_promotion_moves_values_and_deletes_only_the_concept_row(mocker):
 
 
 def test_promotion_creates_the_winner_when_absent(mocker):
+    """The winner is created UNPLACED while the loser still owns its slot
+    (an occupied (path, order_key) would be rejected by the insert guard), then
+    moved into the loser's slot once the loser row is deleted."""
     service = _service(mocker)
     loser = {"_id": ObjectId(), "concept": OLD_TAG, "label": "Revenues",
-             "path": "001", "order_key": "a"}
+             "path": "001", "order_key": "a", "parent_concept": None,
+             "parent_path": None}
     winner_id = ObjectId()
-    winner = {"_id": winner_id, "concept": NEW_TAG, "path": "001"}
+    winner = {"_id": winner_id, "concept": NEW_TAG, "path": None}
 
     concept_repo = Mock()
     # loser found, winner missing, winner found after creation
@@ -114,15 +129,40 @@ def test_promotion_creates_the_winner_when_absent(mocker):
     mocker.patch.object(service, "_get_concept_repo_by_form_type", return_value=concept_repo)
     mocker.patch.object(service, "_get_value_repo_by_form_type", return_value=value_repo)
     create = mocker.patch.object(service, "_create_concept", return_value=winner_id)
+    service._concept_alias_store = Mock()
+    service._concept_alias_store.promote.return_value = 0
 
     receipt = service.promote_concept("0000789019", "income", "10-Q", OLD_TAG, NEW_TAG)
 
     create.assert_called_once()
     assert create.call_args[0][0] == "0000789019"
     assert create.call_args[0][2]["concept"] == NEW_TAG
-    # inherits the loser's hierarchy placement
-    assert create.call_args[0][2]["path"] == "001"
+    # created UNPLACED — the loser still occupies the slot at insert time
+    assert "path" not in create.call_args[0][2]
+    assert "order_key" not in create.call_args[0][2]
     assert receipt["deleted"] is True
+
+    # … then the winner reclaims the loser's now-free placement
+    place = concept_repo.collection.update_one.call_args
+    assert place[0][0] == {"_id": winner_id}
+    assert place[0][1]["$set"]["path"] == "001"
+    assert place[0][1]["$set"]["order_key"] == "a"
+
+
+def test_promotion_does_not_repath_an_existing_winner(mocker):
+    """When the winner already exists it keeps its own placement — only a
+    freshly-created winner reclaims the loser's slot."""
+    service = _service(mocker)
+    loser = {"_id": ObjectId(), "concept": OLD_TAG, "path": "001", "order_key": "a"}
+    winner = {"_id": ObjectId(), "concept": NEW_TAG, "path": "009"}
+    concept_repo, _ = _wire(service, mocker, loser=loser, winner=winner)
+    service._concept_alias_store = Mock()
+    service._concept_alias_store.promote.return_value = 0
+
+    service.promote_concept("0000789019", "income", "10-Q", OLD_TAG, NEW_TAG)
+
+    # only the delete of the loser — no placement update for the winner
+    concept_repo.collection.update_one.assert_not_called()
 
 
 def test_promotion_is_idempotent_when_loser_is_gone(mocker):
@@ -202,9 +242,9 @@ def test_promotion_is_scoped_to_the_given_form_type(mocker):
     service._get_value_repo_by_form_type.assert_called_with("10-Q")
 
 
-def test_promotion_repaths_dimensional_children_under_the_winner(mocker):
-    """Children must be re-pathed, not just re-parented, or the loser row's
-    deletion orphans them (regression: capex merge left 002.005.00x orphans)."""
+def test_promotion_reparents_children_with_agent_placed_paths(mocker):
+    """Children must be re-parented (never orphaned); their PATH comes from the
+    hierarchy agent's plan (move_row + preview) — persist never computes it."""
     service = _service(mocker)
     loser = {"_id": ObjectId(), "concept": OLD_TAG, "path": "002.005"}
     winner = {"_id": ObjectId(), "concept": NEW_TAG, "path": "005.006"}
@@ -213,7 +253,48 @@ def test_promotion_repaths_dimensional_children_under_the_winner(mocker):
 
     concept_repo = Mock()
     concept_repo.find_existing.side_effect = [loser, winner]
-    concept_repo.collection.find.return_value = [child]
+    concept_repo.collection.find.side_effect = (
+        lambda q: [child] if q.get("dimension_concept") is True else []
+    )
+    concept_repo.collection.find_one.return_value = None
+    concept_repo.collection.delete_one.return_value = Mock(deleted_count=1)
+    value_repo = Mock()
+    value_repo.collection.update_many.return_value = Mock(modified_count=0)
+    mocker.patch.object(service, "_get_concept_repo_by_form_type", return_value=concept_repo)
+    mocker.patch.object(service, "_get_value_repo_by_form_type", return_value=value_repo)
+    service._concept_alias_store = Mock()
+    service._concept_alias_store.promote.return_value = 0
+
+    receipt = service.promote_concept(
+        "0000320193", "cashflow", "10-K", OLD_TAG, NEW_TAG,
+        children=[{"concept": "aapl:RetailMember", "path": "005.006.001", "order_key": "a"}],
+    )
+
+    assert receipt["dimensional_children_moved"] == 1
+    assert receipt["unplaced_children"] == []
+    update = concept_repo.collection.update_one.call_args
+    assert update[0][0] == {"_id": child["_id"]}
+    fields = update[0][1]["$set"]
+    assert fields["path"] == "005.006.001"      # from the AGENT's plan
+    assert fields["parent_path"] == "005.006"
+    assert fields["concept_id"] == winner["_id"]
+
+
+def test_promotion_without_agent_path_keeps_child_path_and_reports_it(mocker):
+    """No agent plan → the child is still re-parented (never orphaned) but its
+    path is left as-is and reported — never invented."""
+    service = _service(mocker)
+    loser = {"_id": ObjectId(), "concept": OLD_TAG, "path": "002.005"}
+    winner = {"_id": ObjectId(), "concept": NEW_TAG, "path": "005.006"}
+    child = {"_id": ObjectId(), "concept": "aapl:RetailMember",
+             "path": "002.005.001", "dimension_concept": True}
+
+    concept_repo = Mock()
+    concept_repo.find_existing.side_effect = [loser, winner]
+    concept_repo.collection.find.side_effect = (
+        lambda q: [child] if q.get("dimension_concept") is True else []
+    )
+    concept_repo.collection.find_one.return_value = None
     concept_repo.collection.delete_one.return_value = Mock(deleted_count=1)
     value_repo = Mock()
     value_repo.collection.update_many.return_value = Mock(modified_count=0)
@@ -225,9 +306,51 @@ def test_promotion_repaths_dimensional_children_under_the_winner(mocker):
     receipt = service.promote_concept("0000320193", "cashflow", "10-K", OLD_TAG, NEW_TAG)
 
     assert receipt["dimensional_children_moved"] == 1
-    update = concept_repo.collection.update_one.call_args
-    assert update[0][0] == {"_id": child["_id"]}
-    fields = update[0][1]["$set"]
-    assert fields["path"] == "005.006.001"
-    assert fields["parent_path"] == "005.006"
+    assert receipt["unplaced_children"] == ["aapl:RetailMember"]
+    fields = concept_repo.collection.update_one.call_args[0][1]["$set"]
+    assert "path" not in fields                 # never invented
     assert fields["concept_id"] == winner["_id"]
+
+
+def test_promotion_reparents_direct_children_and_drops_stale_duplicates(mocker):
+    """A non-dimensional row under the loser (e.g. a custom grouping header,
+    which is keyed by its parent) must follow the rename.  If a fresh copy
+    already sits under the winner, the stale copy is removed — otherwise the
+    rename leaves a duplicate path pointing at a retired name."""
+    service = _service(mocker)
+    loser = {"_id": ObjectId(), "concept": OLD_TAG, "path": "001", "order_key": "a"}
+    winner = {"_id": ObjectId(), "concept": NEW_TAG, "path": "001"}
+    stale = {"_id": ObjectId(), "concept": "custom:ProductSegmentation",
+             "path": "001.001", "parent_concept": OLD_TAG, "dimension_concept": False}
+    movable = {"_id": ObjectId(), "concept": "custom:GeographicSegmentation",
+               "path": "001.002", "parent_concept": OLD_TAG, "dimension_concept": False}
+
+    concept_repo = Mock()
+    concept_repo.find_existing.side_effect = [loser, winner]
+    concept_repo.collection.find.side_effect = (
+        lambda q: [stale, movable] if q.get("dimension_concept") == {"$ne": True} else []
+    )
+    # a fresh `custom:ProductSegmentation` already hangs under the winner …
+    concept_repo.collection.find_one.side_effect = (
+        lambda q: {"_id": ObjectId()} if q.get("concept") == "custom:ProductSegmentation" else None
+    )
+    concept_repo.collection.delete_one.return_value = Mock(deleted_count=1)
+    value_repo = Mock()
+    value_repo.collection.update_many.return_value = Mock(modified_count=0)
+    mocker.patch.object(service, "_get_concept_repo_by_form_type", return_value=concept_repo)
+    mocker.patch.object(service, "_get_value_repo_by_form_type", return_value=value_repo)
+    service._concept_alias_store = Mock()
+    service._concept_alias_store.promote.return_value = 0
+
+    receipt = service.promote_concept("0000320193", "income", "10-K", OLD_TAG, NEW_TAG)
+
+    assert receipt["stale_children_deleted"] == 1
+    assert receipt["children_reparented"] == 1
+    # the stale copy is deleted …
+    assert {"_id": stale["_id"]} in [c.args[0] for c in concept_repo.collection.delete_one.call_args_list]
+    # … the other is re-parented onto the winner (path untouched)
+    reparent = [c for c in concept_repo.collection.update_one.call_args_list
+                if c.args[0] == {"_id": movable["_id"]}]
+    assert len(reparent) == 1
+    assert reparent[0].args[1]["$set"]["parent_concept"] == NEW_TAG
+    assert "path" not in reparent[0].args[1]["$set"]

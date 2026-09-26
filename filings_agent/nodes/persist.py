@@ -91,6 +91,7 @@ def make_persist_node(
 
         written = 0
         skipped_statements: list[Any] = []
+        write_errors: list[dict] = []
 
         # A write is now certain: run the deferred pre-write step (the scraper
         # uses this for the --reload delete, so a skip can never delete data).
@@ -136,6 +137,7 @@ def make_persist_node(
                     promo.get("form_type"),
                     promo.get("from_concept"),
                     promo.get("to_concept"),
+                    children=promo.get("children"),
                 )
                 promotion_receipts.append(receipt)
                 report_call(
@@ -170,21 +172,74 @@ def make_persist_node(
                 skipped_statements.append(statement_type)
                 continue
 
-            if norm_service.persist_statement_bundle(
-                bundle,
-                enforce_allowed_types=enforce_allowed_types,
-                replace_existing=bool(state.get("replace_existing")),
-            ):
+            try:
+                wrote = norm_service.persist_statement_bundle(
+                    bundle,
+                    enforce_allowed_types=enforce_allowed_types,
+                    replace_existing=bool(state.get("replace_existing")),
+                )
+                for defect in (getattr(norm_service, "last_write_failures", None) or []):
+                    write_errors.append({"statement_type": statement_type, **defect})
+            except Exception as exc:  # noqa: BLE001 — a write defect must not block the filing
+                logger.error(
+                    "persist: %s write raised; continuing with the other statements: %s",
+                    statement_type, exc, exc_info=True,
+                )
+                report_call(f"  [persist]  ! {statement_type} write failed — {str(exc)[:120]}")
+                write_errors.append(
+                    {"statement_type": statement_type, "stage": "statement", "error": str(exc)}
+                )
+                wrote = False
+
+            if wrote:
                 written += 1
-                report_call(f"  [persist]  ✓ {statement_type} written")
+                report_call(
+                    f"  [persist]  ✓ {statement_type} written"
+                    + (
+                        f" ({sum(1 for e in write_errors if e.get('statement_type') == statement_type)} row defect(s) skipped)"
+                        if any(e.get("statement_type") == statement_type for e in write_errors)
+                        else ""
+                    )
+                )
             else:
                 skipped_statements.append(statement_type)
 
+        if write_errors:
+            logger.error(
+                "persist: %d non-fatal write defect(s) for %s: %s",
+                len(write_errors), state.get("accession_number"),
+                [e.get("concept") or e.get("statement_type") for e in write_errors][:10],
+            )
+
         if written == 0:
+            # Never block the filing on a write defect: report it and finish
+            # cleanly (non-fatal skip).  With the per-item resilience above this
+            # only happens on a total failure, which stays visible in the receipt.
+            reason = (
+                f"no statement written ({len(write_errors)} write error(s))"
+                if write_errors else "no statement had anything to write"
+            )
+            report_call(f"  [persist]  ! {reason} — non-fatal")
+            logger.error(
+                "persist: %s for %s; write_errors=%s",
+                reason, state.get("accession_number"), write_errors,
+            )
             return {
                 **state,
-                "status": "failed",
-                "error": "persist wrote no statements",
+                "status": "skipped",
+                "error": None,
+                "persist_receipt": {
+                    "statements_written": 0,
+                    "statements_total": len(bundles),
+                    "statements_skipped": skipped_statements,
+                    "cik": state.get("cik"),
+                    "accession_number": state.get("accession_number"),
+                    "blocking_findings": len(blocking_findings(state.get("findings") or [])),
+                    "write_errors": write_errors,
+                    "action": plan.get("action"),
+                    "decided_by": plan.get("decided_by"),
+                    "decision_reason": plan.get("reason"),
+                },
             }
 
         # Apply hierarchy repairs (re-pathing duplicate paths, moving non-relevant to path 555)
@@ -224,6 +279,8 @@ def make_persist_node(
                 "blocking_findings": len(blocking_findings(state.get("findings") or [])),
                 "dropped_concepts": plan.get("drop_concepts") or {},
                 "promotions": promotion_receipts,
+                "write_errors": write_errors,
+                "sign_fixes": state.get("sign_fixes") or [],
                 "action": plan.get("action"),
                 "decided_by": plan.get("decided_by"),
                 "decision_reason": plan.get("reason"),

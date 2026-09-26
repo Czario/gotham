@@ -140,6 +140,7 @@ def with_hooks(
                 **state,
                 "status": "failed",
                 "error": f"{node_name} raised: {exc}",
+                "_raised_exception": True,
             }
 
         elapsed_ms = (time.perf_counter() - t0) * 1000

@@ -164,7 +164,7 @@ class ConceptRepository:
                 "path": {"$exists": True, "$ne": None},
                 "order_key": {"$exists": True, "$ne": None}
             },
-            {"path": 1, "order_key": 1, "cik": 1, "_id": 0}
+            {"path": 1, "order_key": 1, "cik": 1, "parent_concept": 1, "_id": 0}
         )
         
         # Collect all references
@@ -209,8 +209,15 @@ class ConceptRepository:
         result = {
             'path': most_common_path,
             'order_key': most_common_order_key,
-            'cik': reference_company or references[0]['cik']
+            'cik': reference_company or references[0]['cik'],
+            'parent_concept': None,
         }
+        for ref in references:
+            if ref['path'] == most_common_path and ref['order_key'] == most_common_order_key:
+                result['parent_concept'] = ref.get('parent_concept')
+                break
+        if result['parent_concept'] is None and references:
+            result['parent_concept'] = references[0].get('parent_concept')
         
         logger.info(f"Selected most common hierarchy for {concept}: path={most_common_path} ({path_counts[most_common_path]}/{len(references)} companies), order_key={most_common_order_key} ({order_key_counts[most_common_order_key]}/{len(references)} companies)")
         
@@ -375,46 +382,6 @@ class ConceptRepository:
         
         for doc in cursor:
             yield doc
-
-    def generate_dimensional_path(self, concept_id: ObjectId, segment_type: str, parent_concept_path: str) -> str:
-        """
-        Generate a materialized path for dimensional concept as child of parent ConceptDocument.
-        The dimensional concept's path naturally extends the parent's path (e.g., parent "003" -> child "003.001").
-        """
-        # Count existing dimensional concepts for this SPECIFIC parent (concept_id) and segment_type
-        existing_count = self.collection.count_documents({
-            "concept_id": concept_id,
-            "segment_type": segment_type,
-            "dimension_concept": True
-        })
-        
-        # Generate child path by appending to parent path
-        # Format: parent_path.child_number
-        # Example: "003.001" (parent path "003" + child number "001")
-        child_number = f"{existing_count + 1:03d}"
-        
-        if parent_concept_path:
-            return f"{parent_concept_path}.{child_number}"
-        else:
-            # Fallback if parent path is not available
-            return child_number
-
-    def get_next_dimensional_order_key(self, concept_id: ObjectId, segment_type: str) -> str:
-        """Get the next available order key for dimensional concepts of this segment type."""
-        # Count existing dimensional concepts for this concept_id and segment_type
-        # This is simpler and more reliable than trying to parse order keys
-        existing_count = self.collection.count_documents({
-            "concept_id": concept_id,
-            "segment_type": segment_type,
-            "dimension_concept": True
-        })
-        
-        # Generate order key like "a", "b", "c" for each segment type independently
-        if existing_count >= 26:
-            # Handle more than 26 items (unlikely but safe)
-            return f"z{existing_count - 25}"
-        
-        return chr(ord('a') + existing_count)
 
     def insert(self, concept_doc: ConceptDocument) -> ObjectId:
         """Insert new concept document with duplicate prevention."""
