@@ -161,7 +161,19 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
                         pass
         return default_idx
 
+    def _order_key_to_pos(key: Optional[str]) -> Optional[int]:
+        if not key or not isinstance(key, str):
+            return None
+        key = key.strip().lower()
+        if len(key) == 1 and "a" <= key <= "z":
+            return ord(key) - ord("a") + 1
+        if len(key) == 2 and "a" <= key[0] <= "z" and "a" <= key[1] <= "z":
+            return 26 + (ord(key[0]) - ord("a") + 1) * 26 + (ord(key[1]) - ord("a")) + 1
+        return None
+
     def _explicit_pos(r: dict) -> Optional[int]:
+        if r.get("_is_stored"):
+            return None
         for k in ("position", "order", "index"):
             val = r.get(k)
             if val is not None:
@@ -198,10 +210,24 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
     def _sibling_rank(r: dict) -> tuple:
         pos = _explicit_pos(r)
         if pos is not None:
-            return (0, pos, row_seq.get(id(r), 0))
-        # No explicit position: keep the row's input order (the merged list is
-        # already in stored tree order), so existing siblings are never re-keyed.
-        return (1, row_seq.get(id(r), 0), 0)
+            return (pos, row_seq.get(id(r), 0))
+        # Stored rows: preserve order by stored order_key or stored order
+        ok = r.get("order_key")
+        if not ok and identity_order_keys:
+            ok = identity_order_keys.get((r.get("concept"), r.get("parent"), False))
+        if ok and isinstance(ok, str):
+            p = _order_key_to_pos(ok)
+            if p is not None:
+                return (p, row_seq.get(id(r), 0))
+        for k in ("position", "order", "index"):
+            val = r.get(k)
+            if val is not None:
+                try:
+                    return (int(val), row_seq.get(id(r), 0))
+                except (ValueError, TypeError):
+                    pass
+        # Unpositioned new rows naturally append after existing siblings
+        return (1000 + row_seq.get(id(r), 0), row_seq.get(id(r), 0))
 
     def _walk(parent: Optional[str], ancestors: frozenset = frozenset()) -> None:
         base = _base(parent)
@@ -565,13 +591,13 @@ def make_hierarchy_agent_node(
                     task = (
                         f"INCREMENTAL UPDATE for {getattr(bundle, 'statement_type', '?')} "
                         f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
-                        f"Stored rows: {len(stored)}, Filing rows: {len(filing_rows)}. "
-                        f"Call query_hierarchy_diff() to inspect the delta between filing and stored tree. "
-                        f"If any new concept is an alias, call decide_mapping(). "
-                        f"Then call propose_hierarchy(rows_json, dims_json) with the COMPLETE ordered tree "
-                        f"(every row gets an explicit position) so you own the full order. "
-                        f"Call preview_hierarchy() to verify the materialized paths/order_keys, "
-                        f"fix anything wrong, then finalize."
+                        f"Stored rows: {len(stored)}, New incoming concepts: {len(new_concepts)}. "
+                        f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely. "
+                        f"Call query_hierarchy_diff() to inspect new incoming concepts and their filing parent references. "
+                        f"If any new concept is an alias/rename of a stored concept, call decide_mapping(). "
+                        f"For new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
+                        f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically). "
+                        f"Call preview_hierarchy() to verify materialized paths/order_keys, fix anything wrong, then finalize."
                     )
                 try:
                     _ = run_agent_loop(

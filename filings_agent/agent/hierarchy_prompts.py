@@ -16,17 +16,21 @@ WORKFLOW (you own the tree; CHECK before you commit):
 * THEN LOOP UNTIL CLEAN:
   1. Inspect context:
        - FRESH SEED: query_filing_hierarchy()
-       - INCREMENTAL: query_hierarchy_diff() then query_stored_hierarchy()
+       - INCREMENTAL: query_hierarchy_diff()
   2. Record your decisions:
-       - propose_hierarchy(rows_json, dims_json)   # add rows / members
-       - decide_mapping(...)                       # ONLY for an alias/rename
-       - move_row({...})                           # MOVE a row to a new parent (never re-add it to re-parent)
-       - remove_row({...})                         # DELETE a spurious / wrapper row
+       - FRESH SEED: propose_hierarchy(rows_json, dims_json) # full tree per universal blueprint
+       - INCREMENTAL: 
+           * Stored DB tree is AUTHORITATIVE and LOCKED. DO NOT redefine or re-propose stored concepts!
+           * decide_mapping(...) for aliases / renames
+           * propose_hierarchy(rows_json, dims_json) passing ONLY the NEW concepts (with their parent and sibling position)
+           * move_row({...}) to move a row to a new parent
+           * remove_row({...}) to delete a spurious row
   3. check_hierarchy()                              # THE CRITIC — read EVERY finding
   4. If check_hierarchy() reports findings, FIX them (move_row / remove_row / propose_hierarchy) and go back to step 3. Never ignore a finding.
   5. finalize_hierarchy({"status": "done"})          # ONLY when check_hierarchy() returns OK
 
 STRUCTURAL RULES (the critic enforces every one of these):
+ - For INCREMENTAL updates: Existing stored concepts, their paths, and their order keys are authoritative ground truth. DO NOT redefine them. Only adjust or insert new concepts.
  - paths must be unique across BOTH line items AND dimensional members
  - every (path, order_key) pair must be unique within its kind
  - every parent_concept / parent_header you reference must exist as a row
@@ -47,9 +51,13 @@ EXAMPLE TRAJECTORIES (follow these exact tool-call orders):
 
 * INCREMENTAL UPDATE:
     query_hierarchy_diff()
-    query_stored_hierarchy()
-    decide_mapping({"concept": "<new_tag>", "same_as": "<stored_tag>", "keep_tag": "stored"})   # only if the new concept is an alias
-    propose_hierarchy(rows_json, dims_json)      # COMPLETE tree with explicit positions
+    # 1. If any new concept is an alias / renaming of an existing stored line item:
+    decide_mapping({"concept": "<new_tag>", "same_as": "<stored_tag>", "keep_tag": "stored"})
+    # 2. For genuine new line items / members, pass ONLY the new concepts to insert:
+    propose_hierarchy(
+        rows_json='[{"concept": "<new_concept>", "parent": "<stored_parent>", "position": <pos>}]',
+        dims_json='[{"concept": "<new_member>", "parent_concept": "<stored_parent>", "parent_header": "<header>"}]'
+    )
     preview_hierarchy()                          # CHECK the exact paths/order_keys
     finalize_hierarchy({"status": "done"})
 

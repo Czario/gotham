@@ -124,6 +124,15 @@ def build_unified_hierarchy_tools(
         stored_dims_map = {r.get("concept"): r for r in stored_rows if r.get("dimension_concept") and r.get("concept")}
         stored_headers = [r for r in stored_rows if str(r.get("concept", "")).startswith("custom:")]
 
+        stored_main_sorted = sorted(
+            (r for r in stored_rows if not r.get("dimension_concept") and r.get("concept")),
+            key=lambda r: (str(r.get("path") or ""), str(r.get("order_key") or "")),
+        )
+        stored_dims_sorted = sorted(
+            (r for r in stored_rows if r.get("dimension_concept") and r.get("concept")),
+            key=lambda r: (str(r.get("parent_concept") or ""), str(r.get("order_key") or "")),
+        )
+
         filing_main = [r for r in filing_rows if not r.get("dimension_concept") and r.get("concept")]
         filing_dims = [r for r in filing_rows if r.get("dimension_concept") and r.get("concept")]
 
@@ -137,8 +146,84 @@ def build_unified_hierarchy_tools(
 
         lines = [
             f"=== HIERARCHY DELTA {scope_banner} ===",
+            "NOTE: The existing stored hierarchy in DB is verified and LOCKED ground truth.",
+            "DO NOT redefine or re-propose stored concepts! Propose ONLY decisions for NEW concepts below.",
             f"SUMMARY: {len(matched_main) + len(matched_dims)} matched, {len(new_main)} new line item(s), {len(new_dims)} new dim member(s), {len(stored_absent)} stored absent.\n",
         ]
+
+        if new_main or new_dims:
+            lines.append("=" * 60)
+            lines.append(f"NEW INCOMING CONCEPTS ({len(new_main) + len(new_dims)}) — REQUIRE DECISION (merge or insert):")
+            lines.append("Rules for incremental adjustment:")
+            lines.append("  1. If alias/rename: decide_mapping({'concept': '...', 'same_as': '...', 'keep_tag': 'stored'})")
+            lines.append("  2. If new line item: propose_hierarchy(rows_json=[...]) passing ONLY the new concept(s)")
+            lines.append("     Specify 'parent' and 'position' among siblings. Stored rows are kept automatically.")
+            lines.append("  3. If new dim member: propose_hierarchy(dims_json=[...]) passing ONLY the new member(s)")
+            lines.append("-" * 60)
+
+            for r in new_main:
+                c = str(r.get("concept", ""))
+                lbl = r.get("label") or ""
+                p = r.get("parent_concept") or r.get("parent")
+
+                q = c.split(":")[-1].lower()
+                cands = [sr.get("concept") for sr in stored_rows if q in str(sr.get("concept", "")).lower()][:3]
+                cand_str = f" | Candidates to merge with: {cands}" if cands else ""
+
+                parent_info = ""
+                siblings_info = []
+                if p:
+                    stored_p = stored_main_map.get(p)
+                    if stored_p:
+                        parent_info = f"Stored Parent: {p} (Label: '{stored_p.get('label')}', Path: {stored_p.get('path')})"
+                        siblings = [
+                            s for s in stored_main_sorted
+                            if s.get("parent_concept") == p or s.get("parent") == p
+                        ]
+                        if siblings:
+                            siblings_desc = [
+                                f"{s.get('concept')} (Order key: {s.get('order_key') or '-'})"
+                                for s in siblings[:5]
+                            ]
+                            siblings_info.append(f"Existing siblings under parent ({len(siblings)}): {', '.join(siblings_desc)}")
+                            siblings_info.append(f"Suggested position to append after siblings: position={len(siblings) + 1}")
+                    else:
+                        parent_info = f"Filing Parent: {p} (NOTE: this parent is not in stored DB — choose stored parent from universal blueprint)"
+                else:
+                    parent_info = "Filing Parent: None (reported as root in filing linkbase)"
+
+                lines.append(f"  * [NEW LINE ITEM] {c} (\"{lbl}\")")
+                lines.append(f"      {parent_info}{cand_str}")
+                for s_line in siblings_info:
+                    lines.append(f"      {s_line}")
+                lines.append("")
+
+            for r in new_dims:
+                c = str(r.get("concept", ""))
+                lbl = r.get("label") or ""
+                parent_c = r.get("parent_concept") or r.get("parent")
+                extra = []
+                if parent_c:
+                    stored_p = stored_main_map.get(parent_c)
+                    parent_desc = f"parent line: {parent_c}" + (f" (Path: {stored_p.get('path')})" if stored_p else "")
+                    extra.append(parent_desc)
+                    matching_headers = [
+                        sh.get("concept") for sh in stored_headers
+                        if (sh.get("parent_concept") == parent_c or sh.get("parent") == parent_c)
+                    ]
+                    if matching_headers:
+                        extra.append(f"existing headers under parent: {matching_headers}")
+                    dim_siblings = [
+                        sd for sd in stored_dims_sorted
+                        if (sd.get("parent_concept") == parent_c or sd.get("parent") == parent_c)
+                    ]
+                    if dim_siblings:
+                        extra.append(f"existing member siblings ({len(dim_siblings)}): {[ds.get('concept') for ds in dim_siblings[:4]]}")
+                extra_str = f"\n      ({'; '.join(extra)})" if extra else ""
+                lines.append(f"  * [NEW DIM MEMBER] {c} (\"{lbl}\"){extra_str}")
+                lines.append("")
+            lines.append("=" * 60)
+            lines.append("")
 
         if stored_headers:
             lines.append("EXISTING STORED GROUPING HEADERS (reuse these exact names):")
@@ -146,45 +231,12 @@ def build_unified_hierarchy_tools(
                 lines.append(f"  {fmt_row(h)}")
             lines.append("")
 
-        if new_main or new_dims:
-            lines.append(f"NEW INCOMING CONCEPTS ({len(new_main) + len(new_dims)}) — REQUIRE DECISION (merge or insert):")
-            for r in new_main:
-                c = str(r.get("concept", ""))
-                q = c.split(":")[-1].lower()
-                cands = [sr.get("concept") for sr in stored_rows if q in str(sr.get("concept", "")).lower()][:3]
-                cand_str = f" -> candidates to merge with: {cands}" if cands else " -> new line item to place"
-                lines.append(f"  [NEW LINE ITEM] {fmt_row(r)}{cand_str}")
-            for r in new_dims:
-                parent_c = r.get("parent_concept") or r.get("parent")
-                extra = []
-                if parent_c:
-                    extra.append(f"parent line: {parent_c}")
-                    matching_headers = [
-                        sh.get("concept") for sh in stored_headers
-                        if (sh.get("parent_concept") == parent_c or sh.get("parent") == parent_c)
-                    ]
-                    if matching_headers:
-                        extra.append(f"existing headers: {matching_headers}")
-                extra_str = f" ({'; '.join(extra)})" if extra else ""
-                lines.append(f"  [NEW DIM MEMBER] {fmt_row(r)}{extra_str}")
-            lines.append("")
-
         lines.append(f"MATCHED CONCEPTS ({len(matched_main) + len(matched_dims)}) — ALREADY IN STORED HIERARCHY:")
         filing_main_names = {r["concept"] for r in filing_main}
         filing_dims_names = {r["concept"] for r in filing_dims}
-        # Show matched rows in STORED order (path/order_key), not filing order,
-        # so the agent sees the real current tree structure.
-        stored_main_sorted = sorted(
-            (r for r in stored_rows if not r.get("dimension_concept") and r.get("concept")),
-            key=lambda r: (str(r.get("path") or ""), str(r.get("order_key") or "")),
-        )
         for stored_r in stored_main_sorted:
             if stored_r["concept"] in filing_main_names:
                 lines.append(f"  {fmt_row(stored_r)}")
-        stored_dims_sorted = sorted(
-            (r for r in stored_rows if r.get("dimension_concept") and r.get("concept")),
-            key=lambda r: (str(r.get("parent_concept") or ""), str(r.get("order_key") or "")),
-        )
         for stored_d in stored_dims_sorted:
             if stored_d["concept"] in filing_dims_names:
                 lines.append(f"  {fmt_row(stored_d)} [dim]")
@@ -299,6 +351,7 @@ def build_unified_hierarchy_tools(
                 "order_key": s.get("order_key"),
                 "level": s.get("level", 0),
                 "abstract": s.get("abstract", False),
+                "_is_stored": True,
             }
             for s in stored_rows
             if not s.get("dimension_concept") and s.get("concept") and s["concept"] not in merged_away
@@ -323,18 +376,15 @@ def build_unified_hierarchy_tools(
                 if c in overrides:
                     merged_row = dict(s)
                     merged_row.update(overrides[c])
+                    merged_row["_is_stored"] = False
                     merged.append(merged_row)
                 else:
                     merged.append(s)
             for r in parsed_rows:
                 if isinstance(r, dict) and r.get("concept") and r["concept"] not in stored_main_concepts:
-                    merged.append(r)
-            # Stored rows keep their stored order: give every row WITHOUT an
-            # explicit position a positional rank from the merged list so newly
-            # added rows can interleave by the agent's own position numbers.
-            for i, r in enumerate(merged):
-                if not any(r.get(k) is not None for k in ("position", "order", "index")):
-                    r["position"] = i + 1
+                    item = dict(r)
+                    item["_is_stored"] = False
+                    merged.append(item)
             final_rows = merged
 
         # 2. Base dimensional members from stored
@@ -347,6 +397,7 @@ def build_unified_hierarchy_tools(
                 "parent_header": s.get("parent_header"),
                 "order": s.get("order"),
                 "order_key": s.get("order_key"),
+                "_is_stored": True,
             }
             for s in stored_rows
             if s.get("dimension_concept") and (s.get("concept") or s.get("member"))
@@ -373,6 +424,7 @@ def build_unified_hierarchy_tools(
                 if key in dim_overrides:
                     merged_dim = dict(sd)
                     merged_dim.update(dim_overrides[key])
+                    merged_dim["_is_stored"] = False
                     merged_dims.append(merged_dim)
                 else:
                     merged_dims.append(sd)
@@ -386,12 +438,8 @@ def build_unified_hierarchy_tools(
                         norm_dim["concept"] = norm_dim.pop("member")
                     if "parent" in norm_dim and "parent_concept" not in norm_dim:
                         norm_dim["parent_concept"] = norm_dim.pop("parent")
+                    norm_dim["_is_stored"] = False
                     merged_dims.append(norm_dim)
-            # Preserve stored dim order: assign positional ranks to dims without
-            # an explicit position.
-            for i, d in enumerate(merged_dims):
-                if not any(d.get(k) is not None for k in ("position", "order", "index")):
-                    d["position"] = i + 1
             final_dims = merged_dims
 
         return final_rows, final_dims
@@ -400,11 +448,10 @@ def build_unified_hierarchy_tools(
     def propose_hierarchy(rows_json: str, dims_json: str) -> str:
         """Submit (or revise) the tree proposal.
         - Each call ACCUMULATES: rows are keyed by (parent, concept) and dims by
-          (parent_concept, concept), so a later revision only adds/overrides what
-          you pass — it never erases rows from an earlier call.
+          (parent_concept, concept).
         - FRESH SEED: pass the complete tree per universal blueprint.
-        - INCREMENTAL UPDATE: pass the COMPLETE ordered tree (every row/dim with
-          an explicit 'position'/'order'); stored rows you omit are merged back."""
+        - INCREMENTAL UPDATE: pass ONLY the new or modified concepts (with their
+          'parent' and sibling 'position'). Stored rows are kept automatically!"""
         try:
             parsed_rows = json.loads(rows_json)
         except json.JSONDecodeError as exc:
