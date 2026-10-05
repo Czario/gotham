@@ -645,6 +645,78 @@ class FiscalYearCalculator:
             return None
 
     @staticmethod
+    def detect_convention_from_company_facts(
+        company_facts: Dict[str, Any],
+        fiscal_year_end_code: Optional[str] = None,
+    ) -> Optional[str]:
+        """Detect 'start' or 'end' fiscal year convention from SEC Company Facts JSON.
+
+        Inspects recent 10-K annual facts (fp='FY') for common concepts. For
+        companies with a Jan/Feb fiscal year end, if the 10-K ending in Jan/Feb
+        year Y is labelled fy=Y-1, the convention is 'start' (e.g. GME, RENT, ZUMZ).
+        If labelled fy=Y, the convention is 'end' (e.g. WMT, NVDA).
+        """
+        if not company_facts or not isinstance(company_facts, dict):
+            return None
+        try:
+            facts = company_facts.get('facts', {}).get('us-gaap', {})
+            check_concepts = [
+                'Revenues', 'SalesRevenueNet', 'RevenueFromContractWithCustomerExcludingAssessedTax',
+                'GrossProfit', 'OperatingIncomeLoss', 'NetIncomeLoss', 'Assets',
+            ]
+            for concept in check_concepts:
+                if concept not in facts:
+                    continue
+                units_dict = facts[concept].get('units', {})
+                units = units_dict.get('USD', []) or next(iter(units_dict.values()), [])
+                annuals = [
+                    u for u in units
+                    if u.get('form') in ('10-K', '10-K/A') and u.get('fp') == 'FY' and u.get('end')
+                ]
+                for u in reversed(annuals):
+                    end_str = str(u['end'])[:10]
+                    try:
+                        end_dt = datetime.strptime(end_str, "%Y-%m-%d")
+                    except (ValueError, TypeError):
+                        continue
+                    if end_dt.month in (1, 2):
+                        fy = u.get('fy')
+                        if fy == end_dt.year:
+                            return 'end'
+                        elif fy == end_dt.year - 1:
+                            return 'start'
+                if annuals:
+                    break
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def deduce_convention_from_filing(
+        end_date: datetime,
+        fiscal_year_end_code: str,
+        filing_fiscal_year: int,
+        weekday: Optional[object] = None,
+    ) -> Optional[str]:
+        """Infer 'start' or 'end' convention from a single filing's known fiscal year focus."""
+        if not end_date or not fiscal_year_end_code or not filing_fiscal_year:
+            return None
+        try:
+            fys = FiscalYearCalculator.determine_fiscal_year_from_date(
+                end_date, fiscal_year_end_code, weekday, "start"
+            )
+            fye = FiscalYearCalculator.determine_fiscal_year_from_date(
+                end_date, fiscal_year_end_code, weekday, "end"
+            )
+            if fys == filing_fiscal_year and fye != filing_fiscal_year:
+                return "start"
+            if fye == filing_fiscal_year and fys != filing_fiscal_year:
+                return "end"
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
     def determine_quarter_from_form_and_date(form_type: str, end_date: datetime, fiscal_year_end_code: str) -> Optional[int]:
         """
         Determine fiscal quarter using form type and end date.

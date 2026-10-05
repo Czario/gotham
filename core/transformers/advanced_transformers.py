@@ -460,10 +460,11 @@ class EnhancedFinancialDataTransformer:
                     enhanced_period['quarter'] = xbrl_quarter
                     enhanced_period['fiscal_period_source'] = 'xbrl_document'
                 
+                fiscal_year_convention = enhanced_period.get('fiscal_year_convention') or "end"
                 # Calculate fiscal year if missing
-                if 'fiscal_year' not in enhanced_period:
+                if 'fiscal_year' not in enhanced_period or not enhanced_period.get('fiscal_year'):
                     fiscal_year, _ = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                        end_date, fiscal_year_end_code
+                        end_date, fiscal_year_end_code, fiscal_year_convention=fiscal_year_convention
                     )
                     if fiscal_year:
                         enhanced_period['fiscal_year'] = fiscal_year
@@ -506,8 +507,8 @@ class PeriodStandardizer:
         return FiscalYearCalculator.determine_quarter_from_form_and_date(form_type, end_date, fiscal_year_end_code)
 
     @staticmethod
-    def calculate_fiscal_year_and_quarter(end_date: datetime, fiscal_year_end_code: str) -> Tuple[Optional[int], Optional[int]]:
-        return FiscalYearCalculator.calculate_fiscal_year_and_quarter(end_date, fiscal_year_end_code)
+    def calculate_fiscal_year_and_quarter(end_date: datetime, fiscal_year_end_code: str, fiscal_year_convention: str = "end") -> Tuple[Optional[int], Optional[int]]:
+        return FiscalYearCalculator.calculate_fiscal_year_and_quarter(end_date, fiscal_year_end_code, fiscal_year_convention=fiscal_year_convention)
 
     @staticmethod
     def standardize_reporting_period(reporting_period: Dict, primary_period_string: Optional[str] = None, xbrl_fiscal_period: Optional[str] = None) -> Dict:

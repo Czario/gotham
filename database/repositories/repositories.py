@@ -98,6 +98,32 @@ class CompanyRepository:
         company = self.get_company(cik)
         return company.get('fiscal_year_end') if company else None
 
+    def get_fiscal_year_convention(self, cik: str) -> Optional[str]:
+        """Get the stored fiscal year convention ('start' or 'end') for a company."""
+        company = self.get_company(cik)
+        if company:
+            return company.get('fiscal_year_convention')
+        return None
+
+    def update_fiscal_year_convention(self, cik: str, convention: str) -> bool:
+        """Update the fiscal year convention ('start' or 'end') for a company."""
+        if convention not in ("start", "end"):
+            return False
+        try:
+            result = self.collection.update_one(
+                {'cik': str(cik)},
+                {
+                    '$set': {
+                        'fiscal_year_convention': convention,
+                        'fiscal_year_convention_updated_at': datetime.now()
+                    }
+                }
+            )
+            return result.modified_count > 0 or result.matched_count > 0
+        except Exception as e:
+            print(f"Error updating fiscal year convention for company {cik}: {e}")
+            return False
+
     def get_fiscal_year_anchors(self, cik: str, limit: int = 8) -> List[Tuple[str, Optional[int]]]:
         """Return recent (period_date, fiscal_year) anchors for a company.
 

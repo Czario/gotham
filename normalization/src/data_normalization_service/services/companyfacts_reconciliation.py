@@ -275,16 +275,19 @@ class CompanyFactsReconciliationService:
                                           "concept_values_quarterly")
             form_type = "10-Q"
 
-        # Retrieve fiscal_year_end_code so the reporting_period can include quarter.
+        # Retrieve fiscal_year_end_code and convention so the reporting_period can include quarter.
         fiscal_year_end_code: Optional[str] = None
+        fiscal_year_convention: Optional[str] = None
         try:
             company_doc = self.db.companies.find_one(
-                {"cik": str(cik)}, {"corporate_info.fiscal_year_end": 1}
+                {"cik": str(cik)},
+                {"corporate_info.fiscal_year_end": 1, "fiscal_year_convention": 1}
             )
             if company_doc:
                 fiscal_year_end_code = (
                     company_doc.get("corporate_info", {}).get("fiscal_year_end")
                 )
+                fiscal_year_convention = company_doc.get("fiscal_year_convention")
         except Exception:
             pass
 
@@ -293,10 +296,6 @@ class CompanyFactsReconciliationService:
         if target_period_end is not None:
             gaps = [g for g in gaps if g["period_end"] == target_period_end]
 
-        # Stamp fiscal_year_end_code on every gap so _build_reporting_period can compute quarter.
-        if fiscal_year_end_code:
-            for g in gaps:
-                g["fiscal_year_end_code"] = fiscal_year_end_code
         stats = {"gaps": len(gaps), "filled": 0,
                  "skipped_absent": 0, "skipped_exists": 0}
         if not gaps:
@@ -307,6 +306,27 @@ class CompanyFactsReconciliationService:
             logger.warning(f"No companyfacts for CIK {cik}; cannot reconcile")
             stats["skipped_absent"] = len(gaps)
             return stats
+
+        if facts and not fiscal_year_convention:
+            from utilities.helpers.period_utils import FiscalYearCalculator
+            fiscal_year_convention = FiscalYearCalculator.detect_convention_from_company_facts(
+                facts, fiscal_year_end_code
+            )
+            if fiscal_year_convention:
+                try:
+                    self.db.companies.update_one(
+                        {"cik": str(cik)},
+                        {"$set": {"fiscal_year_convention": fiscal_year_convention}}
+                    )
+                except Exception:
+                    pass
+
+        # Stamp fiscal_year_end_code and convention on every gap
+        for g in gaps:
+            if fiscal_year_end_code:
+                g["fiscal_year_end_code"] = fiscal_year_end_code
+            if fiscal_year_convention:
+                g["fiscal_year_convention"] = fiscal_year_convention
 
         vcoll = self.db[values_coll]
         for gap in gaps:
@@ -403,11 +423,12 @@ class CompanyFactsReconciliationService:
         # for comparatives is wrong; we must recompute from the period end date so
         # the comparative correctly lands in the prior fiscal year.
         fye = gap.get("fiscal_year_end_code") or ""
+        conv = gap.get("fiscal_year_convention") or "end"
         if fye:
             try:
                 from utilities.helpers.period_utils import FiscalYearCalculator
                 computed_fy, computed_q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                    end_dt, fye
+                    end_dt, fye, fiscal_year_convention=conv
                 )
                 if computed_fy:
                     fiscal_year = computed_fy   # override API fy
@@ -422,6 +443,7 @@ class CompanyFactsReconciliationService:
             "end_date": end_dt,
             "period_date": gap["period_str"],
             "fiscal_year": fiscal_year,
+            "fiscal_year_convention": conv,
         }
         if quarter is not None and form_type == "10-Q":
             rp["quarter"] = quarter

@@ -306,9 +306,8 @@ class EntityInformationExtractor:
                 
                 for attr_name, concept_names in entity_mapping.items():
                     for target_concept in concept_names:
-                        # Match both local name and full qname
+                        # Match exact local name or full prefixed qname (avoid substring matches like ...RemainderOfFiscalYear)
                         if (concept_name == target_concept or 
-                            target_concept in concept_qname or
                             concept_qname.endswith(':' + target_concept)):
                             
                             if attr_name not in entity_candidates:
@@ -323,7 +322,7 @@ class EntityInformationExtractor:
         
         # Select best value for each attribute
         for attr_name, candidates in entity_candidates.items():
-            best_value = cls._select_best_candidate(candidates)
+            best_value = cls._select_best_candidate(candidates, attr_name=attr_name)
             if best_value:
                 entity_info[attr_name] = best_value
         
@@ -336,17 +335,19 @@ class EntityInformationExtractor:
         return entity_info
     
     @classmethod
-    def _select_best_candidate(cls, candidates: list) -> Optional[str]:
+    def _select_best_candidate(cls, candidates: list, attr_name: Optional[str] = None) -> Optional[str]:
         """
         Select the best candidate from multiple values.
         
         Selection criteria:
         1. Prefer non-null, non-empty values
         2. Prefer values without dimensions (consolidated data)
-        3. Prefer most recent context
+        3. For fiscal_year, strongly prefer valid 4-digit years (1990-2100)
+        4. Prefer most recent context
         
         Args:
             candidates: List of candidate dictionaries with value, context, fact
+            attr_name: Name of attribute being selected (e.g. 'fiscal_year')
             
         Returns:
             Best candidate value as string, or None
@@ -367,6 +368,18 @@ class EntityInformationExtractor:
         scored_candidates = []
         for candidate in valid_candidates:
             score = 0
+            val_str = str(candidate['value']).strip()
+            
+            # For fiscal_year attribute, validate reasonable 4-digit year
+            if attr_name == 'fiscal_year':
+                try:
+                    val_int = int(val_str)
+                    if 1990 <= val_int <= 2100:
+                        score += 50
+                    else:
+                        score -= 50
+                except (ValueError, TypeError):
+                    score -= 50
             
             # Prefer values without dimensions (consolidated data)
             if candidate['context'] is not None:
@@ -380,7 +393,7 @@ class EntityInformationExtractor:
                     # Use timestamp as score component
                     score += candidate['context'].instantDatetime.timestamp() / 1e10
             
-            scored_candidates.append((score, candidate['value']))
+            scored_candidates.append((score, val_str))
         
         # Sort by score (highest first) and return best
         scored_candidates.sort(key=lambda x: x[0], reverse=True)

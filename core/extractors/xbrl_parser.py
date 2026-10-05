@@ -875,6 +875,9 @@ class FlexibleXBRLExtractor:
             else:
                 logger.warning("⚠ Could not extract fiscal year from any source")
         
+        primary_period_info['fiscal_year_convention'] = (self.company_info or {}).get(
+            'fiscal_year_convention', 'end'
+        )
         return primary_period_info
     
     def _identify_statement_roles_flexible(self, modelXbrl) -> Dict[str, Dict[str, str]]:
@@ -1453,8 +1456,9 @@ class FlexibleXBRLExtractor:
                     # This prevents selecting comparative/prior year periods (e.g., 2012 Q2 when we want 2013 Q2)
                     if fiscal_year and fiscal_year_end_code and target_form_type == '10-Q':
                         from utilities.helpers.period_utils import FiscalYearCalculator
+                        fy_conv = (self.company_info or {}).get('fiscal_year_convention', 'end')
                         period_fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(
-                            period_end, fiscal_year_end_code
+                            period_end, fiscal_year_end_code, fiscal_year_convention=fy_conv
                         )
                         
                         logger.debug(f"Fiscal year validation for {fact.qname}: period_end={period_end}, period_fiscal_year={period_fiscal_year}, target_fiscal_year={fiscal_year}")

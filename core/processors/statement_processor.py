@@ -85,52 +85,72 @@ class EnhancedFinancialStatementProcessor:
         # CRITICAL FIX: Calculate fiscal year and quarter from SEC API BEFORE parsing
         # This ensures the XBRL parser can filter facts by fiscal year during primary fact selection
         enhanced_company_info = (company_info or {}).copy()
-        if not enhanced_company_info.get('fiscal_year'):
-            report_date = filing_info.get('reportDate')
-            fiscal_year_end_code = (
-                enhanced_company_info.get('fiscal_year_end_code')
-                or enhanced_company_info.get('fiscalYearEnd')
-            )
-            
-            # If fiscal year end not in company_info, retrieve from database
-            if not fiscal_year_end_code and hasattr(self, 'company_repo') and self.company_repo:
-                db_company = self.company_repo.get_company(company_cik)
-                if db_company:
-                    fiscal_year_end_code = db_company.get('corporate_info', {}).get('fiscal_year_end')
-                    if fiscal_year_end_code:
-                        logger.debug(f"Retrieved fiscal year end {fiscal_year_end_code} from database for CIK {company_cik}")
-            
-            if report_date and fiscal_year_end_code:
-                try:
-                    end_date = datetime.strptime(report_date, '%Y-%m-%d')
-                    # Detect the company's fiscal-year naming convention (start vs end
-                    # year) from its existing reporting periods so early-year filers
-                    # like Chewy (FY2025 = Feb2025-Feb2026) are labeled consistently.
-                    # Falls back to the default 'end' convention when unknown.
-                    fiscal_year_convention = None
-                    if hasattr(self, 'company_repo') and self.company_repo:
-                        anchors = self.company_repo.get_fiscal_year_anchors(company_cik)
-                        if anchors:
-                            fiscal_year_convention = (
-                                FiscalYearCalculator.determine_fiscal_year_convention(
-                                    anchors, fiscal_year_end_code
-                                )
-                            )
-                    fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
-                        end_date, fiscal_year_end_code, None,
-                        fiscal_year_convention or "end",
+        report_date = filing_info.get('reportDate')
+        fiscal_year_end_code = (
+            enhanced_company_info.get('fiscal_year_end_code')
+            or enhanced_company_info.get('fiscalYearEnd')
+        )
+        
+        # If fiscal year end not in company_info, retrieve from database
+        if not fiscal_year_end_code and hasattr(self, 'company_repo') and self.company_repo:
+            db_company = self.company_repo.get_company(company_cik)
+            if db_company:
+                fiscal_year_end_code = (
+                    db_company.get('corporate_info', {}).get('fiscal_year_end')
+                    or db_company.get('fiscal_year_end')
+                )
+                if fiscal_year_end_code:
+                    logger.debug(f"Retrieved fiscal year end {fiscal_year_end_code} from database for CIK {company_cik}")
+
+        # Detect the company's fiscal-year naming convention (start vs end
+        # year) so early-year filers like Chewy, GameStop, Rent the Runway,
+        # Zumiez (FY2025 = Feb2025-Feb2026) are labeled consistently.
+        fiscal_year_convention = enhanced_company_info.get('fiscal_year_convention')
+        if not fiscal_year_convention and hasattr(self, 'company_repo') and self.company_repo:
+            fiscal_year_convention = self.company_repo.get_fiscal_year_convention(company_cik)
+            if not fiscal_year_convention and fiscal_year_end_code:
+                anchors = self.company_repo.get_fiscal_year_anchors(company_cik)
+                if anchors:
+                    fiscal_year_convention = (
+                        FiscalYearCalculator.determine_fiscal_year_convention(
+                            anchors, fiscal_year_end_code
+                        )
                     )
-                    enhanced_company_info['fiscal_year'] = fiscal_year
-                    enhanced_company_info['fiscal_quarter'] = quarter
-                    enhanced_company_info['fiscal_year_end_code'] = fiscal_year_end_code
-                    if fiscal_year_convention:
-                        enhanced_company_info['fiscal_year_convention'] = fiscal_year_convention
-                    logger.debug(
-                        f"Pre-calculated fiscal year {fiscal_year} Q{quarter} "
-                        f"(convention: {fiscal_year_convention or 'end'}) for fact selection"
+        
+        # For Jan/Feb filers without detected convention, check SEC company facts API
+        if not fiscal_year_convention and (not fiscal_year_end_code or str(fiscal_year_end_code)[:2] in ('01', '02')):
+            try:
+                from api.sec_client import SECAPIClient
+                sec_client = SECAPIClient()
+                facts = sec_client.get_company_facts(company_cik)
+                if facts:
+                    fiscal_year_convention = FiscalYearCalculator.detect_convention_from_company_facts(
+                        facts, fiscal_year_end_code
                     )
-                except Exception as e:
-                    logger.warning(f"Could not pre-calculate fiscal year: {e}")
+                    if fiscal_year_convention and hasattr(self, 'company_repo') and self.company_repo:
+                        self.company_repo.update_fiscal_year_convention(company_cik, fiscal_year_convention)
+            except Exception as e:
+                logger.debug(f"Could not detect convention from company facts for {company_cik}: {e}")
+
+        if fiscal_year_convention:
+            enhanced_company_info['fiscal_year_convention'] = fiscal_year_convention
+
+        if report_date and fiscal_year_end_code:
+            try:
+                end_date = datetime.strptime(report_date, '%Y-%m-%d')
+                fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                    end_date, fiscal_year_end_code, None,
+                    fiscal_year_convention or "end",
+                )
+                enhanced_company_info['fiscal_year'] = fiscal_year
+                enhanced_company_info['fiscal_quarter'] = quarter
+                enhanced_company_info['fiscal_year_end_code'] = fiscal_year_end_code
+                logger.debug(
+                    f"Pre-calculated fiscal year {fiscal_year} Q{quarter} "
+                    f"(convention: {fiscal_year_convention or 'end'}) for fact selection"
+                )
+            except Exception as e:
+                logger.warning(f"Could not pre-calculate fiscal year: {e}")
         
         # Use FlexibleXBRLExtractor to extract financial statements
         try:
@@ -154,10 +174,30 @@ class EnhancedFinancialStatementProcessor:
                 
                 # Pass the *enriched* company info so the saved reporting_period
                 # uses the authoritative fiscal year end (DB companies collection)
-                # instead of SEC submissions metadata ("fiscalYearEnd"), which is
-                # unreliable for non-calendar-year filers (e.g. Dell reports 1231).
+                # and convention instead of unverified defaults.
                 reporting_period = extract_period_info_from_sec_api(filing_info, enhanced_company_info)
                 
+                # Ensure reporting_period honors authoritative fiscal year from XBRL DEI facts
+                xbrl_primary = financial_data.get('filing_info', {}).get('primary_period_info', {})
+                xbrl_fy = xbrl_primary.get('fiscal_year')
+                xbrl_fp = xbrl_primary.get('fiscal_period')
+                if xbrl_fy and 1990 <= xbrl_fy <= 2100:
+                    reporting_period['fiscal_year'] = xbrl_fy
+                    # Deduce convention if not already established
+                    if not enhanced_company_info.get('fiscal_year_convention') and reporting_period.get('end_date') and fiscal_year_end_code:
+                        deduced = FiscalYearCalculator.deduce_convention_from_filing(
+                            reporting_period['end_date'], fiscal_year_end_code, xbrl_fy
+                        )
+                        if deduced:
+                            reporting_period['fiscal_year_convention'] = deduced
+                            enhanced_company_info['fiscal_year_convention'] = deduced
+                            if hasattr(self, 'company_repo') and self.company_repo:
+                                self.company_repo.update_fiscal_year_convention(company_cik, deduced)
+                if xbrl_fp and reporting_period.get('period_type') == 'quarterly':
+                    xbrl_q = FiscalYearCalculator.extract_quarter_from_xbrl_fiscal_period(xbrl_fp)
+                    if xbrl_q:
+                        reporting_period['quarter'] = xbrl_q
+
                 return self._convert_arelle_data_to_result(financial_data, filing_info, company_cik, reporting_period)
         except Exception as e:
             logger.error(f"❌ XBRL Extraction Exception for filing {accession_number}: {str(e)}")
@@ -245,10 +285,16 @@ class EnhancedFinancialStatementProcessor:
         # Extract fiscal year and quarter from filing info
         fiscal_year = None
         quarter = None
+        fiscal_year_end_code = None
+        fiscal_year_convention = None
         if filing_info and 'primary_period_info' in filing_info:
             primary_period_info = filing_info['primary_period_info']
             fiscal_year = primary_period_info.get('fiscal_year')
             quarter = primary_period_info.get('quarter')
+            fiscal_year_end_code = primary_period_info.get('fiscal_year_end_code')
+            fiscal_year_convention = primary_period_info.get('fiscal_year_convention')
+        if not fiscal_year_convention and filing_info:
+            fiscal_year_convention = filing_info.get('fiscal_year_convention')
         
         # Abstract grouping headers ("Operating expenses:", "Earnings per
         # share:") carry no value but PARENT the rows beneath them.  Dropping
@@ -315,7 +361,8 @@ class EnhancedFinancialStatementProcessor:
                         filing_form_type,
                         fiscal_year=fiscal_year,
                         quarter=quarter,
-                        fiscal_year_end_code=fiscal_year_end_code
+                        fiscal_year_end_code=fiscal_year_end_code,
+                        fiscal_year_convention=fiscal_year_convention,
                     )
                     # Only warn if many facts were filtered (could indicate a configuration issue)
                     if len(item.all_dimensional_facts) >= 5 and len(filtered_facts) == 0:
@@ -398,7 +445,8 @@ class EnhancedFinancialStatementProcessor:
 
     def _filter_current_period_facts(self, dimensional_facts: List[Dict], filing_form_type: Optional[str] = None, 
                                     fiscal_year: Optional[int] = None, quarter: Optional[int] = None, 
-                                    fiscal_year_end_code: Optional[str] = None) -> List[Dict]:
+                                    fiscal_year_end_code: Optional[str] = None,
+                                    fiscal_year_convention: Optional[str] = "end") -> List[Dict]:
         """
         Enhanced filtering for dimensional facts that prioritizes appropriate periods based on filing type
         and excludes facts with empty dimensional data
@@ -517,6 +565,7 @@ class EnhancedFinancialStatementProcessor:
         filtered_duration_facts = self._filter_duration_facts_by_target(
             duration_facts, target_duration_months, duration_tolerance, filing_form_type, 
             fiscal_year=fiscal_year, quarter=quarter, fiscal_year_end_code=fiscal_year_end_code,
+            fiscal_year_convention=fiscal_year_convention,
             verbose=is_first_time
         )
         
@@ -540,7 +589,9 @@ class EnhancedFinancialStatementProcessor:
     def _filter_duration_facts_by_target(self, duration_facts: List[Dict], target_duration_months: int, 
                                        duration_tolerance: float, filing_form_type: str, 
                                        fiscal_year: Optional[int] = None, quarter: Optional[int] = None,
-                                       fiscal_year_end_code: Optional[str] = None, verbose: bool = True) -> List[Dict]:
+                                       fiscal_year_end_code: Optional[str] = None,
+                                       fiscal_year_convention: Optional[str] = "end",
+                                       verbose: bool = True) -> List[Dict]:
         """
         Filter duration facts to match target duration using FISCAL YEAR logic, not calendar dates.
         
@@ -569,7 +620,8 @@ class EnhancedFinancialStatementProcessor:
             assert fiscal_year_end_code is not None
             
             boundaries = FiscalYearCalculator.calculate_fiscal_quarter_boundaries(
-                fiscal_year, quarter, fiscal_year_end_code
+                fiscal_year, quarter, fiscal_year_end_code,
+                fiscal_year_convention=fiscal_year_convention or "end"
             )
             if boundaries:
                 q_start, q_end = boundaries
@@ -608,7 +660,9 @@ class EnhancedFinancialStatementProcessor:
                     
                     # CRITICAL: First check if this period belongs to the correct fiscal year
                     # This prevents matching comparative/prior year periods (e.g., 2012 Q2 when we want 2013 Q2)
-                    period_fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(end_date, fiscal_year_end_code)
+                    period_fiscal_year = FiscalYearCalculator.determine_fiscal_year_from_date(
+                        end_date, fiscal_year_end_code, fiscal_year_convention=fiscal_year_convention or "end"
+                    )
                     
                     if period_fiscal_year != fiscal_year:
                         if verbose:

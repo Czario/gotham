@@ -59,13 +59,49 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
         # Default to quarterly for unknown forms to satisfy database schema
         period_type = "quarterly"
     
+    # Convention and authoritative period info
+    fiscal_year_convention = (
+        company_info.get('fiscal_year_convention')
+        or filing_info.get('fiscal_year_convention')
+    )
+    authoritative_fy = (
+        company_info.get('fiscal_year')
+        or filing_info.get('fiscal_year')
+        or filing_info.get('DocumentFiscalYearFocus')
+    )
+    if authoritative_fy is not None:
+        try:
+            authoritative_fy = int(authoritative_fy)
+            if not (1990 <= authoritative_fy <= 2100):
+                authoritative_fy = None
+        except (ValueError, TypeError):
+            authoritative_fy = None
+
+    authoritative_qtr = (
+        company_info.get('fiscal_quarter')
+        or company_info.get('quarter')
+        or filing_info.get('fiscal_quarter')
+        or filing_info.get('quarter')
+    )
+    if authoritative_qtr is not None:
+        try:
+            authoritative_qtr = int(str(authoritative_qtr).replace('Q', '').strip())
+            if authoritative_qtr not in (1, 2, 3, 4):
+                authoritative_qtr = None
+        except (ValueError, TypeError):
+            authoritative_qtr = None
+
     # Calculate fiscal year and quarter if we have the necessary data
-    fiscal_year = None
-    quarter = None
+    fiscal_year = authoritative_fy
+    quarter = authoritative_qtr
     
     if end_date and fiscal_year_end_code:
         try:
-            fiscal_year, calculated_quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(end_date, fiscal_year_end_code)
+            calculated_fy, calculated_quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                end_date, fiscal_year_end_code, fiscal_year_convention=fiscal_year_convention or "end"
+            )
+            if fiscal_year is None:
+                fiscal_year = calculated_fy
             
             # For 10-K (annual reports), only include fiscal_year, not quarter
             # For 10-Q (quarterly reports), include both fiscal_year and quarter
@@ -73,11 +109,13 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
                 logger.debug(f"Calculated fiscal year {fiscal_year} for annual report (10-K)")
                 # quarter remains None for 10-K forms
             elif form_type == '10-Q':
-                quarter = calculated_quarter
+                if quarter is None:
+                    quarter = calculated_quarter
                 logger.debug(f"Calculated fiscal year {fiscal_year} Q{quarter} for quarterly report (10-Q)")
             else:
                 # For other forms, include quarter if available
-                quarter = calculated_quarter
+                if quarter is None:
+                    quarter = calculated_quarter
                 logger.debug(f"Calculated fiscal year {fiscal_year} Q{quarter} for form {form_type}")
         except Exception as e:
             print(f"⚠️ Failed to calculate fiscal year/quarter: {e}")
@@ -107,9 +145,11 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
         "cik": company_info.get('cik'),
         "company_name": company_info.get('name'),
     }
+    if fiscal_year_convention:
+        result["fiscal_year_convention"] = fiscal_year_convention
     
     # Only add quarter for quarterly reports (10-Q) and other non-annual forms
-    if quarter is not None:
+    if quarter is not None and form_type != '10-K':
         result["quarter"] = quarter
     
     return result

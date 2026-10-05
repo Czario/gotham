@@ -105,3 +105,45 @@ def test_quarter_boundaries_chewy_start():
         2025, 2, "0201", None, "start"
     )
     assert q_start <= datetime(2025, 8, 3) <= q_end + timedelta(days=7)
+
+
+def test_detect_convention_from_company_facts():
+    # Mock SEC Company Facts JSON for 'start' convention filer (e.g. GME/RENT: 10-K ending 2026-01-31 with fy=2025)
+    start_facts = {
+        'facts': {
+            'us-gaap': {
+                'Revenues': {
+                    'units': {
+                        'USD': [
+                            {'form': '10-K', 'fp': 'FY', 'end': '2026-01-31', 'fy': 2025}
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    assert FYC.detect_convention_from_company_facts(start_facts, "0131") == "start"
+
+    # Mock SEC Company Facts JSON for 'end' convention filer (e.g. WMT: 10-K ending 2026-01-31 with fy=2026)
+    end_facts = {
+        'facts': {
+            'us-gaap': {
+                'Revenues': {
+                    'units': {
+                        'USD': [
+                            {'form': '10-K', 'fp': 'FY', 'end': '2026-01-31', 'fy': 2026}
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    assert FYC.detect_convention_from_company_facts(end_facts, "0131") == "end"
+
+
+def test_deduce_convention_from_filing():
+    # GME/RENT/ZUMZ: filing end 2026-08-01 with filing FY=2026 Focus
+    dt = datetime(2026, 8, 1)
+    assert FYC.deduce_convention_from_filing(dt, "0131", 2026) == "start"
+    assert FYC.deduce_convention_from_filing(dt, "0131", 2027) == "end"
+
