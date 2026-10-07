@@ -1015,14 +1015,71 @@ class FinancialNormalizationService:
         # Always check database first for existing concept
         # Pass dimension_concept parameter to ensure correct matching
         existing = concept_repo.find_existing(
-            cik, 
-            statement_type, 
+            cik,
+            statement_type,
             item['concept'],
             dimension_concept=item.get('dimension', False),
             parent_concept=parent_scope,
         )
+        adopted_legacy_header = False
+        if existing is None and parent_scope is not None:
+            # Older custom grouping headers were persisted without
+            # ``parent_concept``. A new filing now supplies the parent, so the
+            # correctly parent-scoped lookup above misses that legacy row and
+            # would insert the same header a second time. Adopt only an
+            # unparented legacy row, preferring an unambiguous path match when
+            # multiple legacy rows already exist.
+            legacy_query = {
+                'cik': cik,
+                'statement_type': statement_type,
+                'concept': item['concept'],
+                'dimension_concept': item.get('dimension', False),
+                '$or': [
+                    {'parent_concept': {'$exists': False}},
+                    {'parent_concept': None},
+                    {'parent_concept': ''},
+                ],
+            }
+            legacy_rows = list(concept_repo.collection.find(legacy_query))
+            if len(legacy_rows) == 1:
+                existing = legacy_rows[0]
+            elif len(legacy_rows) > 1:
+                same_path = [
+                    row for row in legacy_rows
+                    if item.get('path') and row.get('path') == item.get('path')
+                ]
+                if len(same_path) == 1:
+                    existing = same_path[0]
+                else:
+                    raise ValueError(
+                        f"Ambiguous legacy custom concept {item['concept']!r}: "
+                        f"{len(legacy_rows)} unparented rows exist for {cik} "
+                        f"{statement_type}; refusing to insert another duplicate"
+                    )
+            adopted_legacy_header = existing is not None
+
         if existing:
             concept_id = existing['_id']
+            if adopted_legacy_header:
+                # The hierarchy agent approved the new placement. Repair the
+                # legacy row in place; the later parent-link phase fills in the
+                # parent's ID/path once all concepts have been resolved.
+                placement = {
+                    'parent_concept': parent_scope,
+                    **{
+                        key: item[key]
+                        for key in ('path', 'order_key', 'hierarchy_level', 'level')
+                        if item.get(key) is not None
+                    },
+                }
+                concept_repo.collection.update_one(
+                    {'_id': concept_id}, {'$set': placement}
+                )
+                logger.info(
+                    "Adopted legacy unparented custom concept %s under %s "
+                    "for %s %s (ID %s); skipped duplicate creation",
+                    item['concept'], parent_scope, cik, statement_type, concept_id,
+                )
             # Self-heal labels persisted before cleaning existed.
             cleaned_existing_label = clean_label(existing.get('label'))
             if cleaned_existing_label and cleaned_existing_label != existing.get('label'):
@@ -2391,6 +2448,58 @@ class FinancialNormalizationService:
             dimension_signature=_signature,
             parent_header=parent_header,
         )
+        parent_concept_name = dimension_data.get('concept_name')
+        semantic_candidates = []
+        candidate_finder = getattr(
+            concept_repo, 'find_dimensional_candidates_by_parent_name', None
+        )
+        if parent_concept_name and callable(candidate_finder):
+            semantic_candidates = list(candidate_finder(
+                company_cik,
+                statement_type,
+                concept,
+                parent_concept_name,
+                _signature,
+                parent_header=parent_header,
+            ) or [])
+
+        if semantic_candidates:
+            candidate_ids = {row.get('_id') for row in semantic_candidates}
+            if not existing or existing.get('_id') not in candidate_ids:
+                same_placement = [
+                    row for row in semantic_candidates
+                    if assigned_path and row.get('path') == assigned_path
+                    and (not assigned_order_key or row.get('order_key') == assigned_order_key)
+                ]
+                if len(same_placement) == 1:
+                    existing = same_placement[0]
+                else:
+                    # Prefer a stable, older ID when a stale parent reference
+                    # left multiple identical rows. If the strict current-parent
+                    # lookup succeeded, its result remains authoritative.
+                    existing = min(
+                        semantic_candidates,
+                        key=lambda row: (
+                            getattr(
+                                getattr(row.get('_id'), 'generation_time', None),
+                                'timestamp', lambda: float('inf'),
+                            )(),
+                            str(row.get('_id')),
+                        ),
+                    )
+            duplicates = [
+                row for row in semantic_candidates
+                if row.get('_id') != existing.get('_id')
+            ]
+            if duplicates:
+                self._coalesce_dimensional_concept_rows(
+                    concept_repo,
+                    self._get_value_repo_by_form_type(form_type),
+                    existing['_id'],
+                    duplicates,
+                    company_cik,
+                )
+
         if existing:
             dimensional_concept_id = existing['_id']
             logger.debug(f"Reusing existing dimensional concept: {concept} (ID: {dimensional_concept_id})")
@@ -2409,6 +2518,36 @@ class FinancialNormalizationService:
                 updates['level'] = updates['hierarchy_level']
             if assigned_order_key and existing.get('order_key') != assigned_order_key:
                 updates['order_key'] = assigned_order_key
+            # Parent ObjectIds can change when a parent concept is promoted or
+            # repaired. Keep this member attached to the current parent while
+            # preserving its dimensional concept ID across filings.
+            parent_doc = concept_repo.collection.find_one(
+                {'_id': concept_id}, {'concept': 1, 'path': 1}
+            )
+            parent_fields = parent_doc if isinstance(parent_doc, dict) else {}
+            current_parent_name = parent_fields.get('concept') or parent_concept_name
+            if existing.get('concept_id') != concept_id:
+                updates['concept_id'] = concept_id
+            if current_parent_name and existing.get('concept_name') != current_parent_name:
+                updates['concept_name'] = current_parent_name
+            if current_parent_name and existing.get('parent_concept') != current_parent_name:
+                updates['parent_concept'] = current_parent_name
+            if parent_fields.get('path') and existing.get('parent_path') != parent_fields['path']:
+                updates['parent_path'] = parent_fields['path']
+            if existing.get('dimension_signature') != _signature:
+                updates['dimension_signature'] = _signature
+            # Refresh the canonical row key when the parent id has changed.
+            updates['row_key'] = row_key_str({
+                'cik': company_cik,
+                'form_type': form_type,
+                'statement_type': statement_type,
+                'period': dimension_data.get('period'),
+                'concept': concept,
+                'concept_id': concept_id,
+                'concept_name': current_parent_name,
+                'dimensions': dimension_data.get('dimensions'),
+                'dimension_details': dimension_data.get('dimension_details'),
+            })
             # Persist parent_header if provided (so future lookups can distinguish
             # members under different grouping headers).
             if parent_header and not existing.get('parent_header'):
@@ -2427,6 +2566,73 @@ class FinancialNormalizationService:
         # Cache the result
         self.concept_cache[cache_key] = dimensional_concept_id
         return dimensional_concept_id
+
+    def _coalesce_dimensional_concept_rows(
+        self,
+        concept_repo: 'ConceptRepository',
+        value_repo: 'ValueRepository',
+        winner_id: ObjectId,
+        duplicate_rows: list[dict],
+        company_cik: str,
+    ) -> None:
+        """Merge stale-parent copies into the canonical dimensional row.
+
+        Candidates have already been matched on company, statement, member,
+        semantic parent name, grouping header, and recomputed dimension slice.
+        Move their value history before deleting duplicate concept documents;
+        same-period collisions keep the winner's value, matching the existing
+        concept-promotion policy.
+        """
+        values = value_repo.collection
+        moved = dropped = removed_rows = 0
+        for duplicate in duplicate_rows:
+            duplicate_id = duplicate.get('_id')
+            if not duplicate_id or duplicate_id == winner_id:
+                continue
+            old_values = list(values.find({
+                '$or': [
+                    {'dimensional_concept_id': duplicate_id},
+                    {'concept_id': duplicate_id, 'dimension_value': True},
+                ],
+            }))
+            for value in old_values:
+                reporting_period = value.get('reporting_period') or {}
+                collision_query = {
+                    'cik': value.get('cik') or company_cik,
+                    'dimension_value': True,
+                    'dimensional_concept_id': winner_id,
+                }
+                if reporting_period.get('fiscal_year') is not None:
+                    collision_query['reporting_period.fiscal_year'] = reporting_period['fiscal_year']
+                if reporting_period.get('quarter') is not None:
+                    collision_query['reporting_period.quarter'] = reporting_period['quarter']
+                collision = (
+                    values.find_one(collision_query)
+                    if reporting_period.get('fiscal_year') is not None
+                    else None
+                )
+                if collision and collision.get('_id') != value.get('_id'):
+                    values.delete_one({'_id': value['_id']})
+                    dropped += 1
+                else:
+                    values.update_one(
+                        {'_id': value['_id']},
+                        {'$set': {
+                            'concept_id': winner_id,
+                            'dimensional_concept_id': winner_id,
+                        }},
+                    )
+                    moved += 1
+
+            deleted = concept_repo.collection.delete_one({'_id': duplicate_id})
+            removed_rows += bool(getattr(deleted, 'deleted_count', 0))
+
+        if removed_rows:
+            logger.warning(
+                "Coalesced %s duplicate dimensional row(s) for CIK %s into %s "
+                "(moved %s values, dropped %s same-period duplicate values)",
+                removed_rows, company_cik, winner_id, moved, dropped,
+            )
 
     def _extract_all_dimensional_concepts(self, financial_data: list) -> tuple[Set[DimensionalConceptInfo], Dict[DimensionalConceptInfo, Dict[str, Any]]]:
         """Extract all dimensional concepts from financial data, regardless of values."""

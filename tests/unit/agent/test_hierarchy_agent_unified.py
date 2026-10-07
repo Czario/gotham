@@ -1,12 +1,12 @@
 """Unified, agent-owned hierarchy — encoder + graph wiring.
 
-The model decides; ``_materialize`` only encodes its parent/position choices
-into path strings.  No validation, no fallback, no auto-override.
+The model decides structure and equivalence; ``_materialize`` encodes parent /
+position choices. Alias winners are checked against the latest reported period.
 """
 from __future__ import annotations
 
 from filings_agent.graph import build_filing_graph
-from filings_agent.nodes.hierarchy_agent import _materialize
+from filings_agent.nodes.hierarchy_agent import _materialize, _stored_rows_for
 
 
 def test_materialize_encodes_parent_position():
@@ -23,6 +23,35 @@ def test_materialize_encodes_parent_position():
     assert by["custom:ProductSegmentation"]["path"] == "001.001"
     assert by["aapl:IPhoneMember"]["path"] == "001.001.001"
     assert by["us-gaap:GrossProfit"]["path"] == "002"
+
+
+def test_legacy_dimensional_row_uses_concept_name_as_parent():
+    parent_id = ObjectId()
+    stale_parent_id = ObjectId()
+    member = {
+        "_id": ObjectId(), "concept": "country:US", "concept_name": "us-gaap:Revenue",
+        "concept_id": stale_parent_id, "dimension_concept": True,
+        "path": "001.001.001", "order_key": "b",
+    }
+    parent = {
+        "_id": parent_id, "concept": "us-gaap:Revenue", "dimension_concept": False,
+        "path": "001", "order_key": "a",
+    }
+
+    class _Collection:
+        def find(self, query):
+            return [member] if query.get("dimension_concept") is True else [parent]
+
+    class _NormService:
+        def _get_concept_repo_by_form_type(self, _form_type):
+            return type("Repo", (), {"collection": _Collection()})()
+
+    stored, _paths, _occupied, identity_paths, _orders = _stored_rows_for(
+        _NormService(), _bundle([])
+    )
+
+    assert stored[1]["parent_concept"] == "us-gaap:Revenue"
+    assert identity_paths[("country:US", "us-gaap:Revenue", True, None)] == "001.001.001"
 
 
 def test_materialize_dims_under_grouping_header():
@@ -122,12 +151,16 @@ class _Repo:
 
 
 class _Service:
-    def __init__(self, stored):
+    def __init__(self, stored, values=None):
         self._stored = stored
+        self._values = values or []
 
     def _get_concept_repo_by_form_type(self, form_type):
         # only non-dim stored rows matter for the node's read
         return _Repo([s for s in self._stored if not s.get("dimension_concept")])
+
+    def _get_value_repo_by_form_type(self, form_type):
+        return _Repo(self._values)
 
 
 def _bundle(concepts, dims=None):
@@ -175,11 +208,17 @@ def test_unified_node_records_newest_tag_promotion():
         {"concept": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
          "label": "Revenue", "value": 100.0},
     ])
+    service = _Service(stored, values=[{
+        "concept_id": stored[0]["_id"],
+        "cik": "0000320193",
+        "dimension_value": False,
+        "reporting_period": {"period_date": "2025-09-30", "fiscal_year": 2025, "quarter": 3},
+    }])
     node = make_hierarchy_agent_node(
-        _Service(stored),
+        service,
         chat_llm=_StubChat(
             decide={"concept": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
-                    "same_as": "us-gaap:Revenues", "keep_tag": "incoming"},
+                    "same_as": "us-gaap:Revenues", "keep_tag": "stored"},
             rows=[{"concept": "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
                    "parent": None, "position": 0}],
         ),
@@ -191,6 +230,32 @@ def test_unified_node_records_newest_tag_promotion():
     assert len(promos) == 1
     assert promos[0]["from_concept"] == "us-gaap:Revenues"
     assert promos[0]["to_concept"] == "us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax"
+
+
+def test_unified_node_keeps_stored_tag_when_incoming_period_is_older():
+    stored = [{"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001",
+               "order_key": "a", "dimension_concept": False}]
+    incoming = "us-gaap:OldRevenueAlias"
+    bundle = _bundle([{"concept": incoming, "label": "Revenue", "value": 100.0}])
+    service = _Service(stored, values=[{
+        "concept_id": stored[0]["_id"],
+        "cik": "0000320193",
+        "dimension_value": False,
+        "reporting_period": {"period_date": "2027-09-30", "fiscal_year": 2027, "quarter": 3},
+    }])
+    node = make_hierarchy_agent_node(
+        service,
+        chat_llm=_StubChat(
+            decide={"concept": incoming, "same_as": "us-gaap:Revenues", "keep_tag": "incoming"},
+            rows=[{"concept": incoming, "parent": None, "position": 0}],
+        ),
+    )
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated",
+                "bundles": [bundle]})
+
+    assert out.get("concept_promotions") == []
+    assert bundle.concepts[0].get("_concept_target") == "us-gaap:Revenues"
+    assert bundle.concepts[0]["path"] == "001"
 
 
 def test_materialize_preserves_order_field_over_alphabetical():

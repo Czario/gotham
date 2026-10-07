@@ -10,6 +10,7 @@ import logging
 
 from ..core.models import ConceptDocument, ValueDocument, FinancialStatement, Filing, Company
 from ..core.config import DatabaseConfig
+from ..core.row_identity import dimension_signature as _dimension_signature
 
 logger = logging.getLogger(__name__)
 
@@ -244,19 +245,17 @@ class ConceptRepository:
             query["concept_id"] = parent_concept_id
         if dimension_signature is not None:
             query["dimension_signature"] = dimension_signature
-        # Scope by parent_header: None means bare (no grouping header) — use $exists: False
-        # so legacy bare docs (no parent_header field) are still found correctly.
+        # Scope by parent_header: None means bare (no grouping header). Mongo's
+        # ``$in`` with None matches both explicit null and legacy missing fields.
         if parent_header:
             query["parent_header"] = parent_header
         else:
-            query["parent_header"] = {"$in": [None, ""], "$exists": True}
-            # Also accept docs that simply have no parent_header field (legacy)
-            query_no_field = {k: v for k, v in query.items() if k != "parent_header"}
-            query_no_field["parent_header"] = {"$exists": False}
-            result = self.collection.find_one(query) or self.collection.find_one(query_no_field)
+            query["parent_header"] = {"$in": [None, ""]}
+            result = self.collection.find_one(query)
             if result:
                 return result
-            # Legacy fallback with dimension_signature missing
+            # Legacy fallback with dimension_signature missing. Reuse the same
+            # parent-header scope for old rows with absent/null header metadata.
             if dimension_signature is not None:
                 lq = {
                     "cik": company_cik,
@@ -264,7 +263,7 @@ class ConceptRepository:
                     "concept": concept,
                     "dimension_concept": True,
                     "dimension_signature": {"$exists": False},
-                    "parent_header": {"$exists": False},
+                    "parent_header": {"$in": [None, ""]},
                 }
                 if parent_concept_id:
                     lq["concept_id"] = parent_concept_id
@@ -292,6 +291,46 @@ class ConceptRepository:
                 legacy_query["parent_header"] = parent_header
             return self.collection.find_one(legacy_query)
         return None
+
+    def find_dimensional_candidates_by_parent_name(
+        self,
+        company_cik: str,
+        statement_type: str,
+        concept: str,
+        parent_concept_name: str,
+        dimension_signature: str,
+        parent_header: Optional[str] = None,
+    ) -> list[Dict[str, Any]]:
+        """Find same-slice dimensional rows whose parent ObjectId drifted.
+
+        Old rows can retain a valid ``concept_name`` but point ``concept_id``
+        at a parent row that was later promoted/deleted. In that case an
+        ObjectId-only lookup misses the row and creates a duplicate member.
+        This fallback is deliberately exact on the company, statement, member,
+        semantic parent name, dimension signature, and grouping header.
+        Legacy signatures are recomputed from the stored dimension payload.
+        """
+        query: Dict[str, Any] = {
+            "cik": company_cik,
+            "statement_type": statement_type,
+            "concept": concept,
+            "dimension_concept": True,
+            "concept_name": parent_concept_name,
+        }
+        if parent_header:
+            query["parent_header"] = parent_header
+        else:
+            query["$or"] = [
+                {"parent_header": {"$exists": False}},
+                {"parent_header": {"$in": [None, ""]}},
+            ]
+
+        return [
+            row for row in self.collection.find(query)
+            if _dimension_signature(
+                row.get("dimensions"), row.get("dimension_details")
+            ) == dimension_signature
+        ]
 
     def find_by_concept_id(self, concept_id: ObjectId) -> Iterator[Dict[str, Any]]:
         """Find all dimensional concepts for a given concept_id."""

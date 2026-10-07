@@ -1,8 +1,9 @@
 """Tools for the unified hierarchy agent.
 
-Tools are read/propose-only. They never write MongoDB and never override the
-agent's decisions — ``lint_hierarchy`` is advisory only; the agent chooses
-whether to act on it.
+The tools are read/propose-only and never write MongoDB. ``lint_hierarchy``
+is advisory; the agent chooses whether to act on it. For an approved concept
+alias, ``decide_mapping`` enforces the newest-observed-period rule for choosing
+the surviving tag.
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ def fmt_row(row: dict) -> str:
         flags.append(f"parent_header={row['parent_header']}")
     if row.get("segment_type"):
         flags.append(f"segment={row['segment_type']}")
+    if row.get("latest_period"):
+        flags.append(f"latest_period={row['latest_period']}")
     flag = f"  [{','.join(flags)}]" if flags else ""
     return (
         f"{str(row.get('path') or '-'):<14} {str(row.get('order_key') or '-'):<4} "
@@ -64,6 +67,14 @@ def build_unified_hierarchy_tools(
     """
     stored_names = {r.get("concept") for r in stored_rows if r.get("concept")}
     filing_names = {r.get("concept") for r in filing_rows if r.get("concept")}
+    stored_period_by_concept = {
+        str(r.get("concept")): r.get("_latest_period_rank")
+        for r in stored_rows if r.get("concept")
+    }
+    filing_period_by_concept = {
+        str(r.get("concept")): r.get("_latest_period_rank")
+        for r in filing_rows if r.get("concept")
+    }
     known_names = stored_names | filing_names
 
     cadence = "Annual (10-K/20-F)" if form_type in ("10-K", "20-F") else "Quarterly (10-Q)"
@@ -146,8 +157,8 @@ def build_unified_hierarchy_tools(
 
         lines = [
             f"=== HIERARCHY DELTA {scope_banner} ===",
-            "NOTE: The existing stored hierarchy in DB is verified and LOCKED ground truth.",
-            "DO NOT redefine or re-propose stored concepts! Propose ONLY decisions for NEW concepts below.",
+            "NOTE: The existing stored hierarchy is authoritative except for an approved alias promotion to a strictly newer incoming period.",
+            "DO NOT redefine stored concepts! Propose ONLY decisions for NEW concepts below; decide_mapping enforces the period-based surviving tag.",
             f"SUMMARY: {len(matched_main) + len(matched_dims)} matched, {len(new_main)} new line item(s), {len(new_dims)} new dim member(s), {len(stored_absent)} stored absent.\n",
         ]
 
@@ -155,7 +166,7 @@ def build_unified_hierarchy_tools(
             lines.append("=" * 60)
             lines.append(f"NEW INCOMING CONCEPTS ({len(new_main) + len(new_dims)}) — REQUIRE DECISION (merge or insert):")
             lines.append("Rules for incremental adjustment:")
-            lines.append("  1. If alias/rename: decide_mapping({'concept': '...', 'same_as': '...', 'keep_tag': 'stored'})")
+            lines.append("  1. If alias/rename: decide_mapping({'concept': '...', 'same_as': '...'}); the newer observed period determines which tag survives.")
             lines.append("  2. If new line item: propose_hierarchy(rows_json=[...]) passing ONLY the new concept(s)")
             lines.append("     Specify 'parent' and 'position' among siblings. Stored rows are kept automatically.")
             lines.append("  3. If new dim member: propose_hierarchy(dims_json=[...]) passing ONLY the new member(s)")
@@ -167,8 +178,17 @@ def build_unified_hierarchy_tools(
                 p = r.get("parent_concept") or r.get("parent")
 
                 q = c.split(":")[-1].lower()
-                cands = [sr.get("concept") for sr in stored_rows if q in str(sr.get("concept", "")).lower()][:3]
+                candidates = [
+                    sr for sr in stored_rows
+                    if not sr.get("dimension_concept")
+                    and q in str(sr.get("concept", "")).lower()
+                ][:3]
+                cands = [
+                    f"{sr.get('concept')} (latest_period={sr.get('latest_period') or 'unknown'})"
+                    for sr in candidates
+                ]
                 cand_str = f" | Candidates to merge with: {cands}" if cands else ""
+                incoming_period = f"; incoming latest_period={r.get('latest_period') or 'unknown'}"
 
                 parent_info = ""
                 siblings_info = []
@@ -192,7 +212,7 @@ def build_unified_hierarchy_tools(
                 else:
                     parent_info = "Filing Parent: None (reported as root in filing linkbase)"
 
-                lines.append(f"  * [NEW LINE ITEM] {c} (\"{lbl}\")")
+                lines.append(f"  * [NEW LINE ITEM] {c} (\"{lbl}\"){incoming_period}")
                 lines.append(f"      {parent_info}{cand_str}")
                 for s_line in siblings_info:
                     lines.append(f"      {s_line}")
@@ -252,7 +272,7 @@ def build_unified_hierarchy_tools(
 
     @tool
     def decide_mapping(concept_json: str) -> str:
-        """Record a merge decision for ONE concept."""
+        """Record an equivalence decision; choose the winner by latest period."""
         try:
             parsed = json.loads(concept_json)
         except json.JSONDecodeError as exc:
@@ -272,13 +292,42 @@ def build_unified_hierarchy_tools(
                 )
         if keep_tag not in ("stored", "incoming"):
             return "Error: keep_tag must be 'stored' or 'incoming'."
+        if same_as is None:
+            proposal.setdefault("merges", {})[concept] = {
+                "same_as": None,
+                "keep_tag": "stored",
+                "reason": parsed.get("reason") or "",
+            }
+            return f"OK — '{concept}' will be created as its own row."
+
+        incoming_period = filing_period_by_concept.get(concept)
+        stored_period = stored_period_by_concept.get(same_as)
+        # Tag ownership follows the latest observed financial period. Promote
+        # only when both sides can be compared and the incoming fact is strictly
+        # newer; missing history or a tie keeps the established stored identity.
+        if (
+            incoming_period is not None
+            and stored_period is not None
+            and incoming_period > stored_period
+        ):
+            keep_tag = "incoming"
+            period_decision = (
+                f"Incoming latest period {next((r.get('latest_period') for r in filing_rows if r.get('concept') == concept), 'unknown')} "
+                f"is newer than stored latest period {next((r.get('latest_period') for r in stored_rows if r.get('concept') == same_as), 'none')}."
+            )
+        else:
+            keep_tag = "stored"
+            period_decision = (
+                f"Stored latest period {next((r.get('latest_period') for r in stored_rows if r.get('concept') == same_as), 'unknown')} "
+                f"is as recent as or newer than incoming latest period {next((r.get('latest_period') for r in filing_rows if r.get('concept') == concept), 'unknown')}, "
+                "or a period could not be compared."
+            )
+
         proposal.setdefault("merges", {})[concept] = {
             "same_as": same_as,
             "keep_tag": keep_tag,
             "reason": parsed.get("reason") or "",
         }
-        if same_as is None:
-            return f"OK — '{concept}' will be created as its own row."
         if keep_tag == "incoming":
             # The loser's dimensional children must follow the surviving row.
             # Surface them so the AGENT places them (move_row) — persist never
@@ -302,16 +351,16 @@ def build_unified_hierarchy_tools(
                 )
                 return (
                     f"OK — '{concept}' becomes the surviving name; '{same_as}' is retired. "
-                    f"Its {len(children)} dimensional child(ren) must follow it: {listing}. "
+                    f"{period_decision} Its {len(children)} dimensional child(ren) must follow it: {listing}. "
                     f"Re-parent EACH under '{concept}' with "
                     f"move_row({{\"concept\": \"<child>\", \"parent_concept\": \"{concept}\"}}), "
                     "then run check_hierarchy() before finalizing."
                 )
             return (
                 f"OK — '{concept}' will become the surviving name; "
-                f"'{same_as}' is retired (no dimensional children)."
+                f"'{same_as}' is retired (no dimensional children). {period_decision}"
             )
-        return f"OK — '{concept}' merges into existing '{same_as}'."
+        return f"OK — '{concept}' merges into existing '{same_as}'. {period_decision}"
 
     def _merge_proposal_with_stored(
         parsed_rows: list[dict], parsed_dims: list[dict]
@@ -321,6 +370,7 @@ def build_unified_hierarchy_tools(
 
         # 1. Base main rows from stored
         merged_away = set()
+        incoming_aliases: dict[str, str] = {}
         for c, m in (proposal.get("merges") or {}).items():
             if isinstance(m, dict):
                 same_as = m.get("same_as")
@@ -329,6 +379,31 @@ def build_unified_hierarchy_tools(
                         merged_away.add(same_as)
                     else:
                         merged_away.add(c)
+                        incoming_aliases[str(c)] = str(same_as)
+
+        # A stored-wins alias is not a second hierarchy row. Remove the incoming
+        # alias from the proposal and route any proposed descendants to the
+        # surviving stored parent.
+        effective_rows = []
+        for raw in parsed_rows:
+            if not isinstance(raw, dict) or raw.get("concept") in incoming_aliases:
+                continue
+            row = dict(raw)
+            if row.get("parent") in incoming_aliases:
+                row["parent"] = incoming_aliases[row["parent"]]
+            if row.get("parent_concept") in incoming_aliases:
+                row["parent_concept"] = incoming_aliases[row["parent_concept"]]
+            effective_rows.append(row)
+        effective_dims = []
+        for raw in parsed_dims:
+            if not isinstance(raw, dict):
+                continue
+            dim = dict(raw)
+            for key in ("parent", "parent_concept"):
+                if dim.get(key) in incoming_aliases:
+                    dim[key] = incoming_aliases[dim[key]]
+            effective_dims.append(dim)
+
         # Rows the agent explicitly REMOVED (remove_row) must not be merged back
         # from stored.  A spec with only a concept removes every parent; a spec
         # with both concept and parent removes just that one.
@@ -359,17 +434,15 @@ def build_unified_hierarchy_tools(
         ]
         stored_main_concepts = {s["concept"] for s in stored_main}
         parsed_row_concepts = {
-            r.get("concept") for r in parsed_rows if isinstance(r, dict) and r.get("concept")
+            r.get("concept") for r in effective_rows if r.get("concept")
         }
 
         # If agent supplied all active stored concepts, treat as full replacement tree
         if stored_main_concepts and stored_main_concepts.issubset(parsed_row_concepts):
-            final_rows = parsed_rows
+            final_rows = effective_rows
         else:
             # Incremental: retain stored, apply overrides, append new concepts
-            overrides = {
-                r.get("concept"): r for r in parsed_rows if isinstance(r, dict) and r.get("concept")
-            }
+            overrides = {r.get("concept"): r for r in effective_rows if r.get("concept")}
             merged = []
             for s in stored_main:
                 c = s["concept"]
@@ -380,8 +453,8 @@ def build_unified_hierarchy_tools(
                     merged.append(merged_row)
                 else:
                     merged.append(s)
-            for r in parsed_rows:
-                if isinstance(r, dict) and r.get("concept") and r["concept"] not in stored_main_concepts:
+            for r in effective_rows:
+                if r.get("concept") and r["concept"] not in stored_main_concepts:
                     item = dict(r)
                     item["_is_stored"] = False
                     merged.append(item)
@@ -406,17 +479,16 @@ def build_unified_hierarchy_tools(
         stored_dim_concepts = {d["concept"] for d in stored_dims}
         parsed_dim_concepts = {
             d.get("concept") or d.get("member")
-            for d in parsed_dims
-            if isinstance(d, dict) and (d.get("concept") or d.get("member"))
+            for d in effective_dims
+            if d.get("concept") or d.get("member")
         }
 
         if stored_dim_concepts and stored_dim_concepts.issubset(parsed_dim_concepts):
-            final_dims = parsed_dims
+            final_dims = effective_dims
         else:
             dim_overrides = {
                 (d.get("parent_concept") or d.get("parent"), d.get("concept") or d.get("member")): d
-                for d in parsed_dims
-                if isinstance(d, dict)
+                for d in effective_dims
             }
             merged_dims = []
             for sd in stored_dims:
@@ -428,7 +500,7 @@ def build_unified_hierarchy_tools(
                     merged_dims.append(merged_dim)
                 else:
                     merged_dims.append(sd)
-            for pd in parsed_dims:
+            for pd in effective_dims:
                 c = pd.get("concept") or pd.get("member")
                 parent_c = pd.get("parent_concept") or pd.get("parent")
                 key = (parent_c, c)

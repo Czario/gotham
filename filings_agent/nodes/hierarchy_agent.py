@@ -1,16 +1,18 @@
 """Unified, agent-owned hierarchy node.
 
 This node replaces resolve_hierarchy + hierarchy_review + concept_resolve with a
-single tool-calling loop.  The model pulls the stored tree and the filing tree,
-decides merges, proposes the full tree (line items AND dimensional members),
-lints its own plan, and finalizes.  A thin executor then only *materializes*
-path strings from the model's parent/position choices and annotates the
-bundles — it makes no decisions and never overrides the agent.
+single tool-calling loop. The model pulls the stored tree and filing tree,
+decides equivalences, proposes the full tree (line items AND dimensional members),
+lints its plan, and finalizes. A thin executor materializes paths; the mapping
+tool deterministically enforces that the newer observed financial period wins
+when equivalent concept tags are merged.
 """
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
+from datetime import date, datetime
 from typing import Any, Callable, Optional
 
 import time
@@ -31,6 +33,66 @@ def _order_key(position: int) -> str:
         return _ORDER_CHARS[position]
     position -= 26
     return _ORDER_CHARS[position // 26 - 1] + _ORDER_CHARS[position % 26]
+
+
+def _period_info(value: Any) -> tuple[Optional[tuple[int, int, int]], Optional[str]]:
+    """Return an orderable (year, month, day) and display label for a period."""
+    if isinstance(value, dict):
+        for key in ("period_date", "end_date"):
+            if value.get(key) is not None:
+                rank, label = _period_info(value[key])
+                if rank is not None:
+                    return rank, label
+        year = value.get("fiscal_year") or value.get("year")
+        quarter = value.get("quarter")
+        try:
+            year = int(year)
+            if quarter is not None:
+                month = int(quarter) * 3
+                import calendar
+                day = calendar.monthrange(year, month)[1]
+                return (year, month, day), f"{year}-Q{int(quarter)}"
+            return (year, 12, 31), str(year)
+        except (TypeError, ValueError):
+            return None, None
+
+    if isinstance(value, datetime):
+        return (value.year, value.month, value.day), value.date().isoformat()
+    if isinstance(value, date):
+        return (value.year, value.month, value.day), value.isoformat()
+    if not isinstance(value, str):
+        return None, None
+
+    text = value.strip()
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
+    if match:
+        year, month, day = (int(part) for part in match.groups())
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            return None, None
+        return (year, month, day), parsed.isoformat()
+    match = re.match(r"^(\d{4})[- ]?Q([1-4])$", text, re.IGNORECASE)
+    if match:
+        year, quarter = int(match.group(1)), int(match.group(2))
+        month = quarter * 3
+        import calendar
+        return (year, month, calendar.monthrange(year, month)[1]), f"{year}-Q{quarter}"
+    match = re.match(r"^(\d{4})$", text)
+    if match:
+        year = int(match.group(1))
+        return (year, 12, 31), str(year)
+    return None, None
+
+
+def _latest_period(values: Any) -> tuple[Optional[tuple[int, int, int]], Optional[str]]:
+    latest_rank: Optional[tuple[int, int, int]] = None
+    latest_label: Optional[str] = None
+    for value in values or []:
+        rank, label = _period_info(value)
+        if rank is not None and (latest_rank is None or rank > latest_rank):
+            latest_rank, latest_label = rank, label
+    return latest_rank, latest_label
 
 
 def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str],
@@ -414,7 +476,51 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
 
     main.sort(key=_tree_key)
     dims.sort(key=_tree_key)
+    main_name_by_id = {row.get('_id'): row.get('concept') for row in main if row.get('_id')}
+    for dim in dims:
+        if not dim.get('parent_concept'):
+            # Legacy dimensional rows sometimes lack parent_concept and retain
+            # a parent ObjectId that was later promoted/deleted. The fact's
+            # concept_name is the semantic parent tag; restore it for hierarchy
+            # matching so an unchanged member (e.g. country:US) is not treated
+            # as a new child merely because its old parent ID drifted.
+            dim['parent_concept'] = (
+                dim.get('concept_name') or main_name_by_id.get(dim.get('concept_id'))
+            )
     stored = main + dims
+
+    # Concept rows do not carry their most recent observed period. Fetch it from
+    # the matching annual/quarterly value collection so alias promotions are
+    # decided by financial period, not insertion/processing time.
+    value_repo_resolver = getattr(norm_service, "_get_value_repo_by_form_type", None)
+    if callable(value_repo_resolver):
+        concept_ids = [s.get("_id") for s in main if s.get("_id") is not None]
+        if concept_ids:
+            try:
+                value_repo = value_repo_resolver(getattr(bundle, "form_type", None))
+                values = value_repo.collection.find(
+                    {
+                        "cik": getattr(bundle, "company_cik", None),
+                        "concept_id": {"$in": concept_ids},
+                        "dimension_value": {"$ne": True},
+                    },
+                    {"concept_id": 1, "reporting_period": 1},
+                )
+                latest_by_id: dict[Any, tuple[tuple[int, int, int], str]] = {}
+                for value_doc in values:
+                    rank, label = _period_info(value_doc.get("reporting_period") or {})
+                    concept_id = value_doc.get("concept_id")
+                    if rank is not None and concept_id is not None and (
+                        concept_id not in latest_by_id or rank > latest_by_id[concept_id][0]
+                    ):
+                        latest_by_id[concept_id] = (rank, label or "")
+                for row in main:
+                    latest = latest_by_id.get(row.get("_id"))
+                    if latest:
+                        row["_latest_period_rank"], row["latest_period"] = latest
+            except Exception as exc:  # noqa: BLE001 — period metadata is advisory
+                logger.debug("Could not load latest concept periods: %s", exc)
+
     path_by_concept: dict[str, str] = {}
     for s in main:
         if s.get("concept") and s.get("path"):
@@ -459,10 +565,22 @@ def _filing_rows_for(bundle: Any) -> list[dict]:
             return None
         return path_to_concept.get(path.rsplit(".", 1)[0])
 
+    incoming_periods: dict[str, list[Any]] = defaultdict(list)
+    for value in getattr(bundle, "values", None) or []:
+        if isinstance(value, dict) and value.get("concept") and value.get("period_key"):
+            incoming_periods[str(value["concept"])].append(value["period_key"])
+    # Use the bundle's reporting period only when no concept-specific fact
+    # period is available for that concept.
+    incoming_period_info = {
+        concept: _latest_period(periods)
+        for concept, periods in incoming_periods.items()
+    }
+    fallback_period = getattr(bundle, "reporting_period", None)
+
     rows = []
     for item in concrete + abstracts:
         if isinstance(item, dict) and item.get("concept"):
-            rows.append({
+            row = {
                 "concept": item["concept"],
                 "label": item.get("label"),
                 "abstract": bool(item.get("abstract")),
@@ -471,7 +589,13 @@ def _filing_rows_for(bundle: Any) -> list[dict]:
                 "order_key": item.get("order_key"),
                 "parent_concept": _parent_of(item),
                 "dimension_concept": False,
-            })
+            }
+            period = incoming_period_info.get(str(item["concept"]))
+            if period is None or period[0] is None:
+                period = _latest_period([fallback_period])
+            if period[0] is not None:
+                row["_latest_period_rank"], row["latest_period"] = period
+            rows.append(row)
     for dim in getattr(bundle, "dimensional_concepts", None) or []:
         if isinstance(dim, dict) and dim.get("concept"):
             rows.append({
@@ -594,7 +718,7 @@ def make_hierarchy_agent_node(
                         f"Stored rows: {len(stored)}, New incoming concepts: {len(new_concepts)}. "
                         f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely. "
                         f"Call query_hierarchy_diff() to inspect new incoming concepts and their filing parent references. "
-                        f"If any new concept is an alias/rename of a stored concept, call decide_mapping(). "
+                        f"If any new concept is an alias/rename of a stored concept, call decide_mapping(); its latest-period metadata determines which tag survives. "
                         f"For new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
                         f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically). "
                         f"Call preview_hierarchy() to verify materialized paths/order_keys, fix anything wrong, then finalize."
@@ -645,6 +769,15 @@ def make_hierarchy_agent_node(
                 abstracts = []
                 bundle.abstract_concepts = abstracts
             plan_by_concept = {(r.get("parent"), r.get("concept")): r for r in rows if r.get("concept")}
+            stored_merge_targets = {
+                concept: merge.get("same_as")
+                for concept, merge in (proposal.get("merges") or {}).items()
+                if isinstance(merge, dict) and merge.get("same_as")
+                and merge.get("keep_tag") != "incoming"
+            }
+            for item in list(concrete) + list(abstracts) + list(getattr(bundle, "dimensional_concepts", None) or []):
+                if isinstance(item, dict) and item.get("concept") in stored_merge_targets:
+                    item["_concept_target"] = stored_merge_targets[item["concept"]]
             # Grouping headers repeat by name across parents, so they must be
             # resolved by (concept, parent) instead of name alone.
             plan_header_by_parent = {

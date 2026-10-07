@@ -30,7 +30,7 @@ WORKFLOW (you own the tree; CHECK before you commit):
   5. finalize_hierarchy({"status": "done"})          # ONLY when check_hierarchy() returns OK
 
 STRUCTURAL RULES (the critic enforces every one of these):
- - For INCREMENTAL updates: Existing stored concepts, their paths, and their order keys are authoritative ground truth. DO NOT redefine them. Only adjust or insert new concepts.
+ - For INCREMENTAL updates: Existing stored hierarchy and paths are authoritative, except when decide_mapping confirms an alias and the incoming concept has a strictly newer reported financial period. In that case the incoming tag becomes canonical and the stored concept is merged into it. Equal, older, or uncomparable periods keep the stored tag.
  - paths must be unique across BOTH line items AND dimensional members
  - every (path, order_key) pair must be unique within its kind
  - every parent_concept / parent_header you reference must exist as a row
@@ -39,7 +39,7 @@ STRUCTURAL RULES (the critic enforces every one of these):
  - the same grouping header name must NOT appear under several parents
  - if 3 or more dimensional members share a parent, group them under ONE header
  - to re-parent a row, MOVE it with move_row(). Re-proposing it at a new parent ADDS a duplicate instead of moving it.
- - when decide_mapping(keep_tag="incoming") retires a stored line item, the tool lists that item's dimensional children — re-parent EACH under the surviving concept with move_row() before finalizing, so their paths are recomputed and checked.
+ - when decide_mapping selects the incoming tag because its reported period is newer, the tool lists the stored line item's dimensional children — re-parent EACH under the surviving concept with move_row() before finalizing, so their paths are recomputed and checked.
 
 EXAMPLE TRAJECTORIES (follow these exact tool-call orders):
 
@@ -52,7 +52,9 @@ EXAMPLE TRAJECTORIES (follow these exact tool-call orders):
 * INCREMENTAL UPDATE:
     query_hierarchy_diff()
     # 1. If any new concept is an alias / renaming of an existing stored line item:
-    decide_mapping({"concept": "<new_tag>", "same_as": "<stored_tag>", "keep_tag": "stored"})
+    # decide_mapping compares latest reported periods; newer incoming tag wins,
+    # otherwise the stored tag wins (the tool enforces this rule).
+    decide_mapping({"concept": "<new_tag>", "same_as": "<stored_tag>"})
     # 2. For genuine new line items / members, pass ONLY the new concepts to insert:
     propose_hierarchy(
         rows_json='[{"concept": "<new_concept>", "parent": "<stored_parent>", "position": <pos>}]',

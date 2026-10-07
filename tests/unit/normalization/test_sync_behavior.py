@@ -56,8 +56,191 @@ class TestSyncBehavior:
         assert concept_id == existing_concept_id, "Should reuse existing concept ID"
         mock_repo.find_existing.assert_called_once()
         # Verify that _create_concept was NOT called (concept was reused, not recreated)
-        
-    
+
+    def test_custom_header_adopts_legacy_unparented_row(self, mocker):
+        """A parentless legacy header should be repaired, not duplicated."""
+        mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
+        config = Mock(spec=AppConfig)
+        config.database = Mock()
+        service = FinancialNormalizationService(config)
+        service.concept_cache = {}
+
+        legacy_id = ObjectId()
+        legacy = {
+            '_id': legacy_id,
+            'concept': 'custom:GeographicalRev',
+            'label': 'Geographical Revenue',
+            'path': '001.001',
+            'dimension_concept': False,
+            # Parent is absent: this is the legacy shape that missed the
+            # parent-scoped find_existing() lookup and caused a new insert.
+        }
+        repo = Mock()
+        repo.find_existing.return_value = None
+        repo.collection.find.return_value = [legacy]
+        mocker.patch.object(service, '_get_concept_repo_by_form_type', return_value=repo)
+        create = mocker.patch.object(service, '_create_concept')
+
+        item = {
+            'concept': 'custom:GeographicalRev',
+            'label': 'Geographical Revenue',
+            'parent_concept': 'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax',
+            'path': '001.001',
+            'order_key': 'a',
+            'abstract': True,
+        }
+        result = service._get_or_create_concept(
+            '0001773751', 'income', item, '10-Q'
+        )
+
+        assert result == legacy_id
+        create.assert_not_called()
+        repo.collection.update_one.assert_called_once_with(
+            {'_id': legacy_id},
+            {'$set': {
+                'parent_concept': item['parent_concept'],
+                'path': '001.001',
+                'order_key': 'a',
+            }},
+        )
+
+    def test_ambiguous_legacy_custom_headers_do_not_create_another_row(self, mocker):
+        mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
+        config = Mock(spec=AppConfig)
+        config.database = Mock()
+        service = FinancialNormalizationService(config)
+        service.concept_cache = {}
+
+        repo = Mock()
+        repo.find_existing.return_value = None
+        repo.collection.find.return_value = [
+            {'_id': ObjectId(), 'path': '001.001'},
+            {'_id': ObjectId(), 'path': '002.001'},
+        ]
+        mocker.patch.object(service, '_get_concept_repo_by_form_type', return_value=repo)
+        create = mocker.patch.object(service, '_create_concept')
+
+        with pytest.raises(ValueError, match='refusing to insert another duplicate'):
+            service._get_or_create_concept(
+                '0001773751', 'income',
+                {'concept': 'custom:GeographicalRev',
+                 'parent_concept': 'us-gaap:Revenue', 'path': '003.001'},
+                '10-Q',
+            )
+        create.assert_not_called()
+
+    def test_dimensional_member_reuses_row_when_parent_id_drifted(self, mocker):
+        """A stale parent ObjectId must not duplicate the same member row."""
+        mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
+        config = Mock(spec=AppConfig)
+        config.database = Mock()
+        service = FinancialNormalizationService(config)
+        service.concept_cache = {}
+
+        parent_id, old_parent_id, member_id = ObjectId(), ObjectId(), ObjectId()
+        parent_name = 'us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax'
+        legacy = {
+            '_id': member_id,
+            'concept': 'country:US',
+            'concept_name': parent_name,
+            'concept_id': old_parent_id,
+            'dimension_concept': True,
+            'dimensions': {'StatementGeographicalAxis': 'US'},
+            'dimension_details': {
+                'StatementGeographicalAxis': {
+                    'member_qname': 'country:US',
+                    'member_label': 'UNITED STATES',
+                },
+            },
+            'path': '001.001.001',
+            'order_key': 'b',
+        }
+        repo = Mock()
+        repo.find_dimensional_existing.return_value = None
+        repo.find_dimensional_candidates_by_parent_name.return_value = [legacy]
+        repo.collection.find_one.return_value = {
+            '_id': parent_id, 'concept': parent_name, 'path': '001'
+        }
+        mocker.patch.object(service, '_get_concept_repo_by_form_type', return_value=repo)
+        create = mocker.patch.object(service, '_create_dimensional_concept')
+        mocker.patch.object(
+            service, '_determine_segment_info',
+            return_value=('geographic_segment', 'country:US'),
+        )
+
+        result = service._get_or_create_dimensional_concept(
+            concept_id=parent_id,
+            company_cik='0001773751',
+            statement_type='income',
+            dimension_data={
+                'concept_name': parent_name,
+                'dimensions': {'StatementGeographicalAxis': 'US'},
+                'dimension_details': {
+                    'StatementGeographicalAxis': {
+                        'member_qname': 'country:US',
+                        'member_label': 'UNITED STATES',
+                    },
+                },
+            },
+            form_type='10-Q',
+            assigned_path='001.001.001',
+            assigned_order_key='b',
+        )
+
+        assert result == member_id
+        create.assert_not_called()
+        updates = repo.collection.update_one.call_args.args[1]['$set']
+        assert updates['concept_id'] == parent_id
+        assert updates['parent_concept'] == parent_name
+        assert updates['parent_path'] == '001'
+        assert updates['dimension_signature'] == 'statementgeographical=country:us'
+
+    def test_dimensional_duplicates_are_coalesced_with_value_history(self, mocker):
+        mocker.patch('data_normalization_service.services.normalization_service.DatabaseConnection')
+        config = Mock(spec=AppConfig)
+        config.database = Mock()
+        service = FinancialNormalizationService(config)
+
+        winner_id, loser_id = ObjectId(), ObjectId()
+        old_unique, old_collision = ObjectId(), ObjectId()
+        value_collection = Mock()
+        value_collection.find.return_value = [
+            {
+                '_id': old_unique, 'cik': '0001773751', 'dimension_value': True,
+                'dimensional_concept_id': loser_id, 'concept_id': loser_id,
+                'reporting_period': {'fiscal_year': 2025, 'quarter': 2},
+            },
+            {
+                '_id': old_collision, 'cik': '0001773751', 'dimension_value': True,
+                'dimensional_concept_id': loser_id, 'concept_id': loser_id,
+                'reporting_period': {'fiscal_year': 2026, 'quarter': 2},
+            },
+        ]
+        value_collection.find_one.side_effect = [
+            None,
+            {'_id': ObjectId()},  # winner already owns 2026 Q2
+        ]
+        concept_collection = Mock()
+        concept_collection.delete_one.return_value = Mock(deleted_count=1)
+
+        service._coalesce_dimensional_concept_rows(
+            Mock(collection=concept_collection),
+            Mock(collection=value_collection),
+            winner_id,
+            [{'_id': loser_id}],
+            '0001773751',
+        )
+
+        value_collection.update_one.assert_called_once_with(
+            {'_id': old_unique},
+            {'$set': {
+                'concept_id': winner_id,
+                'dimensional_concept_id': winner_id,
+            }},
+        )
+        value_collection.delete_one.assert_called_once_with({'_id': old_collision})
+        concept_collection.delete_one.assert_called_once_with({'_id': loser_id})
+
     def test_value_skip_when_exists(self, mocker):
         """
         Test that when a value exists in the database,

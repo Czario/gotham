@@ -31,15 +31,15 @@ from typing import Any, Iterable, Mapping, Optional
 # Axes that only flag structural membership (which statement/segment a row
 # belongs to) rather than carrying a real business breakdown. They must not
 # take part in the identity — two rows differing only by one of these are the
-# same row. Tokens are in normalize_axis() form (namespace and ``Axis`` suffix
-# already stripped), which is what the comparison sees.
+# same row. StatementGeographicalAxis is intentionally NOT in this set: its
+# members (e.g. country:US) are real geographic breakdowns. Tokens are in
+# normalize_axis() form (namespace and ``Axis`` suffix already stripped).
 WRAPPER_AXES: frozenset[str] = frozenset(
     {
         "consolidationitems",
         "consolidation",
         "segmentreporting",
         "legalentity",
-        "statementgeographical",
         "explicitmember",  # XBRL-DI internal, not an axis at all
     }
 )
