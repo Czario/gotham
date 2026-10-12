@@ -12,6 +12,7 @@ from collections import defaultdict
 from typing import Any
 
 from langchain_core.tools import tool
+from utilities.helpers.period_utils import is_annual_form
 
 
 def fmt_row(row: dict) -> str:
@@ -77,7 +78,7 @@ def build_unified_hierarchy_tools(
     }
     known_names = stored_names | filing_names
 
-    cadence = "Annual (10-K/20-F)" if form_type in ("10-K", "20-F") else "Quarterly (10-Q)"
+    cadence = "Annual (10-K/20-F)" if is_annual_form(form_type) else "Quarterly (10-Q)"
     scope_banner = f"[{company_cik or '?'} | {statement_type.upper() or 'STATEMENT'} | {cadence}]"
 
     @tool

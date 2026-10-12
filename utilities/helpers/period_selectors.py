@@ -6,6 +6,7 @@ Improved period selection utilities to ensure primary periods are selected
 import re
 import pandas as pd
 from typing import List, Optional
+from .period_utils import is_annual_form
 
 
 def select_primary_period_for_filing(date_columns: List[str], form_type: str, df: Optional[pd.DataFrame] = None) -> Optional[str]:
@@ -49,8 +50,8 @@ def select_primary_period_for_filing(date_columns: List[str], form_type: str, df
                 # Any other period type gets heavily penalized for quarterly filings
                 score -= 5000
             
-        elif form_type == '10-K':
-            # For annual filings (10-K), prefer annual periods
+        elif is_annual_form(form_type):
+            # For annual filings (10-K/20-F), prefer annual periods
             if _is_annual_period(col_lower):
                 score += 100
             elif _is_quarterly_period(col_lower):
@@ -175,7 +176,7 @@ def validate_period_selection(selected_period: str, form_type: str) -> tuple[boo
         elif not _is_quarterly_period(col_lower):
             return False, f"STRICT REJECTION: Non-quarterly period for 10-Q filing - MUST use exactly 3-month period"
     
-    elif form_type == '10-K':
+    elif is_annual_form(form_type):
         if _is_quarterly_period(col_lower) and not _is_annual_period(col_lower):
             return False, f"WARNING: Selected quarterly period for annual filing - should use 12-month period"
     

@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # (NetIncomeLoss, ComprehensiveIncomeNetOfTax) are already captured from the
 # income_statement.
 _ALLOWED_STATEMENT_TYPES = {'income', 'balancesheet', 'cashflow'}
+_ANNUAL_FORM_TYPES = frozenset({'10-K', '10-K/A', '20-F', '20-F/A'})
+
+
+def _is_annual_form_type(form_type: Optional[str]) -> bool:
+    return str(form_type or '').strip().upper() in _ANNUAL_FORM_TYPES
+
 
 # Structural / namespace guards used to reduce a statement hierarchy down to
 # concrete financial line items (see ``_is_structural_concept``).
@@ -103,7 +109,7 @@ class FinancialNormalizationService:
 
     def _get_concept_repo_by_form_type(self, form_type: str) -> ConceptRepository:
         """Get the appropriate concept repository based on form type."""
-        if form_type == '10-K':
+        if _is_annual_form_type(form_type):
             return self.annual_concept_repo
         elif form_type == '10-Q':
             return self.quarterly_concept_repo
@@ -114,7 +120,7 @@ class FinancialNormalizationService:
 
     def _get_value_repo_by_form_type(self, form_type: str) -> ValueRepository:
         """Get the appropriate value repository based on form type."""
-        if form_type == '10-K':
+        if _is_annual_form_type(form_type):
             return self.annual_value_repo
         elif form_type == '10-Q':
             return self.quarterly_value_repo
@@ -808,6 +814,7 @@ class FinancialNormalizationService:
                         filing=filing,
                         item=item,
                         dimensional_concept_mapping=dimensional_concept_mapping,
+                        replace_existing=replace_existing,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
@@ -1551,8 +1558,8 @@ class FinancialNormalizationService:
             k: v for k, v in (statement.reporting_period or {}).items()
             if k in _ALLOWED_RP_KEYS
         }
-        # Remove quarter for annual filings (10-K)
-        if filing.form_type == '10-K':
+        # Annual values are keyed by fiscal year, without a quarter.
+        if _is_annual_form_type(filing.form_type):
             clean_reporting_period.pop('quarter', None)
 
         # Get the appropriate value repository based on form type
@@ -1608,6 +1615,7 @@ class FinancialNormalizationService:
                     'calculated': is_calculated,
                     'fact_id': item.get('fact_id'),
                     'decimals': item.get('decimals'),
+                    'form_type': filing.form_type,
                 }
                 if filing.accession_number:
                     replace_fields['accession_number'] = filing.accession_number
@@ -2289,7 +2297,11 @@ class FinancialNormalizationService:
         month, day = quarter_ends.get(quarter, (12, 31))
         return datetime(fiscal_year, month, day)
 
-    def _process_dimensional_data_enhanced(self, concept_id: ObjectId, statement, filing, item: dict, dimensional_concept_mapping: Dict[tuple, ObjectId]) -> None:
+    def _process_dimensional_data_enhanced(
+        self, concept_id: ObjectId, statement, filing, item: dict,
+        dimensional_concept_mapping: Dict[tuple, ObjectId],
+        replace_existing: bool = False,
+    ) -> None:
         """Process dimensional values using pre-created dimensional concepts."""
         if 'dimensional_facts' not in item:
             return
@@ -2342,7 +2354,8 @@ class FinancialNormalizationService:
                             dimensional_concept_id=dimensional_concept_id,
                             statement=statement,
                             filing=filing,
-                            dimension_data=dimension_data
+                            dimension_data=dimension_data,
+                            replace_existing=replace_existing,
                         )
                         processed_dimensional_count += 1
                     else:
@@ -3105,7 +3118,10 @@ class FinancialNormalizationService:
         logger.debug(f"Created dimensional concept: {segment_type} - {original_concept} (path: {path}, order: {order_key})")
         return dimensional_concept_id
 
-    def _create_dimensional_value_record(self, dimensional_concept_id: ObjectId, statement, filing, dimension_data: dict) -> None:
+    def _create_dimensional_value_record(
+        self, dimensional_concept_id: ObjectId, statement, filing,
+        dimension_data: dict, replace_existing: bool = False,
+    ) -> None:
         """
         Create a dimensional value record with duplicate prevention.
         
@@ -3127,7 +3143,7 @@ class FinancialNormalizationService:
             k: v for k, v in (statement.reporting_period or {}).items()
             if k in _ALLOWED_RP_KEYS
         }
-        if filing.form_type == '10-K':
+        if _is_annual_form_type(filing.form_type):
             clean_reporting_period.pop('quarter', None)
 
         # Check for existing dimensional value to prevent duplicates
@@ -3139,8 +3155,21 @@ class FinancialNormalizationService:
         )
         
         if existing_value:
+            if replace_existing:
+                replacement = {'form_type': filing.form_type}
+                if dimension_data.get('value') is not None:
+                    replacement['value'] = dimension_data.get('value')
+                if dimension_data.get('fact_id') is not None:
+                    replacement['fact_id'] = dimension_data.get('fact_id')
+                if dimension_data.get('decimals') is not None:
+                    replacement['decimals'] = dimension_data.get('decimals')
+                if filing.accession_number:
+                    replacement['accession_number'] = filing.accession_number
+                value_repo.collection.update_one(
+                    {'_id': existing_value['_id']}, {'$set': replacement}
+                )
             # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('accession_number'):
+            elif filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing dimensional value with missing accession_number for dimensional_concept_id {dimensional_concept_id}, "
                             f"period {clean_reporting_period}")
                 value_repo.collection.update_one(

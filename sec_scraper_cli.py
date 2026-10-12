@@ -31,7 +31,8 @@ logger = LoggerConfig.setup_logging(
 )
 
 from database.config.mongodb_config import DatabaseConfig
-from api.sec_client import SECAPIClient
+from api.sec_client import SECAPIClient, FOREIGN_ANNUAL_FORMS
+from utilities.helpers.period_utils import is_annual_form
 from core.processors.statement_processor import EnhancedFinancialStatementProcessor
 # Raw DB repository layer removed — normalization service writes directly to normalize_data
 from core.transformers.data_transformers import CompanyDataTransformer, FilingDataTransformer, FinancialDataTransformer
@@ -480,6 +481,7 @@ class SECDataScraperApp:
         # Per-company state (sequential-only — no threading needed)
         self.current_company_data = None
         self.current_company_doc = None
+        self._foreign_filing_collection_ready = False
         # Outcome of the last filing the agent processed (decision / failure reason)
         self._last_agent_outcome: Optional[Dict[str, Any]] = None
         self.target_fiscal_year = target_fiscal_year
@@ -609,9 +611,91 @@ class SECDataScraperApp:
         return f"https://www.sec.gov/Archives/edgar/data/{company_cik}/{accession_clean}/{accession_number}-index.htm"
     
     def setup_database(self):
-        # Schema/indexes are managed by the normalization service (DatabaseTracker._ensure_indexes)
-        # No raw collections (filings, financial_statements) should be created here
+        # Normalized schemas/indexes are managed by the normalization service.
+        # The per-accession SEC filings ledger is ensured lazily when processing
+        # a foreign annual report; legacy raw financial_statements are not used.
         return True
+
+    @staticmethod
+    def _normalize_sec_boolean(value: Any) -> Optional[bool]:
+        """Normalize SEC submissions booleans, which may be JSON 0/1 integers."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return value == 1
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {'true', '1', 'yes'}:
+                return True
+            if normalized in {'false', '0', 'no'}:
+                return False
+        return None
+
+    @staticmethod
+    def _has_complete_annual_statement_set(prepared_statements: List[tuple]) -> bool:
+        """Whether extraction produced income, balance sheet, and cash flow."""
+        statement_types = {
+            str(statement_type).strip().lower().replace('_', '').replace('-', '')
+            for statement_type, _ in prepared_statements
+        }
+        return {'income', 'balancesheet', 'cashflow'} <= statement_types
+
+    def _record_foreign_annual_filing(self, cik: str, filing: Dict[str, Any]) -> bool:
+        """Idempotently retain SEC metadata for each 20-F/20-F/A accession."""
+        form_type = str(filing.get('form') or filing.get('form_type') or '').upper()
+        if form_type not in FOREIGN_ANNUAL_FORMS:
+            return True
+
+        accession = filing.get('accessionNumber') or filing.get('accession_number')
+        if not accession:
+            logger.error("Cannot record foreign annual filing without accession number")
+            return False
+
+        try:
+            if not getattr(self, '_foreign_filing_collection_ready', False):
+                from database.config.mongodb_config import ensure_filing_metadata_collection
+                ensure_filing_metadata_collection(self.db)
+                self._foreign_filing_collection_ready = True
+
+            cik_value = str(cik).strip()
+            if cik_value.isdigit():
+                cik_value = cik_value.zfill(10)
+            filing_record = self.filing_transformer.transform_filing_data(
+                filing, cik_value
+            )
+            created_at = filing_record.pop('created_at', datetime.utcnow())
+            report_date = filing.get('reportDate') or filing.get('report_date')
+            try:
+                filing_record['report_date'] = datetime.strptime(
+                    str(report_date)[:10], '%Y-%m-%d'
+                ) if report_date else None
+            except (TypeError, ValueError):
+                filing_record['report_date'] = None
+            filing_record.update({
+                'primary_document': filing.get('primaryDocument'),
+                'primary_doc_description': filing.get('primaryDocDescription'),
+                'is_xbrl': self._normalize_sec_boolean(filing.get('isXBRL')),
+                'updated_at': datetime.utcnow(),
+            })
+
+            self.db['filings'].update_one(
+                {'cik': cik_value, 'accession_number': str(accession)},
+                {
+                    '$set': filing_record,
+                    '$setOnInsert': {
+                        '_id': self._make_filing_id(str(accession)),
+                        'created_at': created_at,
+                    },
+                },
+                upsert=True,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — filing provenance is required
+            logger.exception(
+                "Failed to persist SEC filing metadata for %s/%s: %s",
+                cik, accession, exc,
+            )
+            return False
 
     def _ensure_audit(self) -> None:
         """Install the terminal presenter, JSONL audit trail and run session.
@@ -836,7 +920,8 @@ class SECDataScraperApp:
         
         try:
             # Determine the start date for processing
-            # --latest mode: fetch from start_year, then pick only the most recent 10-K/10-Q
+            # --latest mode: fetch from start_year, then pick the most recent
+            # supported annual or quarterly filing (including foreign 20-Fs).
             # Normal mode: fetch from start_year onwards
             range_desc = f"from {self.start_year}" + (f" to {self.end_year}" if self.end_year else " onwards")
             logger.info(f"Processing company CIK: {cik} (filings {range_desc})")
@@ -894,16 +979,17 @@ class SECDataScraperApp:
                     )
             logger.info(f"Company data ready for CIK: {cik}")
             
-            # Step 3: Process filings (10-K and 10-Q) with existence checks and reload logic
+            # Step 3: Process supported annual and quarterly filings with
+            # existence checks and reload logic.
             filings_processed = 0
             filings_skipped = 0
             filings_failed = 0
-            target_forms = ['10-K', '10-Q']
+            target_forms = ['10-K', '10-Q', '20-F', '20-F/A']
             
             # Filter filings to only target forms for progress bar
             target_filings = [f for f in filings_list if f.get('form') in target_forms]
             
-            # If --latest mode, keep only the most recent 10-K or 10-Q filing
+            # If --latest mode, keep only the most recent supported filing.
             # This looks at EDGAR submissions, not MongoDB
             if self.latest and target_filings:
                 # Sort by filing date descending, then take the first one
@@ -934,6 +1020,10 @@ class SECDataScraperApp:
             for i, filing in enumerate(filing_iterator, 1):
                 accession_number = filing.get('accessionNumber', '')
                 form_type = filing.get('form', '')
+                if form_type in FOREIGN_ANNUAL_FORMS:
+                    if not self._record_foreign_annual_filing(cik, filing):
+                        filings_failed += 1
+                        continue
                 filing_date_short = (filing.get('filingDate') or '')[:7]  # YYYY-MM
                 filing_bar.update(1)
                 
@@ -1101,6 +1191,10 @@ class SECDataScraperApp:
                     'cik': cik
                 }
 
+            if target_filing.get('form') in FOREIGN_ANNUAL_FORMS:
+                if not self._record_foreign_annual_filing(cik, target_filing):
+                    return False
+
             # Get ticker for logging
             ticker = self.sec_client.get_ticker_from_cik(cik) or f"CIK_{cik}"
             company_name = company_data.get('name', 'Unknown')
@@ -1122,15 +1216,23 @@ class SECDataScraperApp:
                     _fy, _q = _FYC.calculate_fiscal_year_and_quarter(_rd_date, _fy_end, fiscal_year_convention=_fy_conv)
                     _form = (target_filing or {}).get('form', '')
                     self._last_period_label: str | None = (
-                        f"FY {_fy}" if _form == '10-K' else f"FY {_fy} Q{_q}"
+                        f"FY {_fy}" if is_annual_form(_form) else f"FY {_fy} Q{_q}"
                     )
                 else:
                     self._last_period_label = None
             except Exception:
                 self._last_period_label = None
 
+            # Accession/period deduplication. A 20-F/A is only considered
+            # already handled when that amendment itself is present; an
+            # original 20-F for the same year must not block the amendment.
+            if not self.reload and self._find_existing_filing(cik, target_filing):
+                logger.info("Filing %s is already stored; skipping", accession_number)
+                return True
+
             # Guard: skip if this filing's period is already covered — same
-            # logic as --latest in the CLI.
+            # logic as --latest in the CLI. Amendments are exempt: same report
+            # date is expected, and they may revise the annual facts.
             # Compare the filing's reportDate against the most recent
             # reporting_period.end_date stored for this company.  If the
             # filing's period is not NEWER, it is already in normalize_data
@@ -1143,7 +1245,7 @@ class SECDataScraperApp:
                         from datetime import datetime as _dt
                         report_dt  = _dt.strptime(report_date_str, '%Y-%m-%d')
                         latest_dt  = _dt.strptime(latest_stored,   '%Y-%m-%d')
-                        if report_dt <= latest_dt:
+                        if report_dt <= latest_dt and str(target_filing.get('form') or '').upper() != '20-F/A':
                             logger.info(
                                 f"Filing {accession_number} period {report_date_str} "
                                 f"already covered (latest stored: {latest_stored}) — skipping"
@@ -1211,7 +1313,7 @@ class SECDataScraperApp:
             )
             if fiscal_year is None:
                 return "FY?"
-            if form_type == '10-K':
+            if is_annual_form(form_type):
                 return f"FY{fiscal_year} Annual"
             if form_type == '10-Q' and quarter:
                 return f"FY{fiscal_year} Q{quarter}"
@@ -1245,7 +1347,14 @@ class SECDataScraperApp:
 
         period_filter: Dict[str, Any] = {'cik': cik}
         if form_type:
-            period_filter['form_type'] = form_type
+            if str(form_type).upper() == '20-F':
+                # Once an amendment is the authoritative annual version, a
+                # later scan of the original accession should not reprocess it.
+                period_filter['form_type'] = {'$in': ['20-F', '20-F/A']}
+            else:
+                # An incoming 20-F/A must still be allowed to replace the
+                # original 20-F for the same fiscal year.
+                period_filter['form_type'] = form_type
 
         report_date = filing.get('reportDate') or filing.get('report_date')
         period_added = False
@@ -1354,7 +1463,11 @@ class SECDataScraperApp:
                         return None
                     reload_filter['reporting_period.period_date'] = str(period_date)[:10]
 
-        if form_type:
+        if str(form_type or '').upper() == '20-F/A':
+            # Replace the annual fact set written by either the original 20-F
+            # or an earlier amendment, but never touch 10-K/other filing data.
+            reload_filter['form_type'] = {'$in': ['20-F', '20-F/A']}
+        elif form_type:
             reload_filter['form_type'] = form_type
         return reload_filter
 
@@ -1380,6 +1493,10 @@ class SECDataScraperApp:
         except Exception:  # noqa: BLE001 — no DB/state available (unit contexts)
             return None
         if not fiscal_year_end:
+            if str(form_type or '').upper() == '20-F/A':
+                # SEC reportDate is a safe same-period identity even for a new
+                # company whose fiscal-year-end metadata is not in Mongo yet.
+                return {'reporting_period.period_date': report_end_date.strftime('%Y-%m-%d')}
             return None
         try:
             from utilities.helpers.period_utils import FiscalYearCalculator
@@ -1397,9 +1514,15 @@ class SECDataScraperApp:
             period_filter['reporting_period.quarter'] = quarter
         return period_filter
 
-    def _delete_reload_data(self, cik: str, filing_info: Dict) -> None:
-        """Delete the existing target filing immediately before replacement saves."""
-        if not self.reload:
+    def _delete_reload_data(
+        self, cik: str, filing_info: Dict, *, force: bool = False
+    ) -> None:
+        """Delete a validated replacement period immediately before its write.
+
+        A complete 20-F/A is an automatic revision of its annual 20-F period,
+        so it may force this deferred replacement even without --reload.
+        """
+        if not self.reload and not force:
             return
 
         form_type = filing_info.get('form', filing_info.get('form_type', ''))
@@ -1581,8 +1704,8 @@ class SECDataScraperApp:
                 if fiscal_year == self.target_fiscal_year:
                     # If specific quarter is requested, check quarter match
                     if self.target_fiscal_quarter:
-                        # For 10-K (annual), include if target quarter is Q4
-                        if form_type == '10-K' and self.target_fiscal_quarter == 'Q4':
+                        # Annual reports are included for a Q4 request.
+                        if is_annual_form(form_type) and self.target_fiscal_quarter == 'Q4':
                             filtered_filings.append(filing)
                         # For 10-Q (quarterly), check exact quarter match
                         elif form_type == '10-Q' and quarter == target_quarter_num:
@@ -1590,7 +1713,7 @@ class SECDataScraperApp:
                     else:
                         # A fiscal-year-only request means the annual filing.
                         # Quarterly filings require an explicit --fiscal-quarter.
-                        if form_type == '10-K':
+                        if is_annual_form(form_type):
                             filtered_filings.append(filing)
                         
             except (ValueError, TypeError) as e:
@@ -1645,7 +1768,10 @@ class SECDataScraperApp:
                     fiscal_year, quarter_num = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
                         report_end_date, fiscal_year_end, fiscal_year_convention=fiscal_year_conv
                     )
-                    fiscal_quarter = f"Q{quarter_num}" if quarter_num else None
+                    fiscal_quarter = (
+                        None if is_annual_form(form_type)
+                        else (f"Q{quarter_num}" if quarter_num else None)
+                    )
             except Exception as e:
                 logger.debug(f"Could not calculate fiscal period: {e}")
         
@@ -1755,7 +1881,9 @@ class SECDataScraperApp:
                         company_info_enriched = company_info_enriched.copy()
                         company_info_enriched['fiscal_year'] = fiscal_year
                         company_info_enriched['fiscal_year_end_code'] = fiscal_year_end_code
-                        company_info_enriched['quarter'] = quarter
+                        company_info_enriched['quarter'] = (
+                            None if is_annual_form(form_type) else quarter
+                        )
                         company_info_enriched['fiscal_year_convention'] = fiscal_year_conv
                     except Exception as e:
                         logger.debug(f"Could not enrich company info with fiscal year for {accession_number}: {e}")
@@ -1899,7 +2027,37 @@ class SECDataScraperApp:
                     sec_client=self.sec_client,
                 )
                 agent_state['reporting_period'] = reporting_period
-                if self.reload:
+                is_20f_amendment = (
+                    str(form_type).upper() == '20-F/A'
+                    and str(reporting_period.get('period_type') or '').lower() == 'annual'
+                )
+                complete_20f_amendment = (
+                    is_20f_amendment
+                    and self._has_complete_annual_statement_set(prepared_statements)
+                )
+                if complete_20f_amendment:
+                    # A complete amended annual statement set supersedes the
+                    # original 20-F period. Delete only after the filing agent
+                    # approves the write; include both original and prior
+                    # amendment values in that one fiscal-year replacement.
+                    agent_state['pre_write_hook'] = (
+                        lambda c=cik, f=filing_info: self._delete_reload_data(
+                            c, f, force=True
+                        )
+                    )
+                    agent_state['replace_existing'] = True
+                elif is_20f_amendment:
+                    # A partial amendment may still correct reported facts.
+                    # Merge/replace matching concepts, but never erase the
+                    # original annual set when one or more core statements are
+                    # absent.
+                    logger.warning(
+                        "20-F/A %s has an incomplete annual statement set; "
+                        "merging matching facts without deleting existing FY data",
+                        accession_number,
+                    )
+                    agent_state['replace_existing'] = True
+                elif self.reload:
                     # Deferred reload: only delete if the agent writes, and
                     # replace (not skip) rows that survive the delete.
                     agent_state['pre_write_hook'] = (
@@ -2450,10 +2608,10 @@ def should_process_filing_for_download_period(filing: Dict, company_data: Dict, 
 
         form_type = filing.get('form') or filing.get('form_type')
 
-        # A fiscal-year-only request targets the annual filing. Quarterly
+        # A fiscal-year-only request targets annual reports. Quarterly
         # filings are selected only when a specific fiscal quarter is given.
         if target_fiscal_year and not target_fiscal_quarter:
-            return form_type == '10-K'
+            return is_annual_form(form_type)
         
         # Filter by fiscal quarter (if specified)
         if target_fiscal_quarter:
@@ -2504,7 +2662,8 @@ def main():
     parser = argparse.ArgumentParser(
         prog='main',
         description=(
-            'SEC EDGAR Data Scraper — downloads and normalises 10-K/10-Q XBRL '
+            'SEC EDGAR Data Scraper — downloads and normalises annual/quarterly '
+            '10-K/10-Q/20-F XBRL '
             'filings from the SEC API into MongoDB.\n\n'
             'Quickstart examples:\n'
             '  main --file tickers.txt\n'

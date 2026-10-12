@@ -16,7 +16,8 @@ from typing import Dict, List, Optional, Any, Union, Sequence
 from bs4 import BeautifulSoup
 from core.extractors.sec_data_extractors import extract_period_info_from_sec_api
 from utilities.helpers.period_utils import (
-    PeriodConfig, PeriodParser, PeriodClassifier, PeriodMatcher, FiscalYearCalculator
+    PeriodConfig, PeriodParser, PeriodClassifier, PeriodMatcher, FiscalYearCalculator,
+    is_annual_form,
 )
 from core.extractors.dimensional_filters import filter_dimensional_data_by_period_length, get_target_duration_for_form
 from core.extractors.dimensional_context_filters import apply_dimensional_context_filters
@@ -143,7 +144,9 @@ class EnhancedFinancialStatementProcessor:
                     fiscal_year_convention or "end",
                 )
                 enhanced_company_info['fiscal_year'] = fiscal_year
-                enhanced_company_info['fiscal_quarter'] = quarter
+                enhanced_company_info['fiscal_quarter'] = (
+                    None if is_annual_form(filing_form_type) else quarter
+                )
                 enhanced_company_info['fiscal_year_end_code'] = fiscal_year_end_code
                 logger.debug(
                     f"Pre-calculated fiscal year {fiscal_year} Q{quarter} "
@@ -487,9 +490,9 @@ class EnhancedFinancialStatementProcessor:
         if not meaningful_dimensional_facts:
             return []
 
-        # For 10-K filings, use RELAXED filtering - accept all annual periods without strict matching
-        # This avoids the issue where strict end-date matching rejects valid 12-month periods
-        if filing_form_type == '10-K':
+        # Annual reports use RELAXED filtering - accept annual periods without
+        # strict matching. This includes domestic 10-K and foreign 20-F filings.
+        if is_annual_form(filing_form_type):
             # For annual filings, simple duration-based filtering is sufficient
             # Accept periods between 11-13 months
             filtered_facts = []
@@ -773,7 +776,7 @@ class EnhancedFinancialStatementProcessor:
             else:
                 # CRITICAL FIX: For 10-Q quarterly filings, NEVER use fallback that could pick cumulative periods
                 # Only use fallback for annual filings (10-K) where close matches are acceptable
-                if filing_form_type == '10-K' and valid_periods:
+                if is_annual_form(filing_form_type) and valid_periods:
                     closest_period = valid_periods[0]
                     if verbose:
                         period_type = "annual"

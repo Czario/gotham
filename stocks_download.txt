@@ -1,1 +1,3 @@
-MSFT
+ASML
+TSM
+ERIC

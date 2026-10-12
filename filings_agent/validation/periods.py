@@ -10,6 +10,7 @@ from typing import Any
 
 from .common import duration_days, parse_date, statement_label
 from .findings import LOW, MEDIUM, Finding
+from utilities.helpers.period_utils import is_annual_form
 
 # Durations (days) considered plausible.  A 10-K covers ~365 days, a 10-Q
 # income statement ~90 and its year-to-date cash flow ~180–270.  Anything
@@ -57,12 +58,12 @@ def check_periods(bundle: Any) -> list[Finding]:
 
     period_type = str(reporting_period.get("period_type") or "").lower()
     if period_type:
-        if form_type == "10-K" and period_type != "annual":
+        if is_annual_form(form_type) and period_type != "annual":
             findings.append(
                 Finding(
                     "period_type_form_mismatch",
                     MEDIUM,
-                    f"{st}: 10-K carries period_type={period_type!r} (expected 'annual')",
+                    f"{st}: {form_type} carries period_type={period_type!r} (expected 'annual')",
                     statement_type=st,
                 )
             )

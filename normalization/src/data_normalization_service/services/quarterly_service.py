@@ -31,6 +31,12 @@ from ..utils.progress import progress_wrapper, create_progress_bar
 
 logger = logging.getLogger(__name__)
 
+_ANNUAL_FORM_TYPES = frozenset({'10-K', '10-K/A', '20-F', '20-F/A'})
+
+
+def _is_annual_form_type(form_type: Optional[str]) -> bool:
+    return str(form_type or '').strip().upper() in _ANNUAL_FORM_TYPES
+
 
 @dataclass
 class PeriodData:
@@ -87,7 +93,7 @@ class PeriodBasedFinancialCalculationService:
     
     def _get_concept_repo_by_form_type(self, form_type: str) -> ConceptRepository:
         """Get the appropriate concept repository based on form type."""
-        if form_type == '10-K':
+        if _is_annual_form_type(form_type):
             return self.annual_concept_repo
         elif form_type == '10-Q':
             return self.quarterly_concept_repo
@@ -98,7 +104,7 @@ class PeriodBasedFinancialCalculationService:
 
     def _get_value_repo_by_form_type(self, form_type: str) -> ValueRepository:
         """Get the appropriate value repository based on form type."""
-        if form_type == '10-K':
+        if _is_annual_form_type(form_type):
             return self.annual_value_repo
         elif form_type == '10-Q':
             return self.quarterly_value_repo
@@ -363,7 +369,7 @@ class PeriodBasedFinancialCalculationService:
                     values=values,
                     is_calculated=False,
                 ))
-            elif form_type == '10-K':
+            elif _is_annual_form_type(form_type):
                 annual_data.append(AnnualData(
                     fiscal_year=fiscal_year,
                     form_type=form_type,
@@ -552,7 +558,7 @@ class PeriodBasedFinancialCalculationService:
                     values=values,
                     is_calculated=False
                 ))
-            elif form_type == '10-K':
+            elif _is_annual_form_type(form_type):
                 annual_data.append(AnnualData(
                     fiscal_year=fiscal_year,
                     form_type=form_type,

@@ -66,6 +66,34 @@ def test_consolidated_total_beats_dimensional_member():
     assert best is total
 
 
+def test_20f_prefers_annual_fact_over_same_end_date_quarter():
+    annual_ctx = _Ctx(datetime(2025, 1, 1), datetime(2025, 12, 31))
+    q4_ctx = _Ctx(datetime(2025, 10, 1), datetime(2025, 12, 31))
+    annual = _Fact(1_000, annual_ctx)
+    q4 = _Fact(250, q4_ctx)
+
+    extractor = _extractor()
+    extractor.target_form_type = "20-F"
+    extractor.filing_form_type = "20-F"
+
+    assert extractor._select_best_primary_fact([q4, annual]) is annual
+
+
+def test_20f_primary_period_filter_keeps_annual_duration():
+    annual_ctx = _Ctx(datetime(2025, 1, 1), datetime(2025, 12, 31))
+    q4_ctx = _Ctx(datetime(2025, 10, 1), datetime(2025, 12, 31))
+    annual = _Fact(1_000, annual_ctx)
+    q4 = _Fact(250, q4_ctx)
+
+    extractor = object.__new__(FlexibleXBRLExtractor)
+    extractor.filing_form_type = "20-F"
+    extractor.is_older_filing = False
+
+    assert extractor._filter_facts_to_primary_period([annual, q4], None) == [annual]
+    assert extractor._is_primary_period("2025-01-01 to 2025-12-31")
+    assert not extractor._is_primary_period("2025-10-01 to 2025-12-31")
+
+
 def test_fallback_prefers_undimensioned_fact_when_periods_rejected():
     # Both are 6-month periods → all rejected by the quarterly filter, forcing
     # the fallback path.

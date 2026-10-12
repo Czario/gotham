@@ -73,10 +73,15 @@ ENHANCED_COLLECTIONS_CONFIG = {
                 "properties": {
                     "cik": {"bsonType": "string"},
                     "accession_number": {"bsonType": "string"},
-                    "form_type": {"enum": ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-3"]},
+                    "form_type": {"enum": ["10-K", "10-Q", "8-K", "20-F", "20-F/A", "DEF 14A", "S-1", "S-3"]},
                     "filing_date": {"bsonType": "date"},
+                    "report_date": {"bsonType": ["date", "null"]},
+                    "primary_document": {"bsonType": ["string", "null"]},
+                    "primary_doc_description": {"bsonType": ["string", "null"]},
+                    "is_xbrl": {"bsonType": ["bool", "null"]},
                     "acceptance_datetime": {"bsonType": ["date", "null"]},
-                    "created_at": {"bsonType": "date"}
+                    "created_at": {"bsonType": "date"},
+                    "updated_at": {"bsonType": ["date", "null"]}
                 }
             }
         },

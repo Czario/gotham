@@ -1,4 +1,4 @@
-"""Unified Redis consumer for processing 10-K / 10-Q filings.
+"""Unified Redis consumer for annual and quarterly XBRL filing jobs.
 
 Canonical worker implementation for sec-scraper queue processing.
 """
@@ -24,7 +24,9 @@ from worker_progress import WorkerHeartbeat, WorkerProgressPublisher
 logger = logging.getLogger(__name__)
 
 _DEFAULT_QUEUE = "sec:filings:10kq"
-_HANDLED_TYPES = frozenset({"10-K", "10-Q", "10-K/A", "10-Q/A"})
+_HANDLED_TYPES = frozenset({
+    "10-K", "10-Q", "10-K/A", "10-Q/A", "20-F", "20-F/A",
+})
 
 
 class WorkerProgressManager(ProgressManager):
@@ -191,7 +193,7 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="sec-scraper-worker",
-        description="Consume 10-K/10-Q filing jobs from Redis and run the extraction pipeline.",
+        description="Consume annual/quarterly filing jobs from Redis and run the XBRL pipeline.",
     )
     parser.add_argument("--redis-url",
                         default=os.getenv("REDIS_URL", "redis://localhost:6379/0"))
@@ -282,7 +284,7 @@ def main(argv: list[str] | None = None) -> None:
             form_type = (payload.get("filing_type") or payload.get("form_type") or "").upper()
 
             if form_type not in _HANDLED_TYPES:
-                logger.warning("Unexpected form_type %r on 10-K/Q queue — skipping", form_type)
+                logger.warning("Unsupported form_type %r on annual/quarterly queue — skipping", form_type)
                 if args.once:
                     break
                 continue

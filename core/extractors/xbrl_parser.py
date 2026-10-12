@@ -12,6 +12,7 @@ import pandas as pd
 from dataclasses import dataclass, field, asdict
 import re
 from bs4 import BeautifulSoup
+from utilities.helpers.period_utils import is_annual_form
 
 
 # Custom filter to suppress Arelle transformation namespace warnings
@@ -146,6 +147,9 @@ class FlexibleXBRLExtractor:
 
         # Filing form type for period filtering (10-Q, 10-K, etc.)
         self.target_form_type = filing_form_type
+        # Older selection helpers read this attribute; keep it aligned with the
+        # canonical target_form_type until those call sites are consolidated.
+        self.filing_form_type = filing_form_type
 
         # Authoritative filing date (YYYY-MM-DD) from the SEC submissions API.
         # When absent the date is approximated from the accession number.
@@ -281,6 +285,11 @@ class FlexibleXBRLExtractor:
         """Extract all financial statements with hierarchical structure and enhanced dimensional support"""
         
         start_time = time.time()
+        if filing_form_type:
+            self.target_form_type = filing_form_type
+            self.filing_form_type = filing_form_type
+        else:
+            self.filing_form_type = self.target_form_type
         
         try:
             # Intelligently resolve the optimal XBRL URL
@@ -755,8 +764,9 @@ class FlexibleXBRLExtractor:
         if duration_contexts and doc_period_end:
             # Determine target duration based on filing form type
             filing_form_type = getattr(self, 'filing_form_type', None)
-            target_days_min = 350 if filing_form_type == '10-K' else 80  # Annual vs Quarterly
-            target_days_max = 370 if filing_form_type == '10-K' else 100
+            annual_filing = is_annual_form(filing_form_type)
+            target_days_min = 350 if annual_filing else 80  # Annual vs Quarterly
+            target_days_max = 370 if annual_filing else 100
             
             # Look for periods matching the filing type and ending around document period end
             matching_periods = []
@@ -765,8 +775,8 @@ class FlexibleXBRLExtractor:
                 # Check if period duration matches filing type expectations
                 is_duration_match = target_days_min <= duration_days <= target_days_max
                 
-                # For 10-K, also allow slightly longer periods (up to 400 days for fiscal years)
-                if filing_form_type == '10-K' and 350 <= duration_days <= 400:
+                # Annual reports may cover a 53-week fiscal year (up to 400 days).
+                if annual_filing and 350 <= duration_days <= 400:
                     is_duration_match = True
                     
                 # For 10-Q, be more strict about quarterly periods (80-100 days)
@@ -781,7 +791,7 @@ class FlexibleXBRLExtractor:
             
             if matching_periods:
                 # Sort by how close the end date is to document period end, then by duration appropriateness
-                matching_periods.sort(key=lambda x: (x[3], abs(x[5] - (365 if filing_form_type == '10-K' else 90))))
+                matching_periods.sort(key=lambda x: (x[3], abs(x[5] - (365 if annual_filing else 90))))
                 
                 best_duration = matching_periods[0][0]  # period_str
                 best_context_id = matching_periods[0][4]
@@ -1502,7 +1512,7 @@ class FlexibleXBRLExtractor:
                                 score += 1200  # Higher than instant periods
                             else:
                                 score += 800
-                    elif target_form_type == '10-K':
+                    elif is_annual_form(target_form_type):
                         # For annual filings, prefer annual periods
                         if abs(duration_months - 12.0) <= 1.0:
                             score += 1200  # Annual period
@@ -1983,7 +1993,7 @@ class FlexibleXBRLExtractor:
                         max_months = 4.2 if is_older_filing else 4.0
                         if not (min_months <= duration_months <= max_months):
                             should_include = False
-                    elif target_form_type == '10-K':
+                    elif is_annual_form(target_form_type):
                         # Relaxed annual range for older filings
                         min_months = 10.5 if is_older_filing else 11.0
                         max_months = 13.5 if is_older_filing else 13.0
@@ -2129,7 +2139,7 @@ class FlexibleXBRLExtractor:
                         if target_form_type == '10-Q':
                             # Quarterly: 2.5-4 months
                             return 2.5 <= duration_months <= 4.0
-                        elif target_form_type == '10-K':
+                        elif is_annual_form(target_form_type):
                             # Annual: 11-13 months
                             return 11.0 <= duration_months <= 13.0
                         else:

@@ -6,7 +6,7 @@ This module extracts period information from SEC API and calculates fiscal year 
 
 from datetime import datetime
 from typing import Dict, Optional
-from utilities.helpers.period_utils import FiscalYearCalculator
+from utilities.helpers.period_utils import FiscalYearCalculator, is_annual_form
 from utilities.helpers.logger_config import get_module_logger
 
 logger = get_module_logger(__name__)
@@ -51,7 +51,7 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
             pass
     
     # Determine period type based on form (no calculation, just mapping)
-    if form_type == '10-K':
+    if is_annual_form(form_type):
         period_type = "annual"
     elif form_type == '10-Q':
         period_type = "quarterly"
@@ -93,7 +93,7 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
 
     # Calculate fiscal year and quarter if we have the necessary data
     fiscal_year = authoritative_fy
-    quarter = authoritative_qtr
+    quarter = None if is_annual_form(form_type) else authoritative_qtr
     
     if end_date and fiscal_year_end_code:
         try:
@@ -103,11 +103,11 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
             if fiscal_year is None:
                 fiscal_year = calculated_fy
             
-            # For 10-K (annual reports), only include fiscal_year, not quarter
-            # For 10-Q (quarterly reports), include both fiscal_year and quarter
-            if form_type == '10-K':
-                logger.debug(f"Calculated fiscal year {fiscal_year} for annual report (10-K)")
-                # quarter remains None for 10-K forms
+            # Annual reports include fiscal_year but no quarter. Quarterly
+            # reports include both fiscal_year and quarter.
+            if is_annual_form(form_type):
+                quarter = None
+                logger.debug(f"Calculated fiscal year {fiscal_year} for annual report ({form_type})")
             elif form_type == '10-Q':
                 if quarter is None:
                     quarter = calculated_quarter
@@ -148,8 +148,8 @@ def extract_period_info_from_sec_api(filing_info: Dict, company_info: Dict) -> D
     if fiscal_year_convention:
         result["fiscal_year_convention"] = fiscal_year_convention
     
-    # Only add quarter for quarterly reports (10-Q) and other non-annual forms
-    if quarter is not None and form_type != '10-K':
+    # Annual reports (including 20-F) are stored without a quarter.
+    if quarter is not None and not is_annual_form(form_type):
         result["quarter"] = quarter
     
     return result

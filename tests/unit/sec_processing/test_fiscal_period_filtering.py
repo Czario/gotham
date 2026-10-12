@@ -69,6 +69,43 @@ def test_fiscal_year_only_selects_annual_filing():
     assert [filing["accessionNumber"] for filing in selected] == ["k"]
 
 
+def test_fiscal_year_only_selects_20f_and_20f_amendment_as_annual():
+    filings = _filings() + [
+        {"form": "20-F", "accessionNumber": "20f", "reportDate": "2023-12-31"},
+        {"form": "20-F/A", "accessionNumber": "20fa", "reportDate": "2023-12-31"},
+    ]
+
+    selected = _app_for_period()._filter_filings_by_fiscal_period(filings, _company())
+
+    assert [filing["accessionNumber"] for filing in selected] == ["k", "20f", "20fa"]
+
+
+def test_q4_filter_accepts_20f_annual_but_other_quarters_do_not():
+    filings = _filings() + [
+        {"form": "20-F", "accessionNumber": "20f", "reportDate": "2023-12-31"},
+    ]
+
+    q4_selected = _app_for_period("Q4")._filter_filings_by_fiscal_period(
+        filings, _company()
+    )
+    q3_selected = _app_for_period("Q3")._filter_filings_by_fiscal_period(
+        filings, _company()
+    )
+
+    assert "20f" in [filing["accessionNumber"] for filing in q4_selected]
+    assert "20f" not in [filing["accessionNumber"] for filing in q3_selected]
+
+
+def test_20f_period_label_is_annual():
+    app = _app_for_period()
+    assert app._format_filing_period(
+        {"form": "20-F", "reportDate": "2023-12-31"}, _company()
+    ) == "FY2023 Annual"
+    assert app._format_filing_period(
+        {"form": "20-F/A", "reportDate": "2023-12-31"}, _company()
+    ) == "FY2023 Annual"
+
+
 def test_filing_period_label_uses_company_fiscal_year():
     # September fiscal year end: a March 31 report date is fiscal Q2.
     app = _app_for_period(fiscal_year_end="0930")
@@ -116,6 +153,16 @@ def test_download_only_fiscal_year_selects_annual_filing():
         company,
         target_fiscal_year=2023,
     )
+    assert should_process_filing_for_download_period(
+        {"form_type": "20-F", "reportDate": "2023-12-31"},
+        company,
+        target_fiscal_year=2023,
+    )
+    assert should_process_filing_for_download_period(
+        {"form_type": "20-F/A", "reportDate": "2023-12-31"},
+        company,
+        target_fiscal_year=2023,
+    )
     assert not should_process_filing_for_download_period(
         {"form_type": "10-Q", "reportDate": "2023-09-30"},
         company,
@@ -151,6 +198,66 @@ def test_existing_filing_falls_back_to_fiscal_period_when_accession_is_missing()
     assert period_query["form_type"] == "10-Q"
     assert period_query["reporting_period.fiscal_year"] == 2023
     assert period_query["reporting_period.quarter"] == 2
+
+
+def test_latest_20f_amendment_reload_scopes_the_annual_period_and_form_family():
+    app = _app_for_period()
+    app.latest = True
+
+    reload_filter = app._build_reload_filter(
+        "0000937966",
+        {
+            "form": "20-F/A",
+            "accessionNumber": "0001628280-26-011378",
+            "reportDate": "2025-12-31",
+        },
+        "20-F/A",
+    )
+
+    assert reload_filter["reporting_period.fiscal_year"] == 2025
+    assert "reporting_period.quarter" not in reload_filter
+    assert reload_filter["form_type"] == {"$in": ["20-F", "20-F/A"]}
+
+
+def test_20f_amendment_reload_uses_period_date_without_fiscal_year_metadata():
+    app = _app_for_period(in_db=False)
+    app.latest = True
+    app._get_authoritative_fiscal_year_end = lambda *_args, **_kwargs: None
+    app._get_authoritative_fiscal_year_convention = lambda *_args, **_kwargs: None
+
+    reload_filter = app._build_reload_filter(
+        "0000937966",
+        {"form": "20-F/A", "accessionNumber": "amend", "reportDate": "2025-12-31"},
+        "20-F/A",
+    )
+
+    assert reload_filter["reporting_period.period_date"] == "2025-12-31"
+    assert reload_filter["form_type"] == {"$in": ["20-F", "20-F/A"]}
+
+
+def test_forced_20f_amendment_delete_runs_without_global_reload():
+    app = _app_for_period(fiscal_year_end="1231")
+    app.reload = False
+    app.latest = True
+    app._cv_annual_col = MagicMock()
+    app._cv_quarterly_col = MagicMock()
+    app._cv_annual_col.delete_many.return_value.deleted_count = 0
+    app._cv_quarterly_col.delete_many.return_value.deleted_count = 0
+    app.progress = MagicMock()
+
+    app._delete_reload_data(
+        "0000937966",
+        {"form": "20-F/A", "accessionNumber": "amend", "reportDate": "2023-12-31"},
+        force=True,
+    )
+
+    expected = {
+        "cik": "0000937966",
+        "reporting_period.fiscal_year": 2023,
+        "form_type": {"$in": ["20-F", "20-F/A"]},
+    }
+    app._cv_annual_col.delete_many.assert_called_once_with(expected)
+    app._cv_quarterly_col.delete_many.assert_called_once_with(expected)
 
 
 def test_latest_reload_filter_is_scoped_to_accession():

@@ -138,6 +138,32 @@ def test_reload_replaces_the_existing_period_row(service):
     assert update["calculated"] is False
 
 
+def test_20f_amendment_replaces_annual_value_and_keeps_amendment_provenance(service):
+    repo = Mock()
+    existing_id = ObjectId()
+    repo.find_existing_value.return_value = {
+        "_id": existing_id, "value": 111.0, "accession_number": "original-20f",
+    }
+    service._get_value_repo_by_form_type = Mock(return_value=repo)
+    annual_statement = _statement(
+        {"fiscal_year": 2025, "quarter": 4, "period_date": "2025-12-31"}
+    )
+
+    result = service._create_value_record(
+        ObjectId(), annual_statement, _filing("20-F/A"), dict(ITEM), 123.0,
+        replace_existing=True,
+    )
+
+    assert result == existing_id
+    repo.find_existing_value.assert_called_once()
+    period = repo.find_existing_value.call_args.args[1]
+    assert period == {"fiscal_year": 2025, "period_date": "2025-12-31"}
+    update = repo.collection.update_one.call_args.args[1]["$set"]
+    assert update["value"] == 123.0
+    assert update["form_type"] == "20-F/A"
+    assert update["accession_number"] == "acc-1"
+
+
 def test_reload_flag_threads_through_persist_statement_bundle(service, mocker):
     """persist_statement_bundle(replace_existing=True) must reach the writer."""
     captured = {}

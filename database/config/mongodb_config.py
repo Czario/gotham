@@ -111,10 +111,15 @@ COLLECTIONS_CONFIG = {
                 "properties": {
                     "cik": {"bsonType": "string"},
                     "accession_number": {"bsonType": "string"},
-                    "form_type": {"enum": ["10-K", "10-Q", "8-K", "DEF 14A", "S-1", "S-3"]},
+                    "form_type": {"enum": ["10-K", "10-Q", "8-K", "20-F", "20-F/A", "DEF 14A", "S-1", "S-3"]},
                     "filing_date": {"bsonType": "date"},
+                    "report_date": {"bsonType": ["date", "null"]},
+                    "primary_document": {"bsonType": ["string", "null"]},
+                    "primary_doc_description": {"bsonType": ["string", "null"]},
+                    "is_xbrl": {"bsonType": ["bool", "null"]},
                     "acceptance_datetime": {"bsonType": ["date", "null"]},
-                    "created_at": {"bsonType": "date"}
+                    "created_at": {"bsonType": "date"},
+                    "updated_at": {"bsonType": ["date", "null"]}
                 }
             }
         },
@@ -195,6 +200,26 @@ COLLECTIONS_CONFIG = {
         ]
     }
 }
+
+
+def ensure_filing_metadata_collection(db):
+    """Create/upgrade the per-accession SEC filings ledger collection.
+
+    This targeted migration is safe to run repeatedly and avoids creating the
+    legacy raw financial_statements collection used by older pipelines.
+    """
+    collection_name = "filings"
+    config = COLLECTIONS_CONFIG[collection_name]
+    if collection_name not in db.list_collection_names():
+        db.create_collection(collection_name, validator=config["validator"])
+    else:
+        db.command({"collMod": collection_name, "validator": config["validator"]})
+
+    collection = db[collection_name]
+    for index_spec, options in config["indexes"]:
+        collection.create_index(index_spec, **options)
+    return collection
+
 
 def setup_database_schema(db):
     """

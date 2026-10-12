@@ -17,6 +17,10 @@ from utilities.sec_rate_limiter import _global_rate_limiter
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_FINANCIAL_FORMS = ("10-K", "10-Q", "20-F", "20-F/A")
+FOREIGN_ANNUAL_FORMS = frozenset({"20-F", "20-F/A"})
+
+
 class SECAPIClient:
     """Client for interacting with SEC EDGA            # Construct SEC directory URL using the same pattern as XBRL
             directory_url = f"https://www.sec.gov/Archives/edgar/data/{unpadded_cik}/{clean_accession}/"
@@ -161,8 +165,17 @@ class SECAPIClient:
             'filings': data.get('filings', {})
         }
     
-    def _extract_filings(self, data: Dict, forms_filter: List[str] = ['10-K', '10-Q'], start_year: int = 2010, end_year: Optional[int] = None, company_cik: Optional[str] = None) -> List[Dict]:
-        """Extract filings from SEC response, filtered by form types and fiscal year range"""
+    def _extract_filings(self, data: Dict, forms_filter: Optional[List[str]] = None, start_year: int = 2010, end_year: Optional[int] = None, company_cik: Optional[str] = None) -> List[Dict]:
+        """Extract supported financial filings, filtered by form and fiscal year.
+
+        20-F forms are included only when SEC submissions provides a valid
+        reportDate, producing annual-report candidates while excluding the
+        common registration filings with no reporting period. Once the primary
+        document is available, its cover can be verified with
+        ``utilities.sec_filing_classifier``.
+        """
+        if forms_filter is None:
+            forms_filter = list(DEFAULT_FINANCIAL_FORMS)
         # Handle both main response format and historical file format
         if 'filings' in data and 'recent' in data['filings']:
             # Main submissions response format
@@ -190,10 +203,17 @@ class SECAPIClient:
         
         for i, form in enumerate(forms):
             if form in forms_filter:
-                filing_date = filing_dates[i]
+                filing_date = filing_dates[i] if i < len(filing_dates) else None
                 
                 # Get filing-specific data
                 report_date = report_dates[i] if i < len(report_dates) else None
+                if form in FOREIGN_ANNUAL_FORMS:
+                    try:
+                        datetime.strptime(str(report_date), '%Y-%m-%d')
+                    except (TypeError, ValueError):
+                        # Form 20-F is also used for non-annual filings. Keep
+                        # only submissions with an explicit reporting period.
+                        continue
                 fiscal_year_end = fiscal_year_ends[i] if i < len(fiscal_year_ends) else company_fiscal_year_end
                 
                 # Filter by fiscal year using proper calculation

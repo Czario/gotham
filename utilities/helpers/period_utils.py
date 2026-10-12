@@ -12,6 +12,14 @@ import re
 from .period_normalizer import normalize_period_type
 
 
+ANNUAL_REPORT_FORMS = frozenset({"10-K", "10-K/A", "20-F", "20-F/A"})
+
+
+def is_annual_form(form_type: Optional[str]) -> bool:
+    """Return whether an SEC form represents an annual financial report."""
+    return str(form_type or "").strip().upper() in ANNUAL_REPORT_FORMS
+
+
 class PeriodConfig:
     """Configuration constants for period processing"""
     
@@ -19,6 +27,9 @@ class PeriodConfig:
     FILING_TYPE_DURATIONS = {
         '10-Q': 3,   # Quarterly
         '10-K': 12,  # Annual
+        '10-K/A': 12,
+        '20-F': 12,  # Foreign private issuer annual report
+        '20-F/A': 12,
     }
     
     # Period type indicators
@@ -206,7 +217,7 @@ class PeriodMatcher:
     @staticmethod
     def get_duration_tolerance_for_form(form_type: Optional[str]) -> float:
         """Get the duration tolerance for a filing type - STRICT MODE"""
-        if form_type == '10-K':
+        if is_annual_form(form_type):
             return PeriodConfig.ANNUAL_DURATION_TOLERANCE
         elif form_type == '10-Q':
             # Ultra strict for quarterly filings - must be exactly 3 months
@@ -282,7 +293,7 @@ class PeriodMatcher:
             elif not PeriodClassifier.is_quarterly_period(selected_period):
                 return False, f"STRICT REJECTION: Non-quarterly period for 10-Q filing - MUST use exactly 3-month period"
         
-        elif form_type == '10-K':
+        elif is_annual_form(form_type):
             if (PeriodClassifier.is_quarterly_period(selected_period) and 
                 not PeriodClassifier.is_annual_period(selected_period)):
                 return False, f"WARNING: Selected quarterly period for annual filing - should use 12-month period"
@@ -651,9 +662,10 @@ class FiscalYearCalculator:
     ) -> Optional[str]:
         """Detect 'start' or 'end' fiscal year convention from SEC Company Facts JSON.
 
-        Inspects recent 10-K annual facts (fp='FY') for common concepts. For
-        companies with a Jan/Feb fiscal year end, if the 10-K ending in Jan/Feb
-        year Y is labelled fy=Y-1, the convention is 'start' (e.g. GME, RENT, ZUMZ).
+        Inspects recent annual report facts (fp='FY') from 10-K/20-F forms for
+        common concepts. For companies with a Jan/Feb fiscal year end, if the
+        annual report ending in Jan/Feb of year Y is labelled fy=Y-1, the
+        convention is 'start' (e.g. GME, RENT, ZUMZ).
         If labelled fy=Y, the convention is 'end' (e.g. WMT, NVDA).
         """
         if not company_facts or not isinstance(company_facts, dict):
@@ -671,7 +683,7 @@ class FiscalYearCalculator:
                 units = units_dict.get('USD', []) or next(iter(units_dict.values()), [])
                 annuals = [
                     u for u in units
-                    if u.get('form') in ('10-K', '10-K/A') and u.get('fp') == 'FY' and u.get('end')
+                    if is_annual_form(u.get('form')) and u.get('fp') == 'FY' and u.get('end')
                 ]
                 for u in reversed(annuals):
                     end_str = str(u['end'])[:10]
@@ -726,9 +738,12 @@ class FiscalYearCalculator:
         if not end_date or not fiscal_year_end_code:
             return None
         
-        # For 10-K filings, it's always Q4 (annual/full year)
-        if form_type == '10-K':
+        # Domestic annual reports are conventionally labeled Q4. Foreign
+        # annual reports remain annual and must not acquire a quarterly slot.
+        if form_type in ('10-K', '10-K/A'):
             return 4
+        if form_type in ('20-F', '20-F/A'):
+            return None
         
         # For 10-Q filings, use centralized quarter determination
         if form_type == '10-Q':
