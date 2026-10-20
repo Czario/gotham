@@ -17,7 +17,6 @@ import json
 import logging
 import re
 import time
-from itertools import count
 from typing import Any, Callable
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -156,6 +155,28 @@ def _build_finalize_tool(name: str, description: str):
     return finalize_tool
 
 
+def _is_non_resolving_tool_result(tool_name: str, result: Any) -> bool:
+    """Return True if a tool call failed or reported unresolved critic/linter issues."""
+    if not isinstance(result, str):
+        return False
+    text = result.strip()
+    if text.startswith(("Tool error:", "Unknown tool:", "Invalid JSON", "Error:", "Warning:")):
+        return True
+    if tool_name in ("propose_hierarchy", "lint_hierarchy", "check_hierarchy") and "FINDINGS:" in text:
+        return True
+    if tool_name == "preview_hierarchy" and "CHECK FAILURES" in text:
+        return True
+    if tool_name == "check_signs" and "sign violation(s) remaining" in text:
+        return True
+    if tool_name == "search" and text.startswith("No lines found"):
+        return True
+    if tool_name == "read_lines" and text.startswith("Invalid range"):
+        return True
+    if tool_name == "query_statement_rows" and text.startswith("No numeric rows"):
+        return True
+    return False
+
+
 def run_agent_loop(
     system_prompt: str,
     initial_message: str,
@@ -163,6 +184,7 @@ def run_agent_loop(
     *,
     ticker: str = "?",
     max_steps: int | None = None,
+    max_retries: int | None = None,
     finalize_name: str = "finalize_review",
     finalize_description: str = FINALIZE_DESCRIPTION,
     parse_final_result: Callable[[str], dict[str, Any] | None] | None = None,
@@ -177,7 +199,8 @@ def run_agent_loop(
         initial_message: First human message.
         tools: LangChain tools; the terminal finalize tool is appended.
         ticker: For logging / progress.
-        max_steps: Optional hard step cap (``None`` = open-ended).
+        max_steps: Optional hard step cap (defaults to ``config.AGENT_MAX_STEPS``).
+        max_retries: Max consecutive non-resolving turns before exiting (capped at 3).
         finalize_name: Name of the terminal tool.
         finalize_description: Docstring for the terminal tool.
         parse_final_result: Parser for the terminal tool's JSON string.
@@ -193,10 +216,24 @@ def run_agent_loop(
     Returns:
         The parsed final result dict, or ``None`` if the agent produced none.
     """
+    from filings_agent import config
+
     if parse_final_result is None:
         parse_final_result = parse_json_object
     if recovery_regex is None:
         recovery_regex = re.compile(r"\{.*\}", re.DOTALL)
+
+    effective_max_steps = (
+        max(1, int(max_steps))
+        if max_steps is not None
+        else max(1, int(getattr(config, "AGENT_MAX_STEPS", 8)))
+    )
+    configured_max_retries = (
+        int(max_retries)
+        if max_retries is not None
+        else int(getattr(config, "AGENT_MAX_RETRIES", 3))
+    )
+    effective_max_retries = min(3, max(1, configured_max_retries))
 
     all_tools = list(tools) + [_build_finalize_tool(finalize_name, finalize_description)]
 
@@ -214,8 +251,11 @@ def run_agent_loop(
     ]
 
     final_result: dict[str, Any] | None = None
+    consecutive_non_resolving = 0
+    seen_tool_calls: dict[str, int] = {}
+    tool_name_counts: dict[str, int] = {}
 
-    steps = count(1) if not max_steps else range(1, max_steps + 1)
+    steps = range(1, effective_max_steps + 1)
 
     diag_handler = _NetworkDiagnosticHandler()
     watched_loggers = [
@@ -264,6 +304,16 @@ def run_agent_loop(
                 content = getattr(response, "content", "") or ""
                 if "finalize" in content.lower() or "{" in content:
                     break
+                consecutive_non_resolving += 1
+                if consecutive_non_resolving >= effective_max_retries:
+                    logger.warning(
+                        "Agent loop for %s exceeded max retries (%d) without tool calls; exiting",
+                        ticker, effective_max_retries,
+                    )
+                    report_call(
+                        f"  [agent]  ⚠ exceeded max retries ({effective_max_retries}) without resolving — exiting"
+                    )
+                    break
                 messages.append(
                     HumanMessage(
                         content=(
@@ -275,10 +325,20 @@ def run_agent_loop(
                 continue
 
             tool_messages: list[ToolMessage] = []
+            step_had_non_resolving = False
             for tc in tool_calls:
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("args", {})
                 tool_call_id = tc.get("id", "")
+
+                call_sig = f"{tool_name}:{json.dumps(tool_args, sort_keys=True, default=str)}"
+                seen_tool_calls[call_sig] = seen_tool_calls.get(call_sig, 0) + 1
+                if seen_tool_calls[call_sig] > 1:
+                    step_had_non_resolving = True
+                if tool_name in ("propose_hierarchy", "preview_hierarchy", "check_hierarchy", "lint_hierarchy", "check_signs"):
+                    tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
+                    if tool_name_counts[tool_name] > effective_max_retries:
+                        step_had_non_resolving = True
 
                 logger.info(
                     "Agent call for %s → tool: %s(%s)",
@@ -307,6 +367,7 @@ def run_agent_loop(
                     parsed = parse_final_result(result_str)
                     _fin_dur = time.perf_counter() - _t_fin
                     if parsed is None:
+                        step_had_non_resolving = True
                         report_call(f"  [tool]  ✗ {finalize_name} — could not parse result JSON")
                     else:
                         final_result = parsed
@@ -350,6 +411,9 @@ def run_agent_loop(
                     _tool_dur = 0.0
                     result = f"Unknown tool: {tool_name}"
 
+                if _is_non_resolving_tool_result(tool_name, result):
+                    step_had_non_resolving = True
+
                 tool_summary = _summarize_tool_result(tool_name, result, _tool_dur)
                 report_call(f"  [tool]  {tool_summary}")
 
@@ -362,6 +426,19 @@ def run_agent_loop(
             messages.extend(tool_messages)
             if final_result is not None:
                 break
+            if step_had_non_resolving:
+                consecutive_non_resolving += 1
+                if consecutive_non_resolving >= effective_max_retries:
+                    logger.warning(
+                        "Agent loop for %s exceeded max retries (%d) on unresolved tool calls; exiting",
+                        ticker, effective_max_retries,
+                    )
+                    report_call(
+                        f"  [agent]  ⚠ exceeded max retries ({effective_max_retries}) without resolving — exiting"
+                    )
+                    break
+            else:
+                consecutive_non_resolving = 0
     finally:
         for wl in watched_loggers:
             wl.removeHandler(diag_handler)

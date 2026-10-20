@@ -204,8 +204,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--poll-timeout", type=int, default=5,
                         help="Seconds to block-wait for a Redis message.")
     parser.add_argument("--max-attempts", type=int,
-                        default=int(os.getenv("REDIS_MAX_ATTEMPTS", "3")),
-                        help="Retry limit before moving a job to the dead-letter queue.")
+                        default=min(3, max(1, int(os.getenv("REDIS_MAX_ATTEMPTS", "3")))),
+                        help="Retry limit before moving a job to the dead-letter queue (max 3).")
     parser.add_argument("--retry-delay", type=int,
                         default=int(os.getenv("REDIS_RETRY_DELAY_SECONDS", "5")),
                         help="Seconds to wait between retries.")

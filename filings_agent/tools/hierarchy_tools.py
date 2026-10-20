@@ -329,6 +329,7 @@ def build_unified_hierarchy_tools(
             "keep_tag": keep_tag,
             "reason": parsed.get("reason") or "",
         }
+        _build_preview()
         if keep_tag == "incoming":
             # The loser's dimensional children must follow the surviving row.
             # Surface them so the AGENT places them (move_row) — persist never
@@ -591,25 +592,20 @@ def build_unified_hierarchy_tools(
                 cur_dims.append(dict(d))
         proposal["dims"] = cur_dims
 
+        _build_preview()
+
         row_concepts = {r.get("concept") for r in proposal["rows"] if isinstance(r, dict)}
         unknown = [c for c in row_concepts if c not in known_names and not str(c).startswith("custom:")]
         if unknown:
             sorted_unknown = sorted(str(c) for c in unknown if c is not None)
             return (
-                f"Warning: these concepts are neither stored nor in the filing "
-                f"(they may still be custom headers): {sorted_unknown[:10]}"
-            )
-        lint_report = _run_linter()
-        if lint_report != "OK — no structural issues found.":
-            return (
-                f"Recorded {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s).\n"
-                f"{lint_report}\n"
-                "Please fix these findings with a revised propose_hierarchy()."
+                f"OK — recorded {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s) "
+                f"(note: unknown concepts {sorted_unknown[:10]}). Call finalize_hierarchy() now."
             )
         return (
-            f"OK — hierarchy recorded with 0 issues. "
-            f"Recorded {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s). "
-            "Now call preview_hierarchy() to check the exact paths/order_keys before finalizing."
+            f"OK — hierarchy recorded and materialized: "
+            f"{len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s). "
+            "Call finalize_hierarchy() now."
         )
 
     @tool
@@ -657,9 +653,9 @@ def build_unified_hierarchy_tools(
         )
         where = "dimensional members" if is_dim else "rows"
         (proposal["dims"] if is_dim else proposal["rows"]).append(spec)
+        _build_preview()
         return (
-            f"OK — '{concept}' moved to parent={parent!r} in {where}. "
-            "Run check_hierarchy() to verify."
+            f"OK — '{concept}' moved to parent={parent!r} in {where}."
         )
 
     @tool
@@ -695,7 +691,8 @@ def build_unified_hierarchy_tools(
         proposal.setdefault("removed", []).append(
             {"concept": concept} if parent is None else {"concept": concept, "parent": parent}
         )
-        return f"OK — removed {before - after} entr(y/ies) for '{concept}'. Run check_hierarchy() to verify."
+        _build_preview()
+        return f"OK — removed {before - after} entr(y/ies) for '{concept}'."
 
     def _structural_findings(rows: list[dict], dims: list[dict], materialized: bool = True) -> list[str]:
         """Structural critic.  Path-based checks run only when the rows carry

@@ -94,13 +94,14 @@ def with_recovery(
     """Wrap *node_fn* (already ``with_hooks``-wrapped) with bounded self-healing."""
 
     node_name = getattr(node_fn, "__name__", "node")
+    bounded_attempts = min(3, max(1, int(max_attempts)))
 
     @wraps(node_fn)
     def _wrapper(state: dict) -> dict:
         current = state
         issues = list(state.get("_issues") or [])
-        attempt = 0
-        while True:
+        result = current
+        for attempt in range(1, bounded_attempts + 1):
             result = node_fn(current)
             if result is None:
                 result = current
@@ -125,18 +126,17 @@ def with_recovery(
                 return result
 
             # ── Detect & record (operational exception) ───────────────────
-            attempt += 1
             issues.append({"node": node_name, "error": error, "attempt": attempt, "kind": "exception"})
             logger.warning(
                 "recovery: %s failed (attempt %d/%d): %s",
-                node_name, attempt, max_attempts, error,
+                node_name, attempt, bounded_attempts, error,
             )
             report_call(
-                f"  [recovery]  ⚠ {node_name} failed (attempt {attempt}/{max_attempts}) — {error[:140]}"
+                f"  [recovery]  ⚠ {node_name} failed (attempt {attempt}/{bounded_attempts}) — {error[:140]}"
             )
 
             # ── Escalate after the retry budget is exhausted ───────────────
-            if attempt >= max_attempts:
+            if attempt >= bounded_attempts:
                 result["_issues"] = issues
                 return result
 
@@ -154,5 +154,9 @@ def with_recovery(
             report_call(f"  [recovery]  ↻ retrying {node_name} — {reason[:120]}")
             # Clear transient failure markers so the node can re-run cleanly.
             current = {**result, "error": None, "status": state.get("status") or "validated"}
+
+        if issues:
+            result["_issues"] = issues
+        return result
 
     return _wrapper

@@ -153,3 +153,42 @@ def test_loop_respects_max_steps():
 
     assert result is None  # never finalized
     assert chat.invocations == 2
+
+
+def test_loop_stops_after_max_3_retries_on_repeated_non_resolving_calls():
+    """Never spin infinitely if the model repeats the same tool call or fails to finalize."""
+    chat = StubChat(
+        [
+            AIMessage(content="still thinking", tool_calls=[])
+            for _ in range(10)
+        ]
+    )
+
+    result = run_agent_loop(
+        "system", "hi", [ping], ticker="TEST", chat_llm=chat
+    )
+
+    assert result is None
+    assert chat.invocations == 3
+
+
+def test_loop_stops_after_max_3_retries_on_bad_finalize_json():
+    """Repeated invalid JSON in finalize tool is bounded to 3 attempts max."""
+    chat = StubChat(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "finalize_review", "args": {"result_json": "not-json"}, "id": f"tc{i}"}
+                ],
+            )
+            for i in range(10)
+        ]
+    )
+
+    result = run_agent_loop(
+        "system", "hi", [ping], ticker="TEST", chat_llm=chat
+    )
+
+    assert result is None
+    assert chat.invocations == 3

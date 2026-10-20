@@ -52,14 +52,25 @@ GEMINI_REQUEST_TIMEOUT: float = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "120")
 
 # ── Agent chat-model retries ───────────────────────────────────────────────
 # Retries for the tool-calling chat model used by the agent nodes (hierarchy
-# review, guidance).  Default 1 — the hierarchy agent is authoritative, so a
-# transient provider timeout must not cost the filing: under
+# review, guidance).  Default 1 (and hard-capped at 3) — the hierarchy agent is
+# authoritative, so a transient provider timeout must not cost the filing: under
 # HIERARCHY_AGENT_FAILURE_POLICY=block a single unretried timeout blocks the
 # whole filing.  LangChain's own default of 2 is not used because it lets a hung
 # call ride out `timeout x 3` (DeepSeek: 120s x 3 = 6 min) inside one agent step.
 # Set 0 to bound a stall to exactly one timeout, at the cost of failing the
 # filing on the first provider error.
-LLM_CHAT_MAX_RETRIES: int = int(os.getenv("LLM_CHAT_MAX_RETRIES", "1"))
+MAX_RETRY_LIMIT: int = 3
+LLM_CHAT_MAX_RETRIES: int = min(MAX_RETRY_LIMIT, max(0, int(os.getenv("LLM_CHAT_MAX_RETRIES", "1"))))
+
+# ── Node self-healing & ReAct loop retry bounds ────────────────────────────
+# Hard cap on recovery retries for operational exceptions in a LangGraph node
+# (max 3 retries).
+NODE_MAX_RETRIES: int = min(MAX_RETRY_LIMIT, max(0, int(os.getenv("NODE_MAX_RETRIES", "3"))))
+# Hard cap on consecutive non-resolving turns inside run_agent_loop (e.g.
+# repeated tool errors, linter warnings, invalid JSON, or missing tool calls)
+# and total steps so an agent loop can never spin infinitely.
+AGENT_MAX_RETRIES: int = min(MAX_RETRY_LIMIT, max(1, int(os.getenv("AGENT_MAX_RETRIES", "3"))))
+AGENT_MAX_STEPS: int = min(10, max(1, int(os.getenv("AGENT_MAX_STEPS", "8"))))
 
 # ── Dev LLM response cache (opt-in; never enable in production) ─────────────
 LLM_CACHE_ENABLED: bool = os.getenv("LLM_CACHE", "0").strip().lower() in {

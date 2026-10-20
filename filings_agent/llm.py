@@ -78,15 +78,16 @@ class _GroqRateLimiter:
         Returns a mutable ``[timestamp, token_count]`` entry that can be
         corrected later via :meth:`update_actual`.
         """
-        entry: list = [0.0, estimated_tokens]
-        while True:
+        effective_tokens = min(estimated_tokens, self._tpm) if self._tpm > 0 else estimated_tokens
+        entry: list = [0.0, effective_tokens]
+        for _ in range(3):
             with self._lock:
                 now = time.monotonic()
                 self._expire(now)
                 current_rpm = len(self._req_times)
                 current_tpm = sum(e[1] for e in self._tok_log)
                 rpm_ok = current_rpm < self._rpm
-                tpm_ok = current_tpm + estimated_tokens <= self._tpm
+                tpm_ok = current_tpm + effective_tokens <= self._tpm
                 if rpm_ok and tpm_ok:
                     entry[0] = now
                     self._req_times.append(now)
@@ -97,7 +98,7 @@ class _GroqRateLimiter:
                 if not rpm_ok and self._req_times:
                     wait = max(wait, self._WINDOW - (now - self._req_times[0]) + 0.1)
                 if not tpm_ok:
-                    need = current_tpm + estimated_tokens - self._tpm
+                    need = current_tpm + effective_tokens - self._tpm
                     drained = 0
                     for e in self._tok_log:
                         drained += e[1]
@@ -110,6 +111,13 @@ class _GroqRateLimiter:
                     wait, current_rpm, current_tpm, self._rpm, self._tpm,
                 )
             time.sleep(wait)
+        with self._lock:
+            now = time.monotonic()
+            self._expire(now)
+            entry[0] = now
+            self._req_times.append(now)
+            self._tok_log.append(entry)
+            return entry
 
     def update_actual(self, entry: list, actual_tokens: int) -> None:
         """Replace the estimated token count in *entry* with the real API count."""
@@ -339,6 +347,7 @@ def build_llm(
             provider's configured default model is used.
     """
     effective_provider = (provider or LLM_PROVIDER).strip().lower()
+    max_retries = min(3, max(0, int(max_retries)))
     if effective_provider == "groq":
         try:
             from langchain_openai import ChatOpenAI
@@ -443,7 +452,7 @@ def build_llm(
 
 
 def _configured_chat_retries() -> int:
-    """Chat-model retry count, read at call time.
+    """Chat-model retry count, read at call time (capped at MAX_RETRY_LIMIT=3).
 
     Read off the config module rather than bound at import so a test (or an
     operator reloading config) can change it without reimporting this module.
@@ -451,7 +460,9 @@ def _configured_chat_retries() -> int:
     from filings_agent import config
 
     try:
-        return int(getattr(config, "LLM_CHAT_MAX_RETRIES", 1))
+        val = int(getattr(config, "LLM_CHAT_MAX_RETRIES", 1))
+        cap = int(getattr(config, "MAX_RETRY_LIMIT", 3))
+        return min(cap, max(0, val))
     except (TypeError, ValueError):
         return 1
 
@@ -482,7 +493,11 @@ def build_chat_llm(
     simple text mode when Gemini is the configured provider.
     """
     effective_provider = (provider or LLM_PROVIDER).strip().lower()
-    retries = _configured_chat_retries() if max_retries is None else max_retries
+    if max_retries is None:
+        retries = _configured_chat_retries()
+    else:
+        from filings_agent import config
+        retries = min(int(getattr(config, "MAX_RETRY_LIMIT", 3)), max(0, int(max_retries)))
 
     if effective_provider in ("groq", "deepseek"):
         try:

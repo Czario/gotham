@@ -517,7 +517,7 @@ def test_incremental_merge_preserves_stored_order_keys_no_drift():
 
 
 class _NoPreviewChat:
-    """Finalizes without ever calling preview_hierarchy (wrong)."""
+    """Single-pass prediction: calls propose_hierarchy once and finalizes without preview_hierarchy."""
 
     def __init__(self):
         self.step = 0
@@ -540,8 +540,21 @@ class _NoPreviewChat:
         ])
 
 
-def test_node_skips_bundle_when_agent_never_previews():
-    """The check step is mandatory: no preview_hierarchy() → nothing is written."""
+class _NoProposalChat:
+    """Finalizes without ever proposing a hierarchy."""
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        return AIMessage(content="", tool_calls=[
+            {"name": "finalize_hierarchy",
+             "args": {"result_json": json.dumps({"status": "done"})}, "id": "f1"},
+        ])
+
+
+def test_node_materializes_on_single_pass_without_preview():
+    """Single-pass prediction: propose_hierarchy() materializes immediately without requiring preview_hierarchy()."""
     bundle = _bundle([
         {"concept": "us-gaap:Revenues", "label": "Revenue", "value": 100.0},
     ])
@@ -550,7 +563,21 @@ def test_node_skips_bundle_when_agent_never_previews():
                 "bundles": [bundle]})
 
     assert out["status"] == "hierarchy_agent_done"
-    # The bundle must remain untouched — no path/order_key was ever assigned.
+    assert bundle.concepts[0].get("_hierarchy_resolved") is True
+    assert bundle.concepts[0].get("path") == "001"
+    assert bundle.concepts[0].get("order_key") == "a"
+
+
+def test_node_skips_bundle_when_agent_never_proposes():
+    """If the agent never proposes any hierarchy rows at all, nothing is written."""
+    bundle = _bundle([
+        {"concept": "us-gaap:Revenues", "label": "Revenue", "value": 100.0},
+    ])
+    node = make_hierarchy_agent_node(_Service([]), chat_llm=_NoProposalChat())
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated",
+                "bundles": [bundle]})
+
+    assert out["status"] == "hierarchy_agent_done"
     assert not bundle.concepts[0].get("_hierarchy_resolved")
     assert not bundle.concepts[0].get("path")
 

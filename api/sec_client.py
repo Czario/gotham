@@ -87,7 +87,8 @@ class SECAPIClient:
         return None
     
     def _make_request(self, url: str, max_retries: int = 3, backoff_base: float = 2.0) -> Optional[Dict]:
-        """Make rate-limited request to SEC API with retry logic for transient errors"""
+        """Make rate-limited request to SEC API with retry logic for transient errors (max 3)"""
+        max_retries = min(3, max(1, int(max_retries)))
         for attempt in range(max_retries):
             try:
                 _global_rate_limiter.acquire()  # Rate limiting (shared token bucket, 8 req/s)

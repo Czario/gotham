@@ -29,10 +29,12 @@ _ORDER_CHARS = "abcdefghijklmnopqrstuvwxyz"
 
 def _order_key(position: int) -> str:
     position = max(0, int(position))
-    if position < 26:
-        return _ORDER_CHARS[position]
-    position -= 26
-    return _ORDER_CHARS[position // 26 - 1] + _ORDER_CHARS[position % 26]
+    chars = []
+    n = position + 1
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        chars.append(_ORDER_CHARS[rem])
+    return "".join(reversed(chars))
 
 
 def _period_info(value: Any) -> tuple[Optional[tuple[int, int, int]], Optional[str]]:
@@ -322,11 +324,10 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
                     cand = str(stored)
                 else:
                     n = 1
-                    while True:
-                        cand = f"{base}.{n:03d}" if base else f"{n:03d}"
-                        if cand not in used:
-                            break
+                    cand = f"{base}.{n:03d}" if base else f"{n:03d}"
+                    while cand in used:
                         n += 1
+                        cand = f"{base}.{n:03d}" if base else f"{n:03d}"
                 r["path"] = cand
                 r["level"] = len(cand.split(".")) - 1
                 if _explicit_pos(r) is not None:
@@ -702,26 +703,37 @@ def make_hierarchy_agent_node(
                     identity_order_keys=identity_order_keys,
                     materialize=_materialize,
                 )
+                tools_by_name = {t.name: t for t in tools}
                 if not stored:
+                    context_dump = (
+                        tools_by_name["query_filing_hierarchy"].invoke({})
+                        if "query_filing_hierarchy" in tools_by_name
+                        else ""
+                    )
                     task = (
                         f"FRESH SEED for {getattr(bundle, 'statement_type', '?')} "
                         f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
-                        f"No existing hierarchy is stored in DB. Inspect filing line items via query_filing_hierarchy(), "
-                        f"then call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint. "
-                        f"Call preview_hierarchy() to verify the materialized paths/order_keys, "
-                        f"fix anything wrong, then finalize."
+                        f"No existing hierarchy is stored in DB.\n\n"
+                        f"{context_dump}\n\n"
+                        f"Predict ONCE: call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint, "
+                        f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
                     )
                 else:
+                    context_dump = (
+                        tools_by_name["query_hierarchy_diff"].invoke({})
+                        if "query_hierarchy_diff" in tools_by_name
+                        else ""
+                    )
                     task = (
                         f"INCREMENTAL UPDATE for {getattr(bundle, 'statement_type', '?')} "
                         f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
                         f"Stored rows: {len(stored)}, New incoming concepts: {len(new_concepts)}. "
-                        f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely. "
-                        f"Call query_hierarchy_diff() to inspect new incoming concepts and their filing parent references. "
-                        f"If any new concept is an alias/rename of a stored concept, call decide_mapping(); its latest-period metadata determines which tag survives. "
-                        f"For new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
-                        f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically). "
-                        f"Call preview_hierarchy() to verify materialized paths/order_keys, fix anything wrong, then finalize."
+                        f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely.\n\n"
+                        f"{context_dump}\n\n"
+                        f"Predict ONCE: if any new concept is an alias/rename of a stored concept, call decide_mapping(); "
+                        f"for new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
+                        f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically), "
+                        f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
                     )
                 try:
                     _ = run_agent_loop(
@@ -732,6 +744,7 @@ def make_hierarchy_agent_node(
                         finalize_name="finalize_hierarchy",
                         finalize_description="Call when the full hierarchy is decided. Pass {\"status\": \"done\"}.",
                         chat_llm=chat_llm,
+                        max_steps=3,
                         on_event=on_event,
                     )
                 except Exception as exc:  # noqa: BLE001
