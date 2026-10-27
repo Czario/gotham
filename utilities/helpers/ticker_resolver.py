@@ -55,6 +55,35 @@ def _load() -> None:
     except Exception as exc:
         logger.error(f"Failed to fetch ticker mappings from SEC API: {exc}")
 
+    # Canonical mappings from local MongoDB `companies` collection take precedence
+    # so that tickers configured in our system (e.g. XOM -> 0000034088) always match
+    # our stored historical data and backend queries, even if SEC company_tickers.json
+    # maps a ticker to a newly formed holding entity CIK.
+    try:
+        import os
+        import pymongo
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+        db_name = os.getenv("DATABASE_NAME", "normalize_data")
+        client = pymongo.MongoClient(mongo_uri, serverSelectionTimeoutMS=1000)
+        db = client[db_name]
+        for comp in db.companies.find({}, {"cik": 1, "ticker_symbol": 1, "name": 1, "market_info.tickers": 1}):
+            cik = comp.get("cik")
+            if not cik:
+                continue
+            cik_str = str(cik).zfill(10)
+            ticker = comp.get("ticker_symbol")
+            if ticker:
+                _ticker_to_cik[ticker.upper()] = cik_str
+                _cik_to_ticker[cik_str] = ticker.upper()
+            for t in comp.get("market_info", {}).get("tickers", []):
+                if t:
+                    _ticker_to_cik[t.upper()] = cik_str
+            if comp.get("name"):
+                _cik_to_name[cik_str] = comp.get("name")
+        _loaded = True
+    except Exception as exc:
+        logger.debug(f"Could not load ticker mappings from DB: {exc}")
+
 
 # ── Public helpers ─────────────────────────────────────────────────────────────
 

@@ -1,3 +1,2 @@
-ASML
-TSM
-ERIC
+XOM
+FTNT
