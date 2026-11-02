@@ -1602,31 +1602,77 @@ class FinancialNormalizationService:
                     "Updated repaired value for concept %s: %s -> %s",
                     concept_id, item.get('corrected_from'), value,
                 )
-            # --reload: the period is being replaced, so overwrite in place.
-            # Checked BEFORE the accession backfill, because a replace also
-            # refreshes the accession number.
-            # (The DB allows only ONE row per period, so an update — not a
-            # second insert — is the only correct way to replace it.)
+            # --reload: non-destructive upsert.
+            # If the value is already correct, preserve it and fill any missing gaps in the document.
+            # If the value differs, update/correct the incorrect value and refresh metadata.
             elif replace_existing:
-                replace_fields = {
-                    'value': value,
-                    'reporting_period': clean_reporting_period,
-                    'source': item.get('source'),
-                    'calculated': is_calculated,
-                    'fact_id': item.get('fact_id'),
-                    'decimals': item.get('decimals'),
-                    'form_type': filing.form_type,
-                }
-                if filing.accession_number:
-                    replace_fields['accession_number'] = filing.accession_number
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']},
-                    {'$set': {k: v for k, v in replace_fields.items() if v is not None}},
-                )
-                logger.info(
-                    "Reload: replaced value for concept %s (period %s)",
-                    concept_id, clean_reporting_period.get('period_date', 'unknown'),
-                )
+                existing_val = existing_value.get('value')
+                try:
+                    val_differs = existing_val is None or abs(
+                        float(existing_val) - float(value)
+                    ) > max(abs(float(value)) * 1e-6, 1.0)
+                except (TypeError, ValueError):
+                    val_differs = existing_val != value
+
+                if val_differs:
+                    # Incorrect value: correct it in-place
+                    correct_fields = {
+                        'value': value,
+                        'reporting_period': clean_reporting_period,
+                        'source': item.get('source'),
+                        'calculated': is_calculated,
+                        'fact_id': item.get('fact_id'),
+                        'decimals': item.get('decimals'),
+                        'form_type': filing.form_type,
+                    }
+                    if filing.accession_number:
+                        correct_fields['accession_number'] = filing.accession_number
+                    if existing_val is not None:
+                        correct_fields['corrected_from'] = existing_val
+                        correct_fields['corrected_at'] = datetime.utcnow()
+                    value_repo.collection.update_one(
+                        {'_id': existing_value['_id']},
+                        {'$set': {k: v for k, v in correct_fields.items() if v is not None}},
+                    )
+                    logger.info(
+                        "Reload: corrected value for concept %s: %s -> %s (period %s)",
+                        concept_id, existing_val, value, clean_reporting_period.get('period_date', 'unknown'),
+                    )
+                else:
+                    # Value already correct: preserve it and fill any missing gaps in the doc
+                    gap_fields = {}
+                    if filing.accession_number and not existing_value.get('accession_number'):
+                        gap_fields['accession_number'] = filing.accession_number
+                    if item.get('decimals') is not None and existing_value.get('decimals') is None:
+                        gap_fields['decimals'] = item.get('decimals')
+                    if item.get('fact_id') and not existing_value.get('fact_id'):
+                        gap_fields['fact_id'] = item.get('fact_id')
+                    if item.get('source') and not existing_value.get('source'):
+                        gap_fields['source'] = item.get('source')
+                    if filing.form_type and not existing_value.get('form_type'):
+                        gap_fields['form_type'] = filing.form_type
+                    if statement.statement_type and not existing_value.get('statement_type'):
+                        gap_fields['statement_type'] = statement.statement_type
+
+                    existing_rp = existing_value.get('reporting_period') or {}
+                    for k, v in clean_reporting_period.items():
+                        if k not in existing_rp and v is not None:
+                            gap_fields[f'reporting_period.{k}'] = v
+
+                    if gap_fields:
+                        value_repo.collection.update_one(
+                            {'_id': existing_value['_id']},
+                            {'$set': gap_fields},
+                        )
+                        logger.info(
+                            "Reload: concept %s already correct; filled missing gap(s) %s",
+                            concept_id, list(gap_fields.keys()),
+                        )
+                    else:
+                        logger.debug(
+                            "Reload: concept %s already correct, no missing gaps",
+                            concept_id,
+                        )
             # If value exists but is missing accession_number, update it
             elif filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing value with missing accession_number for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
@@ -3156,18 +3202,62 @@ class FinancialNormalizationService:
         
         if existing_value:
             if replace_existing:
-                replacement = {'form_type': filing.form_type}
-                if dimension_data.get('value') is not None:
-                    replacement['value'] = dimension_data.get('value')
-                if dimension_data.get('fact_id') is not None:
-                    replacement['fact_id'] = dimension_data.get('fact_id')
-                if dimension_data.get('decimals') is not None:
-                    replacement['decimals'] = dimension_data.get('decimals')
-                if filing.accession_number:
-                    replacement['accession_number'] = filing.accession_number
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']}, {'$set': replacement}
-                )
+                existing_val = existing_value.get('value')
+                new_val = dimension_data.get('value')
+                try:
+                    val_differs = (
+                        existing_val is None
+                        or (new_val is not None and abs(float(existing_val) - float(new_val)) > max(abs(float(new_val)) * 1e-6, 1.0))
+                    )
+                except (TypeError, ValueError):
+                    val_differs = existing_val != new_val
+
+                if val_differs and new_val is not None:
+                    # Incorrect dimensional value: correct it in-place
+                    replacement = {'form_type': filing.form_type, 'value': new_val}
+                    if dimension_data.get('fact_id') is not None:
+                        replacement['fact_id'] = dimension_data.get('fact_id')
+                    if dimension_data.get('decimals') is not None:
+                        replacement['decimals'] = dimension_data.get('decimals')
+                    if filing.accession_number:
+                        replacement['accession_number'] = filing.accession_number
+                    if existing_val is not None:
+                        replacement['corrected_from'] = existing_val
+                        replacement['corrected_at'] = datetime.utcnow()
+                    value_repo.collection.update_one(
+                        {'_id': existing_value['_id']}, {'$set': replacement}
+                    )
+                    logger.info(
+                        "Reload: corrected dimensional value for %s: %s -> %s",
+                        dimensional_concept_id, existing_val, new_val,
+                    )
+                else:
+                    # Already correct: preserve and fill missing gaps
+                    gap_fields = {}
+                    if filing.accession_number and not existing_value.get('accession_number'):
+                        gap_fields['accession_number'] = filing.accession_number
+                    if dimension_data.get('decimals') is not None and existing_value.get('decimals') is None:
+                        gap_fields['decimals'] = dimension_data.get('decimals')
+                    if dimension_data.get('fact_id') and not existing_value.get('fact_id'):
+                        gap_fields['fact_id'] = dimension_data.get('fact_id')
+                    if filing.form_type and not existing_value.get('form_type'):
+                        gap_fields['form_type'] = filing.form_type
+                    if statement.statement_type and not existing_value.get('statement_type'):
+                        gap_fields['statement_type'] = statement.statement_type
+
+                    existing_rp = existing_value.get('reporting_period') or {}
+                    for k, v in clean_reporting_period.items():
+                        if k not in existing_rp and v is not None:
+                            gap_fields[f'reporting_period.{k}'] = v
+
+                    if gap_fields:
+                        value_repo.collection.update_one(
+                            {'_id': existing_value['_id']}, {'$set': gap_fields}
+                        )
+                        logger.debug(
+                            "Reload: dimensional value %s already correct; filled gap(s) %s",
+                            dimensional_concept_id, list(gap_fields.keys()),
+                        )
             # If value exists but is missing accession_number, update it
             elif filing.accession_number and not existing_value.get('accession_number'):
                 logger.debug(f"Updating existing dimensional value with missing accession_number for dimensional_concept_id {dimensional_concept_id}, "

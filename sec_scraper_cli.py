@@ -5,9 +5,10 @@ import os
 import time
 import logging
 import threading
+import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Sequence, Union
 from dotenv import load_dotenv
 
 # Ensure the project root is on sys.path when running as an installed entry point
@@ -465,9 +466,88 @@ def parse_sec_filing_url(url: str) -> Optional[Dict[str, str]]:
         logger.error(f"Error parsing SEC filing URL: {e}")
         return None
 
+STATEMENT_ALIASES: Dict[str, str] = {
+    'income': 'income',
+    'income_statement': 'income',
+    'income-statement': 'income',
+    'incomestatement': 'income',
+    'is': 'income',
+    'balancesheet': 'balancesheet',
+    'balance_sheet': 'balancesheet',
+    'balance-sheet': 'balancesheet',
+    'bs': 'balancesheet',
+    'cashflow': 'cashflow',
+    'cash_flow': 'cashflow',
+    'cash-flow': 'cashflow',
+    'cash_flows': 'cashflow',
+    'cashflows': 'cashflow',
+    'cf': 'cashflow',
+}
+
+CANONICAL_STATEMENT_TYPES = {'income', 'balancesheet', 'cashflow'}
+
+
+def canonicalize_statement_type(stmt: Optional[str]) -> Optional[str]:
+    """Convert user-supplied statement identifier to the canonical internal name.
+
+    Returns:
+        'income', 'balancesheet', 'cashflow', or None if input is empty.
+    Raises:
+        ValueError: if stmt is not a recognized statement type.
+    """
+    if not stmt:
+        return None
+    normalized = str(stmt).strip().lower().replace("-", "_")
+    canonical = STATEMENT_ALIASES.get(normalized)
+    if not canonical:
+        raise ValueError(
+            f"Invalid statement type '{stmt}'. Must be one of: "
+            "income (or income_statement), balancesheet (or balance_sheet), cashflow (or cash_flow)."
+        )
+    return canonical
+
+
+def normalize_quarter(q: Optional[Any]) -> Optional[str]:
+    """Convert user-supplied quarter identifier to canonical form ('Q1', 'Q2', 'Q3', 'Q4').
+
+    Returns:
+        'Q1', 'Q2', 'Q3', 'Q4', or None if input is empty.
+    Raises:
+        ValueError: if q is not a valid quarter.
+    """
+    if not q:
+        return None
+    val = str(q).strip().upper()
+    if val in ('Q1', '1'):
+        return 'Q1'
+    if val in ('Q2', '2'):
+        return 'Q2'
+    if val in ('Q3', '3'):
+        return 'Q3'
+    if val in ('Q4', '4'):
+        return 'Q4'
+    raise ValueError(
+        f"Invalid fiscal quarter '{q}'. Must be one of: Q1, Q2, Q3, Q4 (or 1, 2, 3, 4)."
+    )
+
+
 class SECDataScraperApp:
     
-    def __init__(self, database_config: Optional[DatabaseConfig] = None, start_year: int = 2010, end_year: Optional[int] = None, enable_dimensions: bool = False, target_fiscal_year: Optional[int] = None, target_fiscal_quarter: Optional[str] = None, reload: bool = False, latest: bool = False, html_download_path: Optional[str] = None, enable_reconciliation: bool = True, progress: Optional["ProgressManager"] = None):
+    def __init__(
+        self,
+        database_config: Optional[DatabaseConfig] = None,
+        start_year: int = 2010,
+        end_year: Optional[int] = None,
+        enable_dimensions: bool = False,
+        target_fiscal_year: Optional[int] = None,
+        target_fiscal_quarter: Optional[str] = None,
+        target_statement: Optional[str] = None,
+        reload: bool = False,
+        latest: bool = False,
+        html_download_path: Optional[str] = None,
+        enable_reconciliation: bool = True,
+        progress: Optional["ProgressManager"] = None,
+    ):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
         self.db_config = database_config or DatabaseConfig()
         if not self.db_config.connect():
@@ -485,15 +565,23 @@ class SECDataScraperApp:
         # Outcome of the last filing the agent processed (decision / failure reason)
         self._last_agent_outcome: Optional[Dict[str, Any]] = None
         self.target_fiscal_year = target_fiscal_year
-        self.target_fiscal_quarter = target_fiscal_quarter
+        self.target_fiscal_quarter = normalize_quarter(target_fiscal_quarter)
+        self.target_statement = canonicalize_statement_type(target_statement)
         self.reload = reload
         self.latest = latest
-        self.html_download_path = html_download_path or os.getenv('SEC_HTML_DOWNLOAD_PATH')
-        if not self.html_download_path:
-            raise RuntimeError(
-                "SEC_HTML_DOWNLOAD_PATH is not set. Please set SEC_HTML_DOWNLOAD_PATH in your .env "
-                "file (e.g. SEC_HTML_DOWNLOAD_PATH=/Users/aijaz/sec_html_filings) before running."
-            )
+        if html_download_path is not None:
+            # An empty string or False explicitly disables HTML downloads
+            self.html_download_path = str(html_download_path) if html_download_path else None
+        elif not os.getenv('SEC_NO_DOWNLOAD_HTML', ''):
+            self.html_download_path = os.getenv('SEC_HTML_DOWNLOAD_PATH') or str(Path.home() / 'sec_html_filings')
+        else:
+            self.html_download_path = None
+
+        if self.html_download_path:
+            try:
+                Path(self.html_download_path).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not create HTML download directory {self.html_download_path}: {e}")
         # Lightweight dedup tracker — only stores accession_number + metadata, no raw data
         from pymongo import MongoClient as _MongoClient
         _mongo_uri = os.getenv('MONGODB_URI')
@@ -934,8 +1022,11 @@ class SECDataScraperApp:
             filings_list = []  # Initialize to avoid unbound variable
             if self.reload:
                 logger.info(f"🔄 RELOAD mode: refreshing data for CIK: {cik}")
-                if self.target_fiscal_year or self.target_fiscal_quarter:
-                    logger.info(f"🎯 Will reload specific period: FY{self.target_fiscal_year} {self.target_fiscal_quarter or 'complete'}")
+                target_stmt = getattr(self, 'target_statement', None)
+                if self.target_fiscal_year or self.target_fiscal_quarter or target_stmt:
+                    period_str = f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or 'complete'}" if self.target_fiscal_year else "all periods"
+                    stmt_str = f" [{target_stmt}]" if target_stmt else ""
+                    logger.info(f"🎯 Will reload specific period: {period_str}{stmt_str}")
             _fetch_t0 = time.perf_counter()
             company_data, filings_list = self.sec_client.get_company_submissions(cik, start_year=effective_start_year, end_year=self.end_year)
             _fetch_ms = (time.perf_counter() - _fetch_t0) * 1000
@@ -1034,10 +1125,16 @@ class SECDataScraperApp:
 
                 # ── RELOAD: extract first, then replace existing data ──
                 if self.reload:
+                    target_stmt = getattr(self, 'target_statement', None)
+                    stmt_desc = f" [{target_stmt}]" if target_stmt else ""
                     if self.latest:
-                        _period_desc = f"latest {form_type} {accession_number or filing_date}"
+                        _period_desc = f"latest {form_type} {accession_number or filing_date}{stmt_desc}"
                     else:
-                        _period_desc = f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}" if self.target_fiscal_year else "all periods"
+                        _period_desc = (
+                            f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}{stmt_desc}"
+                            if self.target_fiscal_year
+                            else f"all periods{stmt_desc}"
+                        )
                     filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} 🔄 reload {_period_desc}")
 
                     # The actual delete is intentionally deferred until after
@@ -1055,7 +1152,10 @@ class SECDataScraperApp:
                         )
                         logger.debug(f"📋 Filing {accession_number or filing_date} already processed, skipping")
                         if self.html_download_path and accession_number:
-                            self.sec_client.download_html_filing(cik, accession_number, filing_date or '2010-01-01', self.html_download_path, ticker)
+                            self.sec_client.download_html_filing(
+                                cik, accession_number, filing_date or '2010-01-01',
+                                self.html_download_path, ticker, reload=self.reload
+                            )
                         filings_skipped += 1
                         if summary and accession_number:
                             summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
@@ -1228,6 +1328,11 @@ class SECDataScraperApp:
             # original 20-F for the same year must not block the amendment.
             if not self.reload and self._find_existing_filing(cik, target_filing):
                 logger.info("Filing %s is already stored; skipping", accession_number)
+                if self.html_download_path and accession_number:
+                    filing_date_for_download = target_filing.get('filingDate', target_filing.get('reportDate', '2010-01-01'))
+                    self.sec_client.download_html_filing(
+                        cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+                    )
                 return True
 
             # Guard: skip if this filing's period is already covered — same
@@ -1254,6 +1359,11 @@ class SECDataScraperApp:
                                 f"  [skip]  period {report_date_str} already stored"
                                 f"  (latest: {latest_stored})"
                             )
+                            if self.html_download_path and accession_number:
+                                filing_date_for_download = target_filing.get('filingDate', target_filing.get('reportDate', '2010-01-01'))
+                                self.sec_client.download_html_filing(
+                                    cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+                                )
                             return True
 
             logger.info(f"Processing filing {accession_number} for {company_name} ({ticker})")
@@ -1331,6 +1441,7 @@ class SECDataScraperApp:
         form_type = filing.get('form') or filing.get('form_type')
         accession_number = filing.get('accessionNumber') or filing.get('accession_number')
         collections = (self._cv_annual_col, self._cv_quarterly_col)
+        target_stmt = getattr(self, 'target_statement', None)
 
         if accession_number:
             accession_filter = {
@@ -1340,12 +1451,16 @@ class SECDataScraperApp:
                     {'accession_number': accession_number},
                 ],
             }
+            if target_stmt:
+                accession_filter['statement_type'] = target_stmt
             for collection in collections:
                 existing = collection.find_one(accession_filter, projection={'_id': 1})
                 if existing:
                     return existing
 
         period_filter: Dict[str, Any] = {'cik': cik}
+        if target_stmt:
+            period_filter['statement_type'] = target_stmt
         if form_type:
             if str(form_type).upper() == '20-F':
                 # Once an amendment is the authoritative annual version, a
@@ -1384,7 +1499,10 @@ class SECDataScraperApp:
 
         # Do not issue a broad CIK/form query if the filing has no usable
         # period identity; that could incorrectly skip unrelated filings.
-        if len(period_filter) <= (2 if form_type else 1):
+        min_keys = 2 if form_type else 1
+        if target_stmt:
+            min_keys += 1
+        if len(period_filter) <= min_keys:
             return None
 
         for collection in collections:
@@ -1469,6 +1587,11 @@ class SECDataScraperApp:
             reload_filter['form_type'] = {'$in': ['20-F', '20-F/A']}
         elif form_type:
             reload_filter['form_type'] = form_type
+
+        target_stmt = getattr(self, 'target_statement', None)
+        if target_stmt:
+            reload_filter['statement_type'] = target_stmt
+
         return reload_filter
 
     def _reload_period_filter(self, filing: Dict, form_type: str) -> Optional[Dict[str, Any]]:
@@ -1527,16 +1650,29 @@ class SECDataScraperApp:
 
         form_type = filing_info.get('form', filing_info.get('form_type', ''))
         reload_filter = self._build_reload_filter(cik, filing_info, form_type)
+        target_stmt = getattr(self, 'target_statement', None)
+        stmt_desc = f" [{target_stmt}]" if target_stmt else ""
         period_desc = (
-            f"latest {form_type} {filing_info.get('accessionNumber') or filing_info.get('reportDate')}"
+            f"latest {form_type} {filing_info.get('accessionNumber') or filing_info.get('reportDate')}{stmt_desc}"
             if self.latest
-            else f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}"
+            else f"FY{self.target_fiscal_year} {self.target_fiscal_quarter or ''}{stmt_desc}"
             if self.target_fiscal_year
-            else "all periods"
+            else f"all periods{stmt_desc}"
         )
 
         if reload_filter is None:
             self.progress.status("  [reload]  skipped delete: filing identity unavailable")
+            return
+
+        if not force:
+            # Force reload performs non-destructive upsert:
+            # Existing correct documents are preserved and gaps are filled.
+            # Only incorrect documents are updated in place, and missing documents are inserted.
+            self.progress.status(f"  [reload]  upserting existing rows ({period_desc})")
+            logger.info(
+                f"🔄 RELOAD (UPSERT): Preserving existing rows for {cik} ({period_desc}); "
+                "will upsert corrections and fill missing gaps"
+            )
             return
 
         ann_del = self._cv_annual_col.delete_many(reload_filter)
@@ -1801,7 +1937,9 @@ class SECDataScraperApp:
         # Download HTML filing if requested
         if self.html_download_path:
             filing_date_for_download = filing_info.get('filingDate', filing_info.get('reportDate', '2010-01-01'))
-            self.sec_client.download_html_filing(cik, accession_number, filing_date_for_download, self.html_download_path, ticker)
+            self.sec_client.download_html_filing(
+                cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+            )
 
         # Generate a stable filing_id from the accession number (no DB write)
         filing_id = self._make_filing_id(accession_number)
@@ -1922,7 +2060,11 @@ class SECDataScraperApp:
             statements = statements_data['statements']
             reporting_period = statements_data.get('reporting_period', {})
             
+            target_stmt = getattr(self, 'target_statement', None)
             for statement_type, statement_data in statements.items():
+                if target_stmt and statement_type != target_stmt:
+                    logger.debug(f"Skipping {statement_type} (target statement is {target_stmt})")
+                    continue
                 if statement_data:
                     # Extract line items from the statement hierarchy structure
                     # statement_data is a dict with {'hierarchy': [root_item], ...}
@@ -1987,9 +2129,10 @@ class SECDataScraperApp:
                     prepared_statements.append((statement_type, statement_doc))
             
             if not prepared_statements:
+                stmt_note = f" for statement '{target_stmt}'" if target_stmt else ""
                 self.progress.status(
                     f"  [xbrl]  {period_label:<12} {form_type} {accession_number} "
-                    f"0 statement(s) extracted"
+                    f"0 statement(s) extracted{stmt_note}"
                 )
                 return 0
 
@@ -2654,7 +2797,7 @@ def download_xbrl_file_if_needed(sec_client, cik: str, accession_number: str, ar
 
 
 
-def main():
+def main(argv: Optional[Sequence[str]] = None):
     import argparse
     from pathlib import Path
     
@@ -2669,6 +2812,7 @@ def main():
             '  main --file tickers.txt\n'
             '  main --companies 0000320193 0001065280 --year 2015 --end-year 2026\n'
             '  main --companies AAPL NFLX --reload --fiscal-year 2023\n'
+            '  main --companies AAPL --fiscal-year 2023 --quarter Q2 --statement balance_sheet\n'
             '  main --url https://www.sec.gov/Archives/edgar/data/1065280/.../nflx-20230930.htm'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2704,9 +2848,15 @@ def main():
              '(e.g. 2024), unless --fiscal-quarter is also provided. '
              'Overrides --year / --end-year for period matching.')
     period.add_argument(
-        '--fiscal-quarter', choices=['Q1', 'Q2', 'Q3', 'Q4'],
-        help='Restrict to a specific fiscal quarter within --fiscal-year (e.g. Q3). '
+        '--fiscal-quarter', '--quarter', '-q', dest='fiscal_quarter',
+        type=str,
+        help='Restrict to a specific fiscal quarter within --fiscal-year (e.g. Q1, Q2, Q3, Q4, or 1, 2, 3, 4). '
              'Requires --fiscal-year.')
+    period.add_argument(
+        '--statement', '--statement-type', '-s', dest='statement',
+        type=str,
+        help='Restrict processing to a specific financial statement '
+             '(e.g. balance_sheet, income, cash_flow).')
 
     # --- Processing behaviour ----------------------------------------------
     proc = parser.add_argument_group('Processing behaviour')
@@ -2750,7 +2900,7 @@ def main():
         '--debug', action='store_true',
         help='Print DEBUG-level logs (implies --verbose). Use for troubleshooting.')
     
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     
     # --verbose implies debug-level console; --debug is the highest detail
     is_verbose = args.verbose or args.debug
@@ -2793,8 +2943,24 @@ def main():
     logger.info(f"Arguments: {vars(args)}")
     
     # Validate arguments
-    if args.fiscal_quarter and not args.fiscal_year:
-        print("❌ --fiscal-quarter requires --fiscal-year to be specified")
+    fiscal_quarter = None
+    if args.fiscal_quarter:
+        try:
+            fiscal_quarter = normalize_quarter(args.fiscal_quarter)
+        except ValueError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+
+    target_statement = None
+    if args.statement:
+        try:
+            target_statement = canonicalize_statement_type(args.statement)
+        except ValueError as e:
+            print(f"❌ {e}")
+            sys.exit(1)
+
+    if fiscal_quarter and not args.fiscal_year:
+        print("❌ --fiscal-quarter/--quarter requires --fiscal-year to be specified")
         sys.exit(1)
     
     if args.fiscal_year and args.fiscal_year < 1990:
@@ -2815,23 +2981,22 @@ def main():
             sys.exit(1)
     
     # HTML download: enabled by default; disabled only with --no-download-html-filings.
-    # Silently skip (no hard exit) if SEC_HTML_DOWNLOAD_PATH is not configured.
-    html_download_path = None
+    html_download_path = ""
     if not args.no_download_html_filings:
-        html_download_path = os.getenv('SEC_HTML_DOWNLOAD_PATH')
-        if html_download_path:
-            html_path = Path(html_download_path)
-            try:
-                html_path.mkdir(parents=True, exist_ok=True)
-                if not html_path.is_dir():
-                    print(f"⚠️  SEC_HTML_DOWNLOAD_PATH is not a directory: {html_download_path} — HTML downloads disabled")
-                    html_download_path = None
-                else:
-                    if is_verbose:
-                        progress.write(f"📁 HTML filings will be saved to: {html_path.absolute()}")
-            except Exception as e:
-                print(f"⚠️  Invalid SEC_HTML_DOWNLOAD_PATH: {e} — HTML downloads disabled")
-                html_download_path = None
+        raw_download_path = os.getenv('SEC_HTML_DOWNLOAD_PATH') or str(Path.home() / 'sec_html_filings')
+        try:
+            html_path = Path(raw_download_path)
+            html_path.mkdir(parents=True, exist_ok=True)
+            if not html_path.is_dir():
+                print(f"⚠️  HTML download path is not a directory: {raw_download_path} — HTML downloads disabled")
+                html_download_path = ""
+            else:
+                html_download_path = str(html_path.resolve())
+                if is_verbose:
+                    progress.write(f"📁 HTML filings will be saved to: {html_download_path}")
+        except Exception as e:
+            print(f"⚠️  Invalid HTML download path: {e} — HTML downloads disabled")
+            html_download_path = ""
     
     try:
         # Handle --url option for single filing processing
@@ -2864,7 +3029,8 @@ def main():
                 end_year=args.end_year,
                 enable_dimensions=not args.no_dimensions,
                 target_fiscal_year=args.fiscal_year,
-                target_fiscal_quarter=args.fiscal_quarter,
+                target_fiscal_quarter=fiscal_quarter,
+                target_statement=target_statement,
                 reload=args.reload,
                 latest=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
@@ -3075,7 +3241,8 @@ def main():
             end_year=args.end_year,
             enable_dimensions=not args.no_dimensions,
             target_fiscal_year=args.fiscal_year,
-            target_fiscal_quarter=args.fiscal_quarter,
+            target_fiscal_quarter=fiscal_quarter,
+            target_statement=target_statement,
             reload=args.reload,
             latest=args.latest,
             html_download_path=html_download_path,
@@ -3163,6 +3330,95 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+def create_load_statement_parser() -> argparse.ArgumentParser:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='load-statement',
+        description=(
+            "Load a specific financial statement for a specific quarter into the database.\n"
+            "Convenience command wrapping SEC XBRL extraction and normalisation."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  load-statement --companies AAPL --fiscal-year 2023 --quarter Q2 --statement balance_sheet\n"
+            "  load-statement --company 0000320193 --fiscal-year 2024 --quarter Q1 --statement income --reload\n"
+            "  load-statement --companies AAPL MSFT --fiscal-year 2023 --quarter Q3 --statement cash_flow\n"
+        ),
+    )
+    src = parser.add_argument_group('Company selection')
+    src.add_argument(
+        '--companies', '--company', '-c', nargs='+', metavar='CIK_OR_TICKER', required=True,
+        help='One or more company CIKs or ticker symbols to process (e.g. AAPL 0001065280).')
+    src.add_argument(
+        '--file', metavar='FILE',
+        help='Path to a plain-text file containing one CIK or ticker per line.')
+
+    period = parser.add_argument_group('Quarter and statement selection')
+    period.add_argument(
+        '--fiscal-year', '--year', '-y', type=int, required=True, metavar='YEAR',
+        help='Fiscal year (e.g. 2023).')
+    period.add_argument(
+        '--quarter', '--fiscal-quarter', '-q', required=True, metavar='QUARTER',
+        help='Fiscal quarter (Q1, Q2, Q3, Q4, or 1, 2, 3, 4).')
+    period.add_argument(
+        '--statement', '--statement-type', '-s', required=True, metavar='STATEMENT',
+        help='Statement type to load: balance_sheet, income, cash_flow.')
+
+    proc = parser.add_argument_group('Processing options')
+    proc.add_argument(
+        '--reload', action='store_true',
+        help='Force reload/overwrite existing records for this statement and quarter.')
+    proc.add_argument(
+        '--no-dimensions', action='store_true',
+        help='Skip dimensional data extraction.')
+    proc.add_argument(
+        '--no-reconciliation', action='store_true',
+        help='Disable post-processing reconciliation.')
+    proc.add_argument(
+        '--no-download-html-filings', action='store_true',
+        help='Skip HTML filing downloads entirely. HTML downloading is enabled by default.')
+
+    log = parser.add_argument_group('Output / logging')
+    log.add_argument(
+        '--verbose', action='store_true',
+        help='Print detailed per-filing log output.')
+    log.add_argument(
+        '--debug', action='store_true',
+        help='Print DEBUG-level logs.')
+
+    return parser
+
+
+def load_statement_cli(argv: Optional[Sequence[str]] = None) -> int:
+    """Dedicated CLI entrypoint for loading a specific statement for a specific quarter."""
+    parser = create_load_statement_parser()
+    args = parser.parse_args(argv)
+
+    cli_args = [
+        '--companies', *args.companies,
+        '--fiscal-year', str(args.fiscal_year),
+        '--fiscal-quarter', str(args.quarter),
+        '--statement', str(args.statement),
+    ]
+    if args.file:
+        cli_args.extend(['--file', args.file])
+    if args.reload:
+        cli_args.append('--reload')
+    if args.no_dimensions:
+        cli_args.append('--no-dimensions')
+    if args.no_reconciliation:
+        cli_args.append('--no-reconciliation')
+    if args.no_download_html_filings:
+        cli_args.append('--no-download-html-filings')
+    if args.debug:
+        cli_args.append('--debug')
+    elif args.verbose:
+        cli_args.append('--verbose')
+
+    return main(cli_args)
 
 
 if __name__ == "__main__":

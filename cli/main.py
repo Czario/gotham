@@ -28,7 +28,20 @@ def create_parser() -> argparse.ArgumentParser:
     company_parser.add_argument("--cik", help="Company CIK")
     company_parser.add_argument("--year", type=int, default=2020, help="Start year")
     company_parser.add_argument("--end-year", type=int, help="End year")
+    company_parser.add_argument("--fiscal-year", type=int, help="Target fiscal year")
+    company_parser.add_argument("--quarter", "--fiscal-quarter", help="Target fiscal quarter (Q1, Q2, Q3, Q4)")
+    company_parser.add_argument("--statement", "-s", help="Target statement type (income, balance_sheet, cash_flow)")
     company_parser.add_argument("--reload", action="store_true", help="Reload existing filings")
+
+    # Command: statement
+    stmt_parser = subparsers.add_parser("statement", help="Load a specific financial statement for a specific quarter")
+    stmt_parser.add_argument("--ticker", "--company", "-c", dest="ticker", help="Company ticker (e.g. AAPL)")
+    stmt_parser.add_argument("--cik", help="Company CIK")
+    stmt_parser.add_argument("--fiscal-year", "--year", "-y", type=int, required=True, dest="fiscal_year", help="Fiscal year")
+    stmt_parser.add_argument("--quarter", "--fiscal-quarter", "-q", required=True, dest="quarter", help="Fiscal quarter (Q1, Q2, Q3, Q4)")
+    stmt_parser.add_argument("--statement", "-s", required=True, help="Statement type (income, balance_sheet, cash_flow)")
+    stmt_parser.add_argument("--reload", action="store_true", help="Force reload existing records")
+    stmt_parser.add_argument("--no-download-html-filings", action="store_true", help="Skip HTML filing downloads")
 
     return parser
 
@@ -48,6 +61,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "company":
         print(f"Running pipeline for company CIK {args.cik or args.ticker}...")
         return 0
+
+    if args.command == "statement":
+        from sec_scraper_cli import load_statement_cli
+        company = args.cik or args.ticker
+        if not company:
+            parser.error("--ticker or --cik is required for statement command")
+        cli_args = [
+            "--companies", company,
+            "--fiscal-year", str(args.fiscal_year),
+            "--quarter", str(args.quarter),
+            "--statement", str(args.statement),
+        ]
+        if args.reload:
+            cli_args.append("--reload")
+        if args.no_download_html_filings:
+            cli_args.append("--no-download-html-filings")
+        return load_statement_cli(cli_args)
 
     return 0
 

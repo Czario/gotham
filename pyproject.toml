@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 main = "sec_scraper_cli:main"
+load-statement = "sec_scraper_cli:load_statement_cli"
 sec-scraper-worker = "worker_10kq:main"
 filings-agent = "main_filing_agent:main"
 

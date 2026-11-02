@@ -397,17 +397,27 @@ class SECAPIClient:
         # In a full implementation, you might want to fetch specific filing documents
         return self._make_request(url)
 
-    def download_html_filing(self, cik: str, accession_number: str, filing_date: str, download_path: str, ticker: Optional[str] = None) -> bool:
+    def download_html_filing(
+        self,
+        cik: str,
+        accession_number: str,
+        filing_date: str,
+        download_path: str,
+        ticker: Optional[str] = None,
+        reload: bool = False,
+    ) -> bool:
         """
-        Download HTML filing and save it compressed with accession number as filename
-        Uses unified URL detector that handles both modern and legacy filings
+        Download HTML/HTM filing and save both uncompressed (.htm) and compressed (.html.gz)
+        organized by ticker.
+        Uses unified URL detector that handles both modern and legacy filings.
         
         Args:
             cik: Company CIK
             accession_number: Filing accession number
             filing_date: Filing date in YYYY-MM-DD format
-            download_path: Directory path to save the HTML file
+            download_path: Directory path to save the HTML/HTM file
             ticker: Optional ticker symbol for organizing files in folders
+            reload: If True, overwrite existing files on disk
             
         Returns:
             bool: True if successful, False otherwise
@@ -416,15 +426,13 @@ class SECAPIClient:
             # Use the download_path directly as base
             base_path = Path(download_path)
             
-            # Require ticker for folder organization
+            # Resolve ticker for folder organization if not provided
             if not ticker:
-                logger.info(f"No ticker found for CIK {cik}, skipping HTML download")
-                return False
+                ticker = self.get_ticker_from_cik(cik) or f"CIK_{str(cik).lstrip('0')}"
             
             # Create ticker-based folder
             ticker_folder = base_path / ticker.upper()
             ticker_folder.mkdir(parents=True, exist_ok=True)
-            final_download_path = ticker_folder
             
             # Clean accession number - remove -xbrl suffix if present
             clean_accession_number = accession_number.replace('-xbrl', '') if accession_number.endswith('-xbrl') else accession_number
@@ -435,12 +443,29 @@ class SECAPIClient:
                 print(f"    Expected format: ##########-##-######")
                 return False
             
-            # Skip if file already exists on disk
-            filename = f"{clean_accession_number}.html.gz"
-            filepath = ticker_folder / filename
-            if filepath.exists():
-                logger.debug(f"HTML filing already exists, skipping: /{ticker.upper()}/{filename}")
-                return True
+            gz_filename = f"{clean_accession_number}.html.gz"
+            gz_filepath = ticker_folder / gz_filename
+            htm_filename = f"{clean_accession_number}.htm"
+            htm_filepath = ticker_folder / htm_filename
+            
+            # If not reloading and files already exist with content, skip download
+            if not reload:
+                gz_valid = gz_filepath.exists() and gz_filepath.stat().st_size > 0
+                htm_valid = htm_filepath.exists() and htm_filepath.stat().st_size > 0
+                if gz_valid and htm_valid:
+                    logger.debug(f"HTML/HTM filing already exists, skipping: /{ticker.upper()}/{htm_filename}")
+                    return True
+                # If compressed .html.gz exists but .htm is missing, extract it locally
+                if gz_valid and not htm_valid:
+                    try:
+                        with gzip.open(gz_filepath, 'rt', encoding='utf-8', errors='replace') as gf:
+                            cached_content = gf.read()
+                        with open(htm_filepath, 'w', encoding='utf-8') as hf:
+                            hf.write(cached_content)
+                        logger.info(f"Extracted missing .htm file from cache: /{ticker.upper()}/{htm_filename}")
+                        return True
+                    except Exception as e:
+                        logger.debug(f"Could not extract .htm from .html.gz: {e}; will re-download")
             
             # Use unified URL detector to find HTML filing
             logger.info(f"Detecting URLs for filing: {clean_accession_number} (date: {filing_date})")
@@ -463,11 +488,25 @@ class SECAPIClient:
                     logger.warning(f"Failed to download HTML: {error or 'No content received'}")
                     return False
                 
-                # Create compressed filename (already computed above)
-                with gzip.open(filepath, 'wt', encoding='utf-8') as f:
+                # Write compressed file (.html.gz)
+                with gzip.open(gz_filepath, 'wt', encoding='utf-8') as f:
                     f.write(html_content)
                 
-                logger.info(f"Downloaded HTML filing: /{ticker.upper()}/{filename} ({len(html_content):,} chars)")
+                # Write uncompressed .htm file
+                with open(htm_filepath, 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                
+                # Also save with the primary document name if distinct (e.g. aapl-20240928.htm)
+                doc_name = str(html_url).split('/')[-1].split('?')[0]
+                if doc_name and doc_name.lower().endswith(('.htm', '.html')) and doc_name != htm_filename:
+                    doc_filepath = ticker_folder / doc_name
+                    try:
+                        with open(doc_filepath, 'w', encoding='utf-8') as f:
+                            f.write(html_content)
+                    except Exception as e:
+                        logger.debug(f"Could not write secondary doc name {doc_name}: {e}")
+                
+                logger.info(f"Downloaded HTML/HTM filing: /{ticker.upper()}/{htm_filename} ({len(html_content):,} chars)")
                 return True
                 
             except Exception as e:

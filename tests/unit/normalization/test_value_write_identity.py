@@ -136,6 +136,101 @@ def test_reload_replaces_the_existing_period_row(service):
     assert update["reporting_period"]["period_date"] == "2026-06-30"
     assert update["accession_number"] == "acc-1"
     assert update["calculated"] is False
+    assert update["corrected_from"] == 111111.0
+    assert "corrected_at" in update
+
+
+def test_reload_preserves_already_correct_value_and_fills_gaps(service):
+    """When a value is already correct, reload preserves the value and fills in missing gaps."""
+    repo = Mock()
+    existing_id = ObjectId()
+    # Existing row already has the correct value 999.0, but missing accession_number, decimals, fact_id
+    repo.find_existing_value.return_value = {
+        "_id": existing_id,
+        "value": 999.0,
+        "reporting_period": {"fiscal_year": 2026, "quarter": 3},
+    }
+    service._get_value_repo_by_form_type = Mock(return_value=repo)
+
+    item_with_gaps = dict(ITEM)
+    item_with_gaps["decimals"] = 2
+    item_with_gaps["fact_id"] = "fact-abc"
+    item_with_gaps["source"] = "as_reported"
+
+    result = service._create_value_record(
+        ObjectId(), _statement(), _filing(), item_with_gaps, 999.0, replace_existing=True
+    )
+
+    assert result == existing_id
+    repo.collection.insert_one.assert_not_called()
+    update = repo.collection.update_one.call_args.args[1]["$set"]
+    # Value is NOT overwritten
+    assert "value" not in update
+    assert "corrected_from" not in update
+    # Missing gaps are filled
+    assert update["accession_number"] == "acc-1"
+    assert update["decimals"] == 2
+    assert update["fact_id"] == "fact-abc"
+    assert update["source"] == "as_reported"
+    assert update["form_type"] == "10-Q"
+    assert update["statement_type"] == "income"
+    assert update["reporting_period.period_date"] == "2026-06-30"
+
+
+def test_reload_dimensional_value_preserves_correct_and_fills_gaps(service):
+    repo = Mock()
+    existing_id = ObjectId()
+    repo.find_dimensional_existing_value.return_value = {
+        "_id": existing_id,
+        "value": 500.0,
+        "reporting_period": {"fiscal_year": 2026, "quarter": 3},
+    }
+    service._get_value_repo_by_form_type = Mock(return_value=repo)
+
+    dim_data = {
+        "value": 500.0,
+        "fact_id": "dim-fact-1",
+        "decimals": 0,
+    }
+    service._create_dimensional_value_record(
+        ObjectId(), _statement(), _filing(), dim_data, replace_existing=True
+    )
+
+    update = repo.collection.update_one.call_args.args[1]["$set"]
+    assert "value" not in update
+    assert update["accession_number"] == "acc-1"
+    assert update["fact_id"] == "dim-fact-1"
+    assert update["decimals"] == 0
+    assert update["form_type"] == "10-Q"
+    assert update["statement_type"] == "income"
+    assert update["reporting_period.period_date"] == "2026-06-30"
+
+
+def test_reload_dimensional_value_corrects_differing_value(service):
+    repo = Mock()
+    existing_id = ObjectId()
+    repo.find_dimensional_existing_value.return_value = {
+        "_id": existing_id,
+        "value": 450.0,
+        "accession_number": "old-acc",
+    }
+    service._get_value_repo_by_form_type = Mock(return_value=repo)
+
+    dim_data = {
+        "value": 500.0,
+        "fact_id": "dim-fact-2",
+        "decimals": 0,
+    }
+    service._create_dimensional_value_record(
+        ObjectId(), _statement(), _filing(), dim_data, replace_existing=True
+    )
+
+    update = repo.collection.update_one.call_args.args[1]["$set"]
+    assert update["value"] == 500.0
+    assert update["corrected_from"] == 450.0
+    assert "corrected_at" in update
+    assert update["accession_number"] == "acc-1"
+    assert update["fact_id"] == "dim-fact-2"
 
 
 def test_20f_amendment_replaces_annual_value_and_keeps_amendment_provenance(service):

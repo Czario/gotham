@@ -92,7 +92,7 @@ def download_html_filing(
     try:
         from api.sec_client import SECAPIClient
         client = SECAPIClient()
-        path = client.download_html_filing(cik, accession_number, filing_date, target_dir)
-        return f"HTML filing saved to {path}"
+        success = client.download_html_filing(cik, accession_number, filing_date, target_dir)
+        return f"HTML filing saved to {target_dir}" if success else "Failed to download HTML filing"
     except Exception as exc:
         return f"Error downloading HTML filing: {exc}"
