@@ -609,6 +609,236 @@ def _filing_rows_for(bundle: Any) -> list[dict]:
     return rows
 
 
+_CONCEPT_STOP_TOKENS = frozenset({
+    "net", "total", "other", "and", "of", "in", "to", "for", "from", "with",
+    "by", "on", "at", "the", "a", "an", "current", "noncurrent", "operating",
+    "nonoperating", "member", "axis", "domain", "line", "items", "table",
+    "abstract",
+})
+
+
+def _concept_tokens(concept: Optional[str], label: Optional[str] = None) -> set[str]:
+    """Extract normalized semantic tokens from a concept local name and label."""
+    raw = str(concept or "").split(":")[-1]
+    parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+", raw)
+    if label:
+        parts.extend(re.findall(r"[A-Za-z]+|\d+", str(label)))
+    return {
+        p.lower() for p in parts
+        if len(p) > 2 and p.lower() not in _CONCEPT_STOP_TOKENS
+    }
+
+
+def _infer_dim_parent_header(
+    parent_concept: str,
+    segment_type: Optional[str],
+    stored: list[dict],
+) -> Optional[str]:
+    """Reuse an existing grouping header under ``parent_concept`` or infer the canonical custom header."""
+    # 1. Check existing stored dims under the same parent_concept
+    parent_dims = [
+        s for s in stored
+        if s.get("dimension_concept") and s.get("parent_concept") == parent_concept
+    ]
+    if segment_type:
+        for s in parent_dims:
+            if s.get("segment_type") == segment_type and s.get("parent_header"):
+                return str(s["parent_header"])
+
+    # 2. Check existing custom headers stored under parent_concept
+    parent_headers = [
+        str(s["concept"]) for s in stored
+        if not s.get("dimension_concept")
+        and str(s.get("concept") or "").startswith("custom:")
+        and s.get("parent_concept") == parent_concept
+    ]
+    seg_low = (segment_type or "").strip().lower()
+    if seg_low:
+        if any(k in seg_low for k in ("prod", "serv")):
+            for h in parent_headers:
+                if "prod" in h.lower() or "serv" in h.lower():
+                    return h
+            return "custom:ProductSegmentation"
+        if any(k in seg_low for k in ("geo", "country", "region")):
+            for h in parent_headers:
+                if "geo" in h.lower() or "region" in h.lower() or "country" in h.lower():
+                    return h
+            return "custom:GeographicSegmentation"
+        if any(k in seg_low for k in ("seg", "bus", "oper")):
+            for h in parent_headers:
+                if "seg" in h.lower() or "bus" in h.lower():
+                    return h
+            return "custom:BusinessSegments"
+
+    if len(parent_headers) == 1:
+        return parent_headers[0]
+    for s in parent_dims:
+        if s.get("parent_header"):
+            return str(s["parent_header"])
+    return None
+
+
+def _try_programmatic_incremental_hierarchy(
+    stored: list[dict],
+    filing_rows: list[dict],
+    new_concepts: set[str],
+    tools_by_name: dict[str, Any],
+    proposal: dict,
+) -> bool:
+    """Attempt deterministic incremental hierarchy placement without calling the LLM.
+
+    Returns ``True`` only when all new concepts (dimensional members and/or
+    unambiguous child line items with known stored parents and no alias/rename
+    candidates) are placed and pass ``check_hierarchy`` with zero warnings.
+    Otherwise resets ``proposal`` and returns ``False`` so the LLM agent takes over.
+    """
+    if not stored or not new_concepts:
+        return False
+    if "propose_hierarchy" not in tools_by_name or "check_hierarchy" not in tools_by_name:
+        return False
+
+    import json as _json
+
+    stored_main = {
+        str(s["concept"]): s
+        for s in stored
+        if not s.get("dimension_concept")
+        and s.get("concept")
+        and not str(s["concept"]).startswith("custom:")
+    }
+    filing_main_names = {
+        str(r["concept"])
+        for r in filing_rows
+        if not r.get("dimension_concept") and r.get("concept")
+    }
+    new_main = [
+        r for r in filing_rows
+        if not r.get("dimension_concept") and r.get("concept") in new_concepts
+    ]
+    new_dims = [
+        r for r in filing_rows
+        if r.get("dimension_concept") and r.get("concept") in new_concepts
+    ]
+
+    # 1. Validate new main concepts (if any): must have known stored parent and no alias candidate
+    stored_absent = [
+        s for c, s in stored_main.items()
+        if c not in filing_main_names and not s.get("abstract")
+    ]
+    auto_rows: list[dict] = []
+    sibling_counters: dict[str, int] = defaultdict(int)
+    for s in stored:
+        if not s.get("dimension_concept") and s.get("parent_concept"):
+            sibling_counters[str(s["parent_concept"])] += 1
+
+    for r in new_main:
+        concept = str(r["concept"])
+        parent = r.get("parent_concept")
+        # Require a known stored parent (never guess root-level placement or missing parents)
+        if not parent or str(parent) not in stored_main:
+            return False
+        parent_str = str(parent)
+        # Check for potential alias/rename against absent stored concepts
+        r_tokens = _concept_tokens(concept, r.get("label"))
+        for abs_row in stored_absent:
+            abs_tokens = _concept_tokens(abs_row.get("concept"), abs_row.get("label"))
+            overlap = r_tokens & abs_tokens
+            if abs_row.get("parent_concept") == parent_str and overlap:
+                return False
+            if len(overlap) >= 2:
+                return False
+
+        sibling_counters[parent_str] += 1
+        auto_rows.append({
+            "concept": concept,
+            "parent": parent_str,
+            "abstract": bool(r.get("abstract")),
+            "label": r.get("label"),
+            "order": sibling_counters[parent_str],
+        })
+
+    # 2. Validate and build new dimensional members
+    known_parents = set(stored_main.keys()) | {r["concept"] for r in auto_rows}
+    dim_counters: dict[tuple[str, Optional[str]], int] = defaultdict(int)
+    for s in stored:
+        if s.get("dimension_concept") and s.get("parent_concept"):
+            dim_counters[(str(s["parent_concept"]), s.get("parent_header"))] += 1
+
+    auto_dims: list[dict] = []
+    for d in new_dims:
+        concept = str(d["concept"])
+        pc = d.get("parent_concept")
+        if not pc or str(pc) not in known_parents:
+            return False
+        pc_str = str(pc)
+        ph = _infer_dim_parent_header(pc_str, d.get("segment_type"), stored)
+        dim_counters[(pc_str, ph)] += 1
+        dim_entry: dict[str, Any] = {
+            "concept": concept,
+            "parent_concept": pc_str,
+            "order": dim_counters[(pc_str, ph)],
+        }
+        if ph:
+            dim_entry["parent_header"] = ph
+        if d.get("segment_type"):
+            dim_entry["segment_type"] = d["segment_type"]
+        if d.get("label"):
+            dim_entry["label"] = d["label"]
+        auto_dims.append(dim_entry)
+
+    try:
+        prop_res = tools_by_name["propose_hierarchy"].invoke({
+            "rows_json": _json.dumps(auto_rows),
+            "dims_json": _json.dumps(auto_dims),
+        })
+        if not isinstance(prop_res, str) or not prop_res.startswith("OK"):
+            proposal.clear()
+            proposal.update({"merges": {}, "rows": [], "dims": []})
+            return False
+        preview = proposal.get("_preview") or {}
+        p_rows = preview.get("rows") or []
+        p_dims = preview.get("dims") or []
+        if not p_rows:
+            proposal.clear()
+            proposal.update({"merges": {}, "rows": [], "dims": []})
+            return False
+
+        # Verify every newly added row/dim materialized cleanly with no path collisions
+        path_counts: dict[str, int] = defaultdict(int)
+        for item in list(p_rows) + list(p_dims):
+            p = str(item.get("path") or "")
+            if p and p != "555":
+                path_counts[p] += 1
+        row_by_c = {r.get("concept"): r for r in p_rows if r.get("concept")}
+        dim_by_c = {
+            (d.get("parent_concept"), d.get("concept")): d
+            for d in p_dims if d.get("concept")
+        }
+        all_placed_cleanly = True
+        for r in auto_rows:
+            placed = row_by_c.get(r["concept"])
+            p = str((placed or {}).get("path") or "")
+            if not p or p == "555" or path_counts.get(p, 0) > 1:
+                all_placed_cleanly = False
+                break
+        if all_placed_cleanly:
+            for d in auto_dims:
+                placed = dim_by_c.get((d["parent_concept"], d["concept"]))
+                p = str((placed or {}).get("path") or "")
+                if not p or p == "555" or path_counts.get(p, 0) > 1:
+                    all_placed_cleanly = False
+                    break
+        if all_placed_cleanly:
+            return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("programmatic incremental hierarchy check failed: %s", exc)
+
+    proposal.clear()
+    proposal.update({"merges": {}, "rows": [], "dims": []})
+    return False
+
+
+
 def make_hierarchy_agent_node(
     norm_service: Any,
     *,
@@ -679,17 +909,6 @@ def make_hierarchy_agent_node(
                     ],
                 }
             else:
-                # New concepts found (or fresh seed) — invoke the LLM agent.
-                if not stored:
-                    report_call(
-                        f"  [hierarchy]  • {stmt_type}: fresh seed (0 stored) → running hierarchy agent"
-                    )
-                else:
-                    report_call(
-                        f"  [hierarchy]  • {stmt_type}: {len(new_concepts)} new concept(s) detected ({len(stored)} stored) → running hierarchy agent"
-                    )
-                report_detail(f"{stmt_type}: running agent...")
-
                 tools = build_unified_hierarchy_tools(
                     stored,
                     filing_rows,
@@ -704,52 +923,80 @@ def make_hierarchy_agent_node(
                     materialize=_materialize,
                 )
                 tools_by_name = {t.name: t for t in tools}
-                if not stored:
-                    context_dump = (
-                        tools_by_name["query_filing_hierarchy"].invoke({})
-                        if "query_filing_hierarchy" in tools_by_name
-                        else ""
+
+                # Programmatic incremental fast-path: resolve unambiguous new dims /
+                # child line items without calling the LLM.
+                resolved_programmatically = (
+                    bool(stored)
+                    and _try_programmatic_incremental_hierarchy(
+                        stored, filing_rows, new_concepts, tools_by_name, proposal
                     )
-                    task = (
-                        f"FRESH SEED for {getattr(bundle, 'statement_type', '?')} "
-                        f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
-                        f"No existing hierarchy is stored in DB.\n\n"
-                        f"{context_dump}\n\n"
-                        f"Predict ONCE: call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint, "
-                        f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
+                )
+                if resolved_programmatically:
+                    stmt_dur = time.perf_counter() - stmt_t0
+                    report_call(
+                        f"  [hierarchy]  • {stmt_type}: ⚡ programmatic incremental fast-path "
+                        f"({len(new_concepts)} new concept(s) placed cleanly)  {stmt_dur:.2f}s"
                     )
+                    report_detail(f"{stmt_type}: programmatic incremental")
                 else:
-                    context_dump = (
-                        tools_by_name["query_hierarchy_diff"].invoke({})
-                        if "query_hierarchy_diff" in tools_by_name
-                        else ""
-                    )
-                    task = (
-                        f"INCREMENTAL UPDATE for {getattr(bundle, 'statement_type', '?')} "
-                        f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
-                        f"Stored rows: {len(stored)}, New incoming concepts: {len(new_concepts)}. "
-                        f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely.\n\n"
-                        f"{context_dump}\n\n"
-                        f"Predict ONCE: if any new concept is an alias/rename of a stored concept, call decide_mapping(); "
-                        f"for new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
-                        f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically), "
-                        f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
-                    )
-                try:
-                    _ = run_agent_loop(
-                        AGENTIC_HIERARCHY_SYSTEM_PROMPT,
-                        task,
-                        tools,
-                        ticker=str(state.get("ticker") or state.get("cik") or "?"),
-                        finalize_name="finalize_hierarchy",
-                        finalize_description="Call when the full hierarchy is decided. Pass {\"status\": \"done\"}.",
-                        chat_llm=chat_llm,
-                        max_steps=3,
-                        on_event=on_event,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("hierarchy agent failed for %s/%s: %s",
-                                   bundle.company_cik, bundle.statement_type, exc)
+                    # Agent takeover: fresh seed or ambiguous incremental concepts.
+                    if not stored:
+                        report_call(
+                            f"  [hierarchy]  • {stmt_type}: fresh seed (0 stored) → running hierarchy agent"
+                        )
+                    else:
+                        report_call(
+                            f"  [hierarchy]  • {stmt_type}: {len(new_concepts)} new concept(s) detected ({len(stored)} stored) → running hierarchy agent"
+                        )
+                    report_detail(f"{stmt_type}: running agent...")
+
+                    if not stored:
+                        context_dump = (
+                            tools_by_name["query_filing_hierarchy"].invoke({})
+                            if "query_filing_hierarchy" in tools_by_name
+                            else ""
+                        )
+                        task = (
+                            f"FRESH SEED for {getattr(bundle, 'statement_type', '?')} "
+                            f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
+                            f"No existing hierarchy is stored in DB.\n\n"
+                            f"{context_dump}\n\n"
+                            f"Predict ONCE: call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint, "
+                            f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
+                        )
+                    else:
+                        context_dump = (
+                            tools_by_name["query_hierarchy_diff"].invoke({})
+                            if "query_hierarchy_diff" in tools_by_name
+                            else ""
+                        )
+                        task = (
+                            f"INCREMENTAL UPDATE for {getattr(bundle, 'statement_type', '?')} "
+                            f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
+                            f"Stored rows: {len(stored)}, New incoming concepts: {len(new_concepts)}. "
+                            f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely.\n\n"
+                            f"{context_dump}\n\n"
+                            f"Predict ONCE: if any new concept is an alias/rename of a stored concept, call decide_mapping(); "
+                            f"for new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
+                            f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically), "
+                            f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
+                        )
+                    try:
+                        _ = run_agent_loop(
+                            AGENTIC_HIERARCHY_SYSTEM_PROMPT,
+                            task,
+                            tools,
+                            ticker=str(state.get("ticker") or state.get("cik") or "?"),
+                            finalize_name="finalize_hierarchy",
+                            finalize_description="Call when the full hierarchy is decided. Pass {\"status\": \"done\"}.",
+                            chat_llm=chat_llm,
+                            max_steps=3,
+                            on_event=on_event,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("hierarchy agent failed for %s/%s: %s",
+                                       bundle.company_cik, bundle.statement_type, exc)
 
             # The agent's tools (propose_hierarchy / preview_hierarchy) already
             # materialized the final tree and the agent checked it.  Use that

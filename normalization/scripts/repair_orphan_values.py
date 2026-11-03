@@ -89,17 +89,7 @@ def repair(db, *, cik: Optional[str] = None, apply: bool = False) -> dict:
             statement_type = src.get("statement_type")
             cik_val = src.get("cik")
 
-            target_name = name
-            alias = db["concept_aliases"].find_one(
-                {"cik": cik_val, "statement_type": statement_type,
-                 "form_type": form_type, "concept": name}
-            )
-            if alias and alias.get("target_concept"):
-                target_name = alias["target_concept"]
-
-            target_id = name_index.get((cik_val, statement_type), {}).get(target_name)
-            if target_id is None:
-                target_id = name_index.get((cik_val, statement_type), {}).get(name)
+            target_id = name_index.get((cik_val, statement_type), {}).get(name)
 
             if target_id is None:
                 # Create a mirror concept in the matching collection.
@@ -110,8 +100,6 @@ def repair(db, *, cik: Optional[str] = None, apply: bool = False) -> dict:
                     name_index[(cik_val, statement_type)][src.get("concept")] = target_id
                 stats["concepts_created"] += 1
                 _log(f"  + create concept {name} ({form_type}) for orphan values")
-            elif target_name != name:
-                stats["aliased"] += 1
 
             if target_id is None:
                 continue

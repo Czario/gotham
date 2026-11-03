@@ -683,3 +683,69 @@ def test_reproposal_does_not_resurrect_a_removed_row():
     assert "custom:GeographicSegmentation" in {
         r.get("concept") for r in proposal["rows"]
     }
+
+
+def test_programmatic_incremental_fast_path_places_new_dims_without_llm(monkeypatch):
+    """When only new dimensional members appear under an existing stored line item,
+    hierarchy_agent_node resolves them programmatically with 0 LLM calls."""
+    from filings_agent.nodes import hierarchy_agent
+
+    called = []
+    monkeypatch.setattr(hierarchy_agent, "run_agent_loop", lambda *a, **k: called.append(1))
+
+    stored = [
+        {"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001",
+         "order_key": "a", "dimension_concept": False},
+    ]
+    bundle = _bundle(
+        concepts=[{"concept": "us-gaap:Revenues", "label": "Revenues", "value": 100.0}],
+        dims=[
+            {"concept": "country:US", "label": "United States",
+             "parent_concept": "us-gaap:Revenues", "segment_type": "geographic"},
+            {"concept": "aapl:IPhoneMember", "label": "iPhone",
+             "parent_concept": "us-gaap:Revenues", "segment_type": "product"},
+        ],
+    )
+    node = make_hierarchy_agent_node(_Service(stored))
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated",
+                "bundles": [bundle]})
+
+    assert out["status"] == "hierarchy_agent_done"
+    assert called == []  # 0 LLM calls!
+    dims_by_concept = {d["concept"]: d for d in bundle.dimensional_concepts}
+    assert dims_by_concept["country:US"]["_hierarchy_resolved"] is True
+    assert dims_by_concept["country:US"]["parent_header"] == "custom:GeographicSegmentation"
+    assert dims_by_concept["aapl:IPhoneMember"]["_hierarchy_resolved"] is True
+    assert dims_by_concept["aapl:IPhoneMember"]["parent_header"] == "custom:ProductSegmentation"
+
+
+def test_programmatic_incremental_fast_path_hands_over_to_llm_on_alias_candidate(monkeypatch):
+    """When a new line item shares semantic tokens with an absent stored concept,
+    programmatic fast-path yields to the LLM agent for alias/mapping resolution."""
+    from filings_agent.nodes import hierarchy_agent
+
+    called = []
+
+    def _fake_loop(*_a, **_k):
+        called.append(1)
+        return {}
+
+    monkeypatch.setattr(hierarchy_agent, "run_agent_loop", _fake_loop)
+
+    stored = [
+        {"_id": ObjectId(), "concept": "us-gaap:OperatingExpenses", "path": "001",
+         "order_key": "a", "dimension_concept": False, "abstract": True},
+        {"_id": ObjectId(), "concept": "us-gaap:ResearchAndDevelopmentExpense", "path": "001.001",
+         "order_key": "a", "parent_concept": "us-gaap:OperatingExpenses", "dimension_concept": False},
+    ]
+    # ResearchAndDevelopmentExpense is absent from the filing, replaced by a likely alias under the same parent
+    bundle = _bundle([
+        {"concept": "us-gaap:OperatingExpenses", "label": "Operating expenses", "path": "001", "abstract": True},
+        {"concept": "us-gaap:ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+         "label": "Research and development", "path": "001.001", "value": 50.0},
+    ])
+    node = make_hierarchy_agent_node(_Service(stored))
+    node({"cik": "0000320193", "ticker": "AAPL", "status": "validated", "bundles": [bundle]})
+
+    assert called == [1]  # handed over to LLM agent!
+

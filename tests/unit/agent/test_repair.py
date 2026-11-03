@@ -318,3 +318,75 @@ def test_create_value_record_updates_existing_repaired_value(mocker):
     assert update["value"] == pytest.approx(600000.0)
     assert update["source"] == "deterministic_identity"
     assert update["corrected_from"] == pytest.approx(999999.0)
+
+
+def test_review_node_programmatic_first_skips_llm_when_all_math_mismatches_resolved(monkeypatch):
+    """When chat_llm=None and all needs_decision findings are resolved by deterministic
+    XBRL arithmetic identities, review_node skips run_agent_loop (0 LLM calls)."""
+    from filings_agent import config as agent_config
+    from filings_agent.nodes import review as review_mod
+    from filings_agent.nodes.review import make_review_node
+
+    called = []
+    monkeypatch.setattr(review_mod, "run_agent_loop", lambda *a, **k: called.append(1))
+    monkeypatch.setattr(agent_config, "AGENT_REVIEW_ENABLED", True)
+    monkeypatch.setattr(agent_config, "AGENT_MODE", "fix")
+
+    finding = {
+        "type": "math_mismatch",
+        "severity": "high",
+        "statement_type": "income",
+        "concept": "us-gaap:GrossProfit",
+        "needs_decision": True,
+        "evidence": {
+            "target_concept": "us-gaap:GrossProfit",
+            "target_value": 999999.0,
+            "expected_value": 600000.0,
+            "identity": "Revenues - CostOfRevenue = GrossProfit",
+        },
+    }
+    out = make_review_node()({
+        "cik": "0000320193",
+        "ticker": "AAPL",
+        "findings": [finding],
+        "bundles": [],
+    })
+
+    assert called == []
+    assert len(out["repair_decisions"]) == 1
+    assert out["repair_decisions"][0]["source"] == "deterministic_identity"
+    assert out["repair_decisions"][0]["new_value"] == pytest.approx(600000.0)
+
+
+def test_recovery_classifies_transient_and_permanent_errors_deterministically():
+    """with_recovery classifies transient vs permanent errors without calling the LLM judge."""
+    from filings_agent.recovery import _classify_error_deterministically, with_recovery
+
+    assert _classify_error_deterministically("TimeoutError: request timed out")["action"] == "retry"
+    assert _classify_error_deterministically("KeyError: 'missing_key'")["action"] == "escalate"
+    assert _classify_error_deterministically("SomeNovelAmbiguousFailure") is None
+
+    judge_calls = []
+
+    class _JudgeLLM:
+        def invoke(self, prompt):
+            judge_calls.append(prompt)
+            return '{"action": "retry", "reason": "llm judge"}'
+
+    attempts = []
+
+    def _permanent_fail_node(state):
+        attempts.append(1)
+        return {
+            **state,
+            "status": "failed",
+            "error": "KeyError: 'broken'",
+            "_raised_exception": True,
+        }
+
+    wrapped = with_recovery(_permanent_fail_node, chat_llm=_JudgeLLM(), max_attempts=3)
+    res = wrapped({"status": "validated"})
+    assert res["status"] == "failed"
+    assert len(attempts) == 1  # escalated immediately on permanent KeyError
+    assert judge_calls == []    # 0 LLM calls
+

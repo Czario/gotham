@@ -77,17 +77,13 @@ def test_promotion_moves_values_and_deletes_only_the_concept_row(mocker):
         service, mocker, loser=loser, winner=winner, values_moved=7, children_moved=2
     )
 
-    store = Mock()
-    store.promote.return_value = 3
-    service._concept_alias_store = store
-
     receipt = service.promote_concept(
         "0000789019", "income", "10-Q", OLD_TAG, NEW_TAG
     )
 
     assert receipt["values_moved"] == 7
     assert receipt["dimensional_children_moved"] == 2
-    assert receipt["alias_rows_repointed"] == 3
+    assert receipt["alias_rows_repointed"] == 0
     assert receipt["deleted"] is True
 
     # 1) values move onto the winner's id …
@@ -99,12 +95,6 @@ def test_promotion_moves_values_and_deletes_only_the_concept_row(mocker):
     concept_repo.collection.delete_one.assert_called_once_with({"_id": loser["_id"]})
     assert not value_repo.collection.delete_many.called
     assert not value_repo.collection.delete_one.called
-
-    # 3) alias store re-keyed and scoped to this form type
-    store.promote.assert_called_once_with(
-        "0000789019", "income", "10-Q", OLD_TAG, NEW_TAG,
-        reason="newest-period promotion",
-    )
 
 
 def test_promotion_creates_the_winner_when_absent(mocker):
@@ -172,17 +162,11 @@ def test_promotion_is_idempotent_when_loser_is_gone(mocker):
     mocker.patch.object(service, "_get_concept_repo_by_form_type", return_value=concept_repo)
     mocker.patch.object(service, "_get_value_repo_by_form_type", return_value=Mock())
 
-    store = Mock()
-    store.promote.return_value = 1
-    service._concept_alias_store = store
-
     receipt = service.promote_concept("0000789019", "income", "10-Q", OLD_TAG, NEW_TAG)
 
     assert receipt["skipped"] == "from_concept_absent"
     assert receipt["deleted"] is False
     assert not concept_repo.collection.delete_one.called
-    # the old tag still resolves to the winner for a future filing
-    store.promote.assert_called_once()
 
 
 def test_promotion_rejects_same_or_empty_names(mocker):

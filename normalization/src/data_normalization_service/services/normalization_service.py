@@ -1112,31 +1112,11 @@ class FinancialNormalizationService:
         concept_repo: 'ConceptRepository' = None,
     ) -> Optional[str]:
         """Return the alias target concept name for an incoming concept, if one
-        has been decided (by the concept-resolution agent) for this
-        company+statement+form-type.
-
-        Preference order:
-          1. The item's own ``_concept_target`` annotation — the in-memory
-             decision made this run by the ``concept_resolve`` agent node;
-          2. A previously recorded decision in the ``concept_aliases`` store
-             (so callers that bypass the agent still get the merge).
-
-        Returns ``None`` when no alias exists (the incoming concept is a real
-        new concept and may be created).
-        """
+        has been decided in-memory this run via ``_concept_target``."""
         target = item.get('_concept_target')
         if target:
             return target if isinstance(target, str) and target else None
-        try:
-            store = getattr(self, '_concept_alias_store', None)
-            if store is None:
-                from ..database import ConceptAliasStore
-                store = ConceptAliasStore(self.db_connection)
-                self._concept_alias_store = store
-            return store.get(cik, statement_type, form_type, item.get('concept', ''))
-        except Exception as exc:  # noqa: BLE001 — alias lookup must never break ingestion
-            logger.debug(f"Concept alias lookup failed for {item.get('concept')}: {exc}")
-            return None
+        return None
 
     # ------------------------------------------------------------------ #
     # Newest-period concept promotion
@@ -1423,23 +1403,8 @@ class FinancialNormalizationService:
         from_concept: str,
         to_concept: str,
     ) -> int:
-        """Re-key the durable alias/series store after a promotion."""
-        try:
-            store = getattr(self, '_concept_alias_store', None)
-            if store is None:
-                from ..database import ConceptAliasStore
-                store = ConceptAliasStore(self.db_connection)
-                self._concept_alias_store = store
-            return store.promote(
-                cik, statement_type, form_type, from_concept, to_concept,
-                reason="newest-period promotion",
-            )
-        except Exception as exc:  # noqa: BLE001 — bookkeeping must not break the merge
-            logger.warning(
-                "Could not repoint concept aliases %s -> %s: %s",
-                from_concept, to_concept, exc,
-            )
-            return 0
+        """No-op: concept_aliases collection is not used."""
+        return 0
 
     def _invalidate_concept_cache(
         self, cik: str, statement_type: str, concept: str, form_type: str

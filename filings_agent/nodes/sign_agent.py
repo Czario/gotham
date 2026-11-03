@@ -115,33 +115,51 @@ def make_sign_agent_node(
 
         # Fast-path: nothing to do → no LLM call.
         if pending:
-            initial = "Rows that violate a declared sign convention:\n" + "\n".join(
-                f"- {row['statement_type']} | {row['concept']} | {row['label']} | "
-                f"value={row['value']:g} | has={row['current_sign']} | "
-                f"must={row['required_sign']}"
-                for row in pending
-            )
-            try:
-                tools = build_sign_tools(bundles, proposal)
-                run_agent_loop(
-                    SIGN_AGENT_SYSTEM_PROMPT,
-                    initial,
-                    tools,
-                    ticker=str(state.get("ticker") or state.get("cik") or "?"),
-                    finalize_name="finalize_signs",
-                    finalize_description=_FINALIZE_DESCRIPTION,
-                    chat_llm=chat_llm,
-                    on_event=on_event,
-                )
-            except Exception as exc:  # noqa: BLE001 — never block a filing over signs
-                logger.warning(
-                    "sign agent unavailable (%s); applying the declared convention", exc
-                )
+            from .. import config
 
-            # Backstop: enforce the declared convention on whatever is left.
-            backstop = _enforce_declared_convention(bundles, proposal)
-            if backstop:
-                logger.info("sign agent: %d row(s) fixed by the declared convention", backstop)
+            use_llm_first = chat_llm is not None or bool(
+                getattr(config, "SIGN_AGENT_LLM_ENABLED", False)
+            )
+            if not use_llm_first:
+                # Programmatic first: declared conventions are deterministic rules.
+                applied = _enforce_declared_convention(bundles, proposal)
+                if applied:
+                    logger.info(
+                        "sign agent: %d row(s) fixed programmatically by declared convention",
+                        applied,
+                    )
+                pending = policy.violations(bundles)
+
+            # Agent takeover: only invoke the LLM when explicitly enabled /
+            # injected, or if unresolved violations remain after programmatic fix.
+            if pending and (use_llm_first or policy.violations(bundles)):
+                initial = "Rows that violate a declared sign convention:\n" + "\n".join(
+                    f"- {row['statement_type']} | {row['concept']} | {row['label']} | "
+                    f"value={row['value']:g} | has={row['current_sign']} | "
+                    f"must={row['required_sign']}"
+                    for row in pending
+                )
+                try:
+                    tools = build_sign_tools(bundles, proposal)
+                    run_agent_loop(
+                        SIGN_AGENT_SYSTEM_PROMPT,
+                        initial,
+                        tools,
+                        ticker=str(state.get("ticker") or state.get("cik") or "?"),
+                        finalize_name="finalize_signs",
+                        finalize_description=_FINALIZE_DESCRIPTION,
+                        chat_llm=chat_llm,
+                        on_event=on_event,
+                    )
+                except Exception as exc:  # noqa: BLE001 — never block a filing over signs
+                    logger.warning(
+                        "sign agent unavailable (%s); applying the declared convention", exc
+                    )
+
+                # Backstop: enforce the declared convention on whatever is left.
+                backstop = _enforce_declared_convention(bundles, proposal)
+                if backstop:
+                    logger.info("sign agent: %d row(s) fixed by the declared convention", backstop)
 
         fixes = proposal["fixes"]
         remaining = policy.violations(bundles)

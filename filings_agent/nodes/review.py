@@ -79,35 +79,55 @@ def make_review_node(*, chat_llm: Any = None, on_event: Any = None) -> Callable[
         proposals: list[dict] = []
         from .. import config
 
-        # The deterministic fallback is always available and is used when the
-        # provider is unavailable or the agent returns no usable proposal.
+        # Deterministic identity repair runs FIRST for validator-proven math mismatches.
+        # Only hand over to the LLM review agent when an explicit chat_llm stub is injected
+        # or when needs_decision findings remain unresolved by deterministic repair.
         fallback = _deterministic_proposals(findings)
+        needs_dec = [f for f in findings if f.get("needs_decision")]
+        resolved_keys = {
+            (p.get("statement_type") or "", p.get("concept"))
+            for p in fallback
+        }
+        unresolved_findings = [
+            f for f in needs_dec
+            if (
+                f.get("statement_type") or "",
+                (f.get("evidence") or {}).get("target_concept") or f.get("concept"),
+            ) not in resolved_keys
+        ]
 
         # Report mode is intentionally deterministic and non-mutating: do not
         # spend an LLM call on a proposal that CorrectionGate will reject.
         if config.AGENT_REVIEW_ENABLED and config.AGENT_MODE != "report":
-            try:
-                from ..hooks import report_call
+            from ..hooks import report_call
 
+            if chat_llm is None and fallback and not unresolved_findings:
                 report_call(
-                    f"  [review]  consulting review agent "
-                    f"({len(findings)} finding(s), mode={config.AGENT_MODE})"
+                    f"  [review]  ⚡ programmatic review "
+                    f"({len(fallback)} math identity repair(s) resolved deterministically)"
                 )
-                tools = build_review_tools(state.get("bundles") or [], proposals)
-                system, initial = _review_prompt(findings)
-                result = run_agent_loop(
-                    system,
-                    initial,
-                    tools,
-                    ticker=state.get("ticker", state.get("cik", "?")),
-                    finalize_name="finalize_review",
-                    chat_llm=chat_llm,
-                    on_event=on_event,
-                )
-                if isinstance(result, dict) and isinstance(result.get("repairs"), list):
-                    proposals.extend(x for x in result["repairs"] if isinstance(x, dict))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("agent review unavailable; using deterministic fallback: %s", exc)
+                proposals = list(fallback)
+            else:
+                try:
+                    report_call(
+                        f"  [review]  consulting review agent "
+                        f"({len(findings)} finding(s), mode={config.AGENT_MODE})"
+                    )
+                    tools = build_review_tools(state.get("bundles") or [], proposals)
+                    system, initial = _review_prompt(findings)
+                    result = run_agent_loop(
+                        system,
+                        initial,
+                        tools,
+                        ticker=state.get("ticker", state.get("cik", "?")),
+                        finalize_name="finalize_review",
+                        chat_llm=chat_llm,
+                        on_event=on_event,
+                    )
+                    if isinstance(result, dict) and isinstance(result.get("repairs"), list):
+                        proposals.extend(x for x in result["repairs"] if isinstance(x, dict))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("agent review unavailable; using deterministic fallback: %s", exc)
 
         if not proposals:
             proposals = fallback

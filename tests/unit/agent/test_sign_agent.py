@@ -244,3 +244,25 @@ def test_sign_fix_is_wired_into_the_graph():
     compiled = build_filing_graph(svc)
     nodes = set(compiled.get_graph().nodes)
     assert "sign_fix" in nodes
+
+
+def test_node_programmatic_first_resolves_violations_with_zero_llm_calls(monkeypatch):
+    """By default (chat_llm=None, SIGN_AGENT_LLM_ENABLED=False), sign violations
+    are resolved programmatically without invoking run_agent_loop."""
+    from filings_agent import config
+    from filings_agent.nodes import sign_agent
+
+    called = []
+    monkeypatch.setattr(config, "SIGN_AGENT_LLM_ENABLED", False)
+    monkeypatch.setattr(sign_agent, "run_agent_loop", lambda *a, **k: called.append(1))
+    bundle = _Bundle("income", [
+        {"concept": "us-gaap:InterestExpense", "value": 500.0},
+    ])
+
+    out = sign_agent.make_sign_agent_node()(_state([bundle]))
+
+    assert called == []
+    assert bundle.concepts[0]["value"] == -500.0
+    assert out["sign_fixes"][0]["source"] == "sign_policy"
+    assert out["sign_fix_unresolved"] == []
+

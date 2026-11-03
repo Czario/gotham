@@ -39,6 +39,54 @@ DEFAULT_MAX_ATTEMPTS = 2
 # straight away avoids burning an LLM call on something a retry cannot fix.
 _NON_RETRYABLE = frozenset({})
 
+_TRANSIENT_PATTERNS = (
+    "timeout",
+    "timed out",
+    "connectionerror",
+    "connection reset",
+    "connection refused",
+    "rate limit",
+    "ratelimit",
+    "429",
+    "502",
+    "503",
+    "504",
+    "temporarily unavailable",
+    "autoreconnect",
+    "networktimeout",
+    "serverselectiontimeouterror",
+)
+
+_PERMANENT_PATTERNS = (
+    "typeerror:",
+    "keyerror:",
+    "attributeerror:",
+    "syntaxerror:",
+    "nameerror:",
+    "zerodivisionerror:",
+    "importerror:",
+    "modulenotfounderror:",
+)
+
+
+def _classify_error_deterministically(error: str) -> Optional[dict]:
+    """Classify well-known transient vs permanent exceptions without an LLM call."""
+    low = (error or "").lower()
+    for pat in _PERMANENT_PATTERNS:
+        if pat in low:
+            return {
+                "action": "escalate",
+                "reason": f"deterministic classification: permanent error ({pat.rstrip(':')})",
+            }
+    for pat in _TRANSIENT_PATTERNS:
+        if pat in low:
+            return {
+                "action": "retry",
+                "reason": f"deterministic classification: transient error ({pat})",
+            }
+    return None
+
+
 
 def _summarize(state: dict, node: str, error: str) -> dict:
     """A compact, LLM-friendly snapshot of the failure context."""
@@ -140,10 +188,12 @@ def with_recovery(
                 result["_issues"] = issues
                 return result
 
-            # ── Decide retry vs escalate (LLM judge, or deterministic retry) ──
+            # ── Decide retry vs escalate (deterministic first, LLM judge on ambiguity) ──
             decision = None
             if node_name not in _NON_RETRYABLE:
-                decision = _ask_recover_agent(_summarize(result, node_name, error), chat_llm)
+                decision = _classify_error_deterministically(error)
+                if decision is None:
+                    decision = _ask_recover_agent(_summarize(result, node_name, error), chat_llm)
             action = (decision or {}).get("action")
             reason = (decision or {}).get("reason") or "deterministic retry"
             if action == "escalate":
