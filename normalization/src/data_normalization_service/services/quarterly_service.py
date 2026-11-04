@@ -49,6 +49,7 @@ class PeriodData:
     reporting_period: Dict[str, Any]
     values: Dict[str, float]  # concept_key -> value
     is_calculated: bool = False
+    calculated_keys: Optional[Dict[str, bool]] = None
 
 
 @dataclass
@@ -136,6 +137,18 @@ class PeriodBasedFinancialCalculationService:
         if concept_doc:
             logger.debug(f"Found concept {concept} in annual collection")
             return concept_doc
+
+        # Canonical statement_type fallback ('cash_flow' <-> 'cashflow')
+        if str(statement_type).lower() in ('cash_flow', 'cashflow'):
+            alt_type = 'cashflow' if statement_type != 'cashflow' else 'cash_flow'
+            for repo in (self.quarterly_concept_repo, self.annual_concept_repo):
+                alt_doc = repo.collection.find_one({
+                    'cik': company_cik,
+                    'statement_type': alt_type,
+                    'concept': concept,
+                })
+                if alt_doc:
+                    return alt_doc
 
         return None
     
@@ -365,8 +378,180 @@ class PeriodBasedFinancialCalculationService:
             accession_number=filing_raw.get('accession_number', filing_raw.get('accessionNumber')),
         )
 
+    def _load_db_periods_for_fiscal_year(
+        self,
+        company_cik: str,
+        statement_type: str,
+        fiscal_year: int,
+        exclude_quarters: Optional[set] = None,
+    ) -> List[PeriodData]:
+        """Load existing quarterly periods for a fiscal year from concept_values_quarterly.
+
+        When a single quarter (e.g., Q2 or Q3, or cashflow-only) is extracted in the
+        current run, the in-memory accumulator only contains that quarter. Loading the
+        other quarters (Q1, Q2, Q3) for the same fiscal year from target_db allows
+        deaccumulation to compute 3-month individual cash flow figures.
+        """
+        exclude = set(exclude_quarters or ())
+        missing_quarters = [q for q in (1, 2, 3) if q not in exclude]
+        if not missing_quarters:
+            return []
+
+        stmt_types = (
+            ['cashflow', 'cash_flow']
+            if str(statement_type).lower() in ('cashflow', 'cash_flow')
+            else [statement_type]
+        )
+        canonical_stmt_type = 'cashflow' if 'cashflow' in stmt_types else statement_type
+
+        try:
+            raw_docs = self.quarterly_value_repo.collection.find({
+                'cik': company_cik,
+                'statement_type': {'$in': stmt_types},
+                'reporting_period.fiscal_year': fiscal_year,
+                'reporting_period.quarter': {'$in': missing_quarters},
+                'dimension_value': {'$ne': True},
+            })
+            docs = list(raw_docs) if raw_docs is not None else []
+        except Exception as exc:
+            logger.debug(f"Could not load DB periods for {company_cik} FY{fiscal_year}: {exc}")
+            return []
+
+        if not docs:
+            return []
+
+        concept_ids = list({d['concept_id'] for d in docs if isinstance(d, dict) and d.get('concept_id') is not None})
+        concept_map: Dict[Any, str] = {}
+        if concept_ids:
+            try:
+                for cdoc in self.quarterly_concept_repo.collection.find(
+                    {'_id': {'$in': concept_ids}}, {'concept': 1}
+                ):
+                    if isinstance(cdoc, dict) and cdoc.get('concept'):
+                        concept_map[cdoc['_id']] = cdoc['concept']
+                missing_cids = [cid for cid in concept_ids if cid not in concept_map]
+                if missing_cids:
+                    for cdoc in self.annual_concept_repo.collection.find(
+                        {'_id': {'$in': missing_cids}}, {'concept': 1}
+                    ):
+                        if isinstance(cdoc, dict) and cdoc.get('concept'):
+                            concept_map[cdoc['_id']] = cdoc['concept']
+            except Exception as exc:
+                logger.debug(f"Could not resolve concept names for DB periods: {exc}")
+                return []
+
+        by_quarter: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            q = (d.get('reporting_period') or {}).get('quarter')
+            if q in (1, 2, 3):
+                by_quarter[int(q)].append(d)
+
+        loaded_periods: List[PeriodData] = []
+        for q in sorted(by_quarter.keys()):
+            q_docs = by_quarter[q]
+            # Pick canonical period_date (most frequent among docs in this quarter)
+            pd_counts: Dict[str, int] = {}
+            rep_rp: Dict[str, Any] = {}
+            rep_acc: Optional[str] = None
+            for d in q_docs:
+                rp = d.get('reporting_period') or {}
+                pd = rp.get('period_date')
+                if pd:
+                    pd_counts[pd] = pd_counts.get(pd, 0) + 1
+                if not rep_rp and rp:
+                    rep_rp = dict(rp)
+                if not rep_acc and d.get('accession_number'):
+                    rep_acc = d.get('accession_number')
+
+            period_date = (
+                max(pd_counts.items(), key=lambda x: x[1])[0]
+                if pd_counts
+                else rep_rp.get('period_date') or f"{fiscal_year}-0{q * 3}-28"
+            )
+
+            values: Dict[str, float] = {}
+            calculated_keys: Dict[str, bool] = {}
+            for d in q_docs:
+                cname = concept_map.get(d.get('concept_id'))
+                val = d.get('value')
+                if not cname or val is None:
+                    continue
+                try:
+                    num_val = float(val)
+                except (ValueError, TypeError):
+                    continue
+                vkey = f"{cname}_{period_date}"
+                values[vkey] = num_val
+                calculated_keys[vkey] = bool(d.get('calculated'))
+
+            if not values:
+                continue
+
+            enriched_rp = dict(rep_rp)
+            enriched_rp['fiscal_year'] = fiscal_year
+            enriched_rp['quarter'] = q
+            enriched_rp['period_date'] = period_date
+            enriched_rp['_cik'] = company_cik
+            enriched_rp['_statement_type'] = canonical_stmt_type
+            if rep_acc:
+                enriched_rp['accession_number'] = rep_acc
+
+            all_calc = bool(calculated_keys) and all(calculated_keys.values())
+            loaded_periods.append(PeriodData(
+                fiscal_year=fiscal_year,
+                period_date=period_date,
+                form_type='10-Q',
+                filing_id=ObjectId(),
+                statement_id=ObjectId(),
+                reporting_period=enriched_rp,
+                values=values,
+                is_calculated=all_calc,
+                calculated_keys=calculated_keys,
+            ))
+
+        return loaded_periods
+
+    def deaccumulate_company_cashflow_in_db(
+        self,
+        company_cik: str,
+        fiscal_year: Optional[int] = None,
+    ) -> int:
+        """Deaccumulate quarterly cash-flow values directly in target_db (concept_values_quarterly).
+
+        Useful both as a repair/backfill entrypoint and when source_db is not used.
+        Returns the number of fiscal years processed.
+        """
+        match_query: Dict[str, Any] = {
+            'cik': company_cik,
+            'statement_type': {'$in': ['cashflow', 'cash_flow']},
+            'dimension_value': {'$ne': True},
+        }
+        if fiscal_year is not None:
+            match_query['reporting_period.fiscal_year'] = fiscal_year
+
+        fys = sorted(
+            fy for fy in self.quarterly_value_repo.collection.distinct(
+                'reporting_period.fiscal_year', match_query
+            )
+            if isinstance(fy, int)
+        )
+        years_processed = 0
+        for fy in fys:
+            periods = self._load_db_periods_for_fiscal_year(
+                company_cik, 'cashflow', fy, exclude_quarters=set()
+            )
+            if not periods:
+                continue
+            individual_periods = self._deaccumulate_periods(periods)
+            for period in individual_periods:
+                self._save_period_data(period, is_calculated=True)
+            years_processed += 1
+        return years_processed
+
     def _process_cash_flow_from_memory(self, company_cik: str, statement_type: str, stmts: list) -> None:
-        """Deaccumulate cash-flow statements from in-memory slim dicts."""
+        """Deaccumulate cash-flow statements from in-memory slim dicts, augmented with DB periods."""
         period_data, annual_data = self._build_period_data_from_memory(company_cik, statement_type, stmts)
         data_by_year = self._group_by_fiscal_year(period_data, annual_data)
 
@@ -375,14 +560,51 @@ class PeriodBasedFinancialCalculationService:
             str(stmt.get('_id', '')): self._get_filing_doc_for_statement(stmt)
             for stmt in stmts
         }
+        already_saved_quarters_by_fy: Dict[int, set] = {}
+        for stmt in stmts:
+            if stmt.get('_already_saved_calculated'):
+                rp = stmt.get('reporting_period') or {}
+                fy = rp.get('fiscal_year')
+                q = rp.get('quarter')
+                if fy is not None and q is not None:
+                    already_saved_quarters_by_fy.setdefault(int(fy), set()).add(int(q))
 
         for fiscal_year, year_data in data_by_year.items():
-            periods = year_data['periods']
-            if len(periods) < 2:
+            periods = list(year_data['periods'])
+            in_memory_quarters = {
+                p.reporting_period.get('quarter')
+                for p in periods
+                if (p.reporting_period or {}).get('quarter') is not None
+            }
+            max_in_memory_q = max(
+                (int(q) for q in in_memory_quarters if isinstance(q, int)),
+                default=3,
+            )
+            # Augment with prior quarters (q <= max_in_memory_q) of the same fiscal year from DB
+            # so single-quarter or partial runs can deaccumulate Q2 and Q3 without touching later
+            # quarters that have not yet been reloaded.
+            exclude_quarters = set(in_memory_quarters) | {q for q in (1, 2, 3) if q > max_in_memory_q}
+            db_periods = self._load_db_periods_for_fiscal_year(
+                company_cik, statement_type, fiscal_year, exclude_quarters=exclude_quarters
+            )
+            db_calculated_quarters = {
+                (p.reporting_period or {}).get('quarter')
+                for p in db_periods
+                if p.is_calculated and (p.reporting_period or {}).get('quarter') is not None
+            }
+            if db_periods:
+                periods.extend(db_periods)
+                periods.sort(key=lambda x: ((x.reporting_period or {}).get('quarter') or 0, x.period_date))
+
+            if not periods:
                 continue
             is_cumulative = self._detect_cumulative_pattern(periods)
             individual_periods = self._deaccumulate_periods(periods)
+            skip_save_quarters = already_saved_quarters_by_fy.get(fiscal_year, set()) | db_calculated_quarters
             for period in individual_periods:
+                q_num = (period.reporting_period or {}).get('quarter')
+                if q_num in skip_save_quarters:
+                    continue
                 self._save_period_data(period, is_calculated=True)
 
         self._memory_filing_map = {}
@@ -420,16 +642,31 @@ class PeriodBasedFinancialCalculationService:
         
         # Get period and annual data
         period_data, annual_data = self._get_filing_data(company_cik, statement_type)
+        if not period_data and not annual_data:
+            # Fallback to deaccumulating directly in target_db when source_db is empty
+            self.deaccumulate_company_cashflow_in_db(company_cik)
+            return
         
         # Group by fiscal year
         data_by_year = self._group_by_fiscal_year(period_data, annual_data)
         
         for fiscal_year, year_data in data_by_year.items():
-            periods = year_data['periods']
+            periods = list(year_data['periods'])
             annual = year_data['annual']
             
-            if len(periods) < 2:
-                logger.info(f"Skipping {fiscal_year} - need at least 2 periods for processing")
+            in_memory_quarters = {
+                p.reporting_period.get('quarter')
+                for p in periods
+                if (p.reporting_period or {}).get('quarter') is not None
+            }
+            db_periods = self._load_db_periods_for_fiscal_year(
+                company_cik, statement_type, fiscal_year, exclude_quarters=in_memory_quarters
+            )
+            if db_periods:
+                periods.extend(db_periods)
+                periods.sort(key=lambda x: ((x.reporting_period or {}).get('quarter') or 0, x.period_date))
+
+            if not periods:
                 continue
             
             logger.info(f"Processing cashflow {fiscal_year} with {len(periods)} periods")
@@ -665,66 +902,160 @@ class PeriodBasedFinancialCalculationService:
         - Q2: Q2_individual = Q2_cumulative - Q1_individual
         - Q3: Q3_individual = Q3_cumulative - (Q1_individual + Q2_individual)
         
-        Only individual deaccumulative values are saved to target database.
+        Supports both full-year in-memory runs and single-quarter / partial runs
+        augmented with DB-loaded periods (where prior quarters in DB may already have
+        calculated=True or may still be raw cumulative with calculated=False).
         """
-        sorted_periods = sorted(periods, key=lambda x: x.period_date)
-        individual_periods = []
+        sorted_periods = sorted(
+            periods,
+            key=lambda x: ((x.reporting_period or {}).get('quarter') or 0, x.period_date),
+        )
+        individual_periods: List[PeriodData] = []
         
         logger.info(f"Deaccumulating {len(sorted_periods)} cashflow periods using clean logic")
-        
-        # Track individual deaccumulative values by base concept
-        individual_sum_by_concept = defaultdict(float)
-        
+
+        # Determine whether explicit quarter numbers (1, 2, 3) are present
+        explicit_quarters = [
+            (p.reporting_period or {}).get('quarter')
+            for p in sorted_periods
+            if (p.reporting_period or {}).get('quarter') in (1, 2, 3)
+        ]
+        use_explicit_quarters = len(explicit_quarters) == len(sorted_periods) and len(sorted_periods) > 0
+
+        if use_explicit_quarters:
+            # Deduplicate by quarter (prefer in-memory / un-calculated or latest period)
+            by_q: Dict[int, PeriodData] = {}
+            for p in sorted_periods:
+                q = int(p.reporting_period['quarter'])
+                if q not in by_q or not p.is_calculated:
+                    by_q[q] = p
+            sorted_periods = [by_q[q] for q in sorted(by_q.keys())]
+            has_q1 = 1 in by_q
+            has_q2 = 2 in by_q
+        else:
+            has_q1 = len(sorted_periods) >= 1
+            has_q2 = len(sorted_periods) >= 2
+
+        q1_individual: Dict[str, float] = {}
+        q2_individual: Dict[str, float] = {}
+        q2_cumulative: Dict[str, float] = {}
+
         for i, period in enumerate(sorted_periods):
-            quarter_num = i + 1
-            
-            if i == 0:
-                # Q1 is already individual deaccumulative - keep as-is
-                individual_periods.append(period)
-                logger.info(f"Q1 ({period.period_date}): kept as individual deaccumulative")
-                
-                # Track Q1 individual values for future calculations
+            quarter_num = int(period.reporting_period['quarter']) if use_explicit_quarters else (i + 1)
+
+            if quarter_num == 1:
+                # Q1 is always a 3-month individual period
                 for value_key, value in period.values.items():
                     base_concept = self._get_base_concept(value_key)
-                    individual_sum_by_concept[base_concept] = value
-                    
-            else:
-                # Q2+ are cumulative - deaccumulate to individual values
-                individual_values = {}
-                
-                for value_key, cumulative_value in period.values.items():
-                    base_concept = self._get_base_concept(value_key)
-                    
-                    # Get sum of all previous individual quarters
-                    previous_individual_sum = individual_sum_by_concept.get(base_concept, 0)
-                    
-                    # Calculate individual deaccumulative value
-                    # Q2_individual = Q2_cumulative - Q1_individual
-                    # Q3_individual = Q3_cumulative - (Q1_individual + Q2_individual)
-                    individual_value = cumulative_value - previous_individual_sum
-                    individual_values[value_key] = individual_value
-                    
-                    # Update running sum for next quarter
-                    individual_sum_by_concept[base_concept] += individual_value
-                    
-                    logger.debug(f"Q{quarter_num} {base_concept}: {cumulative_value:,.0f} (cumulative) → {individual_value:,.0f} (individual)")
-                
-                # Create individual deaccumulative period
-                individual_period = PeriodData(
+                    q1_individual[base_concept] = value
+
+                individual_periods.append(PeriodData(
                     fiscal_year=period.fiscal_year,
                     period_date=period.period_date,
                     form_type=period.form_type,
                     filing_id=period.filing_id,
                     statement_id=period.statement_id,
                     reporting_period=period.reporting_period,
-                    values=individual_values,
-                    is_calculated=True
-                )
-                
-                individual_periods.append(individual_period)
-                logger.info(f"Q{quarter_num} ({period.period_date}): deaccumulated to individual values")
-        
-        logger.info(f"Successfully converted {len(sorted_periods)} periods to individual deaccumulative values")
+                    values=dict(period.values),
+                    is_calculated=True,
+                ))
+                logger.info(f"Q1 ({period.period_date}): kept as individual deaccumulative")
+
+            elif quarter_num == 2:
+                individual_values: Dict[str, float] = {}
+                for value_key, raw_val in period.values.items():
+                    base_concept = self._get_base_concept(value_key)
+                    is_val_calc = (
+                        period.calculated_keys.get(value_key, period.is_calculated)
+                        if period.calculated_keys is not None
+                        else period.is_calculated
+                    )
+                    if is_val_calc:
+                        # Loaded from DB where calculated=True -> already 3-month Q2 individual value
+                        ind_val = raw_val
+                        q2_individual[base_concept] = ind_val
+                        if has_q1:
+                            q2_cumulative[base_concept] = q1_individual.get(base_concept, 0.0) + ind_val
+                        individual_values[value_key] = ind_val
+                    else:
+                        # Raw 6-month YTD cumulative value
+                        q2_cumulative[base_concept] = raw_val
+                        if has_q1:
+                            q1_val = q1_individual.get(base_concept, 0.0)
+                            ind_val = raw_val - q1_val
+                            q2_individual[base_concept] = ind_val
+                            individual_values[value_key] = ind_val
+                            logger.debug(
+                                f"Q2 {base_concept}: {raw_val:,.0f} (cumulative) -> {ind_val:,.0f} (individual)"
+                            )
+
+                if individual_values:
+                    individual_periods.append(PeriodData(
+                        fiscal_year=period.fiscal_year,
+                        period_date=period.period_date,
+                        form_type=period.form_type,
+                        filing_id=period.filing_id,
+                        statement_id=period.statement_id,
+                        reporting_period=period.reporting_period,
+                        values=individual_values,
+                        is_calculated=True,
+                    ))
+                    logger.info(f"Q2 ({period.period_date}): deaccumulated to individual values")
+                else:
+                    logger.warning(
+                        f"Skipping Q2 ({period.period_date}) deaccumulation: Q1 data is missing"
+                    )
+
+            else:
+                # Q3 (9-month YTD cumulative -> 3-month individual)
+                individual_values = {}
+                for value_key, raw_val in period.values.items():
+                    base_concept = self._get_base_concept(value_key)
+                    is_val_calc = (
+                        period.calculated_keys.get(value_key, period.is_calculated)
+                        if period.calculated_keys is not None
+                        else period.is_calculated
+                    )
+                    if is_val_calc:
+                        # Loaded from DB where calculated=True -> already 3-month Q3 individual value
+                        individual_values[value_key] = raw_val
+                    else:
+                        if has_q1 and has_q2:
+                            prior_sum = (
+                                q1_individual.get(base_concept, 0.0)
+                                + q2_individual.get(base_concept, 0.0)
+                            )
+                            ind_val = raw_val - prior_sum
+                            individual_values[value_key] = ind_val
+                            logger.debug(
+                                f"Q{quarter_num} {base_concept}: {raw_val:,.0f} (cumulative) -> {ind_val:,.0f} (individual)"
+                            )
+                        elif has_q2 and base_concept in q2_cumulative:
+                            prior_sum = q2_cumulative.get(base_concept, 0.0)
+                            ind_val = raw_val - prior_sum
+                            individual_values[value_key] = ind_val
+                            logger.debug(
+                                f"Q{quarter_num} {base_concept}: {raw_val:,.0f} (cumulative) -> {ind_val:,.0f} (individual via Q2_cum)"
+                            )
+
+                if individual_values:
+                    individual_periods.append(PeriodData(
+                        fiscal_year=period.fiscal_year,
+                        period_date=period.period_date,
+                        form_type=period.form_type,
+                        filing_id=period.filing_id,
+                        statement_id=period.statement_id,
+                        reporting_period=period.reporting_period,
+                        values=individual_values,
+                        is_calculated=True,
+                    ))
+                    logger.info(f"Q{quarter_num} ({period.period_date}): deaccumulated to individual values")
+                else:
+                    logger.warning(
+                        f"Skipping Q{quarter_num} ({period.period_date}) deaccumulation: prior quarter data is missing"
+                    )
+
+        logger.info(f"Successfully converted {len(individual_periods)} periods to individual deaccumulative values")
         return individual_periods
 
     def _get_or_set_canonical_period_date(
@@ -893,15 +1224,22 @@ class PeriodBasedFinancialCalculationService:
                         # 1-day off-by-one duplicates in 52/53-week fiscal calendars) and
                         # now includes quarter (was previously missing, causing wrong-quarter
                         # matches / skipped inserts).
-                        query = {
+                        # Note: idx_unique_value on concept_values_quarterly is on
+                        # (cik, concept_id, reporting_period.fiscal_year, reporting_period.quarter)
+                        # WITHOUT calculated.
+                        unique_query: Dict[str, Any] = {
                             'concept_id': concept_doc['_id'],
                             'cik': company_cik,
+                            'dimension_value': False,
                             'reporting_period.fiscal_year': period_data.fiscal_year,
-                            'calculated': is_calculated
                         }
                         _query_quarter = period_data.reporting_period.get('quarter')
                         if _query_quarter is not None:
-                            query['reporting_period.quarter'] = _query_quarter
+                            unique_query['reporting_period.quarter'] = _query_quarter
+
+                        query = dict(unique_query)
+                        query.pop('dimension_value', None)
+                        query['calculated'] = is_calculated
 
                         period_date = period_data.reporting_period.get('period_date')
 
@@ -945,22 +1283,56 @@ class PeriodBasedFinancialCalculationService:
 
                         # FIX: atomic insert + DuplicateKeyError catch instead of
                         # non-atomic find_one() then insert_one() (race condition source).
+                        # When persist_statement_bundle has already inserted the raw YTD
+                        # row with calculated=False, idx_unique_value raises DuplicateKeyError.
+                        # For cash flow deaccumulation (is_calculated=True), we must update
+                        # that existing row in place with the deaccumulated 3-month value
+                        # and calculated=True.
                         try:
                             self.quarterly_value_repo.collection.insert_one(value_doc_dict)
                             saved_count += 1
                             logger.debug(f"Saved {'calculated' if is_calculated else 'original'} value for {concept}")
                         except DuplicateKeyError:
-                            existing = self.quarterly_value_repo.collection.find_one(query)
-                            if (accession_number and existing
+                            existing = (
+                                self.quarterly_value_repo.collection.find_one(unique_query)
+                                or self.quarterly_value_repo.collection.find_one(query)
+                            )
+                            if is_calculated and _is_cash_flow and existing:
+                                if existing.get('value') != value or existing.get('calculated') is not True:
+                                    update_fields: Dict[str, Any] = {
+                                        'value': value,
+                                        'calculated': True,
+                                    }
+                                    if accession_number and not existing.get('accession_number'):
+                                        update_fields['accession_number'] = accession_number
+                                    if clean_reporting_period.get('period_date') and not (existing.get('reporting_period') or {}).get('period_date'):
+                                        update_fields['reporting_period.period_date'] = clean_reporting_period['period_date']
+                                    self.quarterly_value_repo.collection.update_one(
+                                        {'_id': existing['_id']},
+                                        {'$set': update_fields}
+                                    )
+                                    saved_count += 1
+                                    logger.debug(
+                                        f"Updated cashflow value to deaccumulated {value:,.0f} (calculated=True) for {concept} on {period_date}"
+                                    )
+                                else:
+                                    if accession_number and not existing.get('accession_number'):
+                                        self.quarterly_value_repo.collection.update_one(
+                                            {'_id': existing['_id']},
+                                            {'$set': {'accession_number': accession_number}}
+                                        )
+                                    skipped_exists += 1
+                            elif (accession_number and existing
                                     and not existing.get('accession_number')):
                                 logger.debug(f"Updating existing quarterly value with missing accession_number for {concept} on {period_date}")
                                 self.quarterly_value_repo.collection.update_one(
                                     {'_id': existing['_id']},
                                     {'$set': {'accession_number': accession_number}}
                                 )
+                                skipped_exists += 1
                             else:
                                 logger.debug(f"Value already exists for {concept} on {period_date}, skipping (DuplicateKeyError)")
-                            skipped_exists += 1
+                                skipped_exists += 1
 
                         break  # Exit retry loop on success
                     except Exception as e:

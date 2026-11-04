@@ -64,6 +64,10 @@ class FilingAgentState(TypedDict):
     # write — used by the scraper to defer the --reload delete until the agent
     # has actually decided to write (so a skip can never delete existing data).
     pre_write_hook: NotRequired[Optional[Any]]
+    # Optional callable invoked by the persist node immediately after bundles
+    # are written (before guidance extraction) — used to immediately deaccumulate
+    # quarterly cash-flow statements into 3-month values.
+    post_write_hook: NotRequired[Optional[Any]]
     # True for a --reload: an existing row for the same period is overwritten
     # rather than skipped, so the reload actually replaces the period's values.
     replace_existing: NotRequired[Optional[bool]]

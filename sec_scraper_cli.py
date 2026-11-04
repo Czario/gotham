@@ -615,8 +615,9 @@ class SECDataScraperApp:
         self._reconciliation_db_uri = _mongo_uri
         self._reconciliation_db_name = _database_name
         # Per-company accumulator: company_cik -> list of raw statement dicts
-        # (only cash_flow + income statements; used for deaccumulation)
+        # (only income statements; 10-Q cash_flow statements are deaccumulated immediately)
         self._quarterly_accumulator: Dict[str, List[Dict]] = {}
+        self._cashflow_fy_accumulator: Dict[tuple, Dict[int, Dict]] = {}
 
         # ── P7: agent graphs / audit / durable session ──────────────────────
         self._filing_graph = None      # cached per-filing LangGraph
@@ -652,7 +653,9 @@ class SECDataScraperApp:
     # ------------------------------------------------------------------
 
     def _accumulate_for_quarterly(self, cik: str, statement_doc: dict, filing_doc: dict) -> None:
-        """Append a slim copy of the statement (for quarterly deaccumulation) to the per-company accumulator."""
+        """Append a slim copy of the statement to the per-company accumulator, and immediately
+        deaccumulate 10-Q cash flow statements into 3-month individual figures.
+        """
         stmt_type = statement_doc.get('statement_type', '')
         if stmt_type.lower() not in ('cashflow', 'cash_flow', 'cashflow',
                                       'income', 'income_statements'):
@@ -666,7 +669,77 @@ class SECDataScraperApp:
             'data': statement_doc.get('data', []),
             '_filing_doc': filing_doc,  # carry filing for accession_number lookup
         }
+        form_type = str(
+            (filing_doc or {}).get('form_type')
+            or (filing_doc or {}).get('form')
+            or (entry['reporting_period'] or {}).get('form_type')
+            or ''
+        ).upper()
+        if stmt_type.lower() in ('cashflow', 'cash_flow') and form_type == '10-Q':
+            self._deaccumulate_quarterly_cashflow_immediately(cik, entry)
+            return
         self._quarterly_accumulator.setdefault(cik, []).append(entry)
+
+    def _deaccumulate_quarterly_cashflow_immediately(self, cik: str, entry: dict) -> None:
+        """Immediately deaccumulate a persisted 10-Q cash flow statement into 3-month figures."""
+        quarterly_service = getattr(self, '_quarterly_service', None)
+        if quarterly_service is None:
+            if hasattr(self, '_quarterly_accumulator'):
+                self._quarterly_accumulator.setdefault(cik, []).append(entry)
+            return
+
+        rp = entry.get('reporting_period') or {}
+        fy = rp.get('fiscal_year')
+        q = rp.get('quarter')
+        cf_acc = getattr(self, '_cashflow_fy_accumulator', None)
+        if cf_acc is None:
+            cf_acc = self._cashflow_fy_accumulator = {}
+
+        if isinstance(fy, int) and isinstance(q, int):
+            fy_map = cf_acc.setdefault((cik, fy), {})
+            fy_map[q] = entry
+            stmts_for_fy = [fy_map[k] for k in sorted(fy_map.keys()) if k <= q]
+        else:
+            stmts_for_fy = [entry]
+
+        try:
+            quarterly_service.process_company_from_statements(cik, stmts_for_fy)
+            entry['_already_saved_calculated'] = True
+            from filings_agent.hooks import report_call
+            if q == 1:
+                report_call(f"  [deaccumulate]  ✓ cashflow FY{fy} Q1 (3M)")
+            elif q == 2:
+                report_call(f"  [deaccumulate]  ✓ cashflow FY{fy} Q2 deaccumulated (6M → 3M)")
+            elif q == 3:
+                report_call(f"  [deaccumulate]  ✓ cashflow FY{fy} Q3 deaccumulated (9M → 3M)")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Immediate cashflow deaccumulation failed for {cik} FY{fy} Q{q}: {exc}", exc_info=True)
+
+    def _ensure_skipped_quarterly_cashflow_deaccumulated(self, cik: str, filing: Dict) -> None:
+        """If an already-stored 10-Q still has uncalculated (YTD) cashflow rows and prior
+        quarters are now in the DB, deaccumulate that fiscal year in place."""
+        if (filing.get('form') or filing.get('form_type')) != '10-Q':
+            return
+        quarterly_service = getattr(self, '_quarterly_service', None)
+        cv_col = getattr(self, '_cv_quarterly_col', None)
+        if quarterly_service is None or cv_col is None or not hasattr(quarterly_service, 'deaccumulate_company_cashflow_in_db'):
+            return
+        try:
+            period_filter = self._reload_period_filter(filing, '10-Q') or {}
+            fy = period_filter.get('reporting_period.fiscal_year')
+            if not isinstance(fy, int):
+                return
+            uncalc = cv_col.find_one({
+                'cik': cik,
+                'statement_type': {'$in': ['cashflow', 'cash_flow']},
+                'reporting_period.fiscal_year': fy,
+                'calculated': False,
+                'dimension_value': {'$ne': True},
+            }, projection={'_id': 1})
+            if uncalc:
+                quarterly_service.deaccumulate_company_cashflow_in_db(cik, fiscal_year=fy)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Could not deaccumulate skipped 10-Q for {cik}: {exc}")
 
     def _record_filing_session(
         self,
@@ -1049,8 +1122,12 @@ class SECDataScraperApp:
             logger.info(f"Fetched {len(filings_list)} total filings for company {company_data.get('name', 'Unknown')} {_range_desc}")
             
             # Apply fiscal year/quarter filtering if specified
+            all_filings_for_company = list(filings_list)
             if self.target_fiscal_year or self.target_fiscal_quarter:
                 filings_list = self._filter_filings_by_fiscal_period(filings_list, company_data)
+                filings_list = self._ensure_prior_quarters_for_cashflow(
+                    cik, filings_list, all_filings_for_company, company_data
+                )
                 logger.info(f"After fiscal year/quarter filtering: {len(filings_list)} filings")
             
             # Update company name for logging
@@ -1090,6 +1167,10 @@ class SECDataScraperApp:
                 filing_date = latest_filing.get('filingDate', '')
                 logger.info(f"📅 LATEST MODE: Selected most recent {form_type} filed {filing_date}")
                 target_filings = [latest_filing]
+            elif len(target_filings) > 1:
+                target_filings = self._sort_filings_by_fy_desc_quarter_asc(
+                    target_filings, company_data, all_filings_for_company
+                )
             
             # Get ticker for logging
             ticker = self.sec_client.get_ticker_from_cik(cik)
@@ -1146,6 +1227,7 @@ class SECDataScraperApp:
                     filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} ⬇")
                     existing_filing = self._find_existing_filing(cik, filing)
                     if existing_filing:
+                        self._ensure_skipped_quarterly_cashflow_deaccumulated(cik, filing)
                         _period_label = self._format_filing_period(filing, self.current_company_data)
                         self.progress.status(
                             f"  [skip]   {_period_label:<12} {accession_number or filing_date}  already stored"
@@ -1863,6 +1945,155 @@ class SECDataScraperApp:
             
         return filtered_filings
 
+    def _ensure_prior_quarters_for_cashflow(
+        self,
+        cik: str,
+        filtered_filings: List[Dict],
+        all_filings: List[Dict],
+        company_data: Dict,
+    ) -> List[Dict]:
+        """Ensure prior quarters (Q1 for Q2; Q1 & Q2 for Q3) exist when extracting Q2/Q3 cashflow.
+
+        When a user requests a single quarter (e.g. ``--quarter Q2`` or ``--quarter Q3``)
+        and cash flow is included (``target_statement in (None, 'cashflow')``), 10-Q cash
+        flow statements report 6-month (Q2) or 9-month (Q3) YTD figures. If the prior
+        quarter(s) of that fiscal year are already in ``concept_values_quarterly``,
+        ``PeriodBasedFinancialCalculationService`` loads them directly from MongoDB.
+        If a prior quarter is completely missing from ``concept_values_quarterly``,
+        this helper prepends that prior quarter's 10-Q filing from ``all_filings`` so
+        deaccumulation always has the required prior quarter(s).
+        """
+        target_stmt = getattr(self, 'target_statement', None)
+        if target_stmt not in (None, 'cashflow'):
+            return filtered_filings
+        if not self.target_fiscal_year or self.target_fiscal_quarter not in ('Q2', 'Q3'):
+            return filtered_filings
+
+        cv_col = getattr(self, '_cv_quarterly_col', None)
+        if cv_col is None:
+            return filtered_filings
+
+        fiscal_year_end_code = self._get_authoritative_fiscal_year_end(company_data)
+        fiscal_year_conv = self._get_authoritative_fiscal_year_convention(company_data)
+        if not fiscal_year_end_code:
+            return filtered_filings
+
+        target_q = 2 if self.target_fiscal_quarter == 'Q2' else 3
+        missing_quarters = []
+        for q in range(1, target_q):
+            try:
+                existing_cf = cv_col.find_one({
+                    'cik': cik,
+                    'statement_type': {'$in': ['cashflow', 'cash_flow']},
+                    'reporting_period.fiscal_year': self.target_fiscal_year,
+                    'reporting_period.quarter': q,
+                })
+            except Exception:
+                existing_cf = True
+            if not existing_cf:
+                missing_quarters.append(q)
+
+        if not missing_quarters:
+            return filtered_filings
+
+        from utilities.helpers.period_utils import FiscalYearCalculator
+
+        prior_by_q: Dict[int, Dict] = {}
+        for filing in all_filings:
+            if filing.get('form') != '10-Q' or not filing.get('reportDate'):
+                continue
+            try:
+                report_end_date = datetime.strptime(filing['reportDate'], '%Y-%m-%d')
+                fy, q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                    report_end_date, fiscal_year_end_code, fiscal_year_convention=fiscal_year_conv
+                )
+                if fy == self.target_fiscal_year and q in missing_quarters and q not in prior_by_q:
+                    prior_by_q[q] = filing
+            except (ValueError, TypeError):
+                continue
+
+        if not prior_by_q:
+            return filtered_filings
+
+        prepended = [prior_by_q[q] for q in sorted(prior_by_q.keys())]
+        existing_acc = {f.get('accessionNumber') for f in filtered_filings if f.get('accessionNumber')}
+        prepended = [f for f in prepended if f.get('accessionNumber') not in existing_acc]
+        if prepended:
+            logger.info(
+                f"Prepending {len(prepended)} prior quarter 10-Q filing(s) (Q{sorted(prior_by_q.keys())}) "
+                f"for FY{self.target_fiscal_year} cashflow deaccumulation"
+            )
+            return prepended + list(filtered_filings)
+        return filtered_filings
+
+    def _sort_filings_by_fy_desc_quarter_asc(
+        self,
+        filings: List[Dict],
+        company_data: Optional[Dict] = None,
+        all_filings: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """Sort filings by fiscal year descending, and within each fiscal year by
+        period ascending: Q1 -> Q2 -> Q3 -> Annual (10-K / 20-F -> 20-F/A).
+
+        Ensures that for every fiscal year (e.g. FY2026, then FY2025, FY2024...),
+        Q1 is processed first, then Q2, then Q3, then Annual, so immediate cash flow
+        deaccumulation always has Q1 before Q2 and Q1+Q2 before Q3.
+        """
+        if len(filings) <= 1:
+            return filings
+
+        from utilities.helpers.period_utils import FiscalYearCalculator
+
+        company = company_data or self.current_company_data or {}
+        fiscal_year_end_code = self._get_authoritative_fiscal_year_end(company)
+        fiscal_year_conv = self._get_authoritative_fiscal_year_convention(company)
+
+        # Fallback if company is not yet in DB: infer MMDD from most recent annual reportDate
+        if not fiscal_year_end_code:
+            for cand in (all_filings or filings):
+                if is_annual_form(cand.get('form') or cand.get('form_type')):
+                    rd = str(cand.get('reportDate') or cand.get('report_date') or '')[:10]
+                    if len(rd) == 10 and rd[4] == '-' and rd[7] == '-':
+                        mmdd = rd[5:7] + rd[8:10]
+                        if mmdd.isdigit():
+                            fiscal_year_end_code = mmdd
+                            break
+        if not fiscal_year_end_code:
+            fiscal_year_end_code = str(company.get('fiscalYearEnd') or '1231')
+
+        def _sort_key(filing: Dict) -> tuple:
+            form_type = str(filing.get('form') or filing.get('form_type') or '').strip().upper()
+            report_date_str = str(filing.get('reportDate') or filing.get('report_date') or '')[:10]
+            filing_date_str = str(filing.get('filingDate') or filing.get('filing_date') or '')[:10]
+
+            fiscal_year: Optional[int] = None
+            quarter: Optional[int] = None
+            if report_date_str:
+                try:
+                    report_end_date = datetime.strptime(report_date_str, '%Y-%m-%d')
+                    fiscal_year, quarter = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                        report_end_date, fiscal_year_end_code, fiscal_year_convention=fiscal_year_conv
+                    )
+                except (ValueError, TypeError):
+                    pass
+
+            if fiscal_year is None:
+                year_str = (report_date_str or filing_date_str)[:4]
+                fiscal_year = int(year_str) if year_str.isdigit() else 0
+
+            if form_type == '10-Q':
+                period_order = quarter if quarter in (1, 2, 3, 4) else 1
+            elif form_type in ('20-F/A', '10-K/A'):
+                period_order = 5
+            elif is_annual_form(form_type):
+                period_order = 4
+            else:
+                period_order = 6
+
+            return (-fiscal_year, period_order, report_date_str, filing_date_str)
+
+        return sorted(filings, key=_sort_key)
+
     @safe_processing_operation("filing_processing", default_return=False)
     def process_filing_with_full_data(self, cik: str, filing_info: Dict) -> bool:
         """
@@ -2207,6 +2438,28 @@ class SECDataScraperApp:
                         lambda c=cik, f=filing_info: self._delete_reload_data(c, f)
                     )
                     agent_state['replace_existing'] = True
+
+                post_write_accumulated = False
+
+                def _on_post_write(bundles_written, skipped_types):
+                    nonlocal post_write_accumulated
+                    post_write_accumulated = True
+                    by_type = {
+                        getattr(b, 'statement_type', None): b
+                        for b in (bundles_written or [])
+                        if getattr(b, 'statement_type', None)
+                    }
+                    skipped_set = set(skipped_types or [])
+                    for st_type, st_doc in prepared_statements:
+                        if st_type in skipped_set:
+                            continue
+                        b_obj = by_type.get(st_type)
+                        if b_obj is not None and isinstance(getattr(b_obj, 'concepts', None), list):
+                            st_doc = dict(st_doc)
+                            st_doc['data'] = b_obj.concepts
+                        self._accumulate_for_quarterly(cik, st_doc, filing_doc_for_norm)
+
+                agent_state['post_write_hook'] = _on_post_write
                 final_state = self._build_filing_agent_graph().invoke(agent_state)
 
                 if final_state.get('status') != 'saved':
@@ -2244,9 +2497,23 @@ class SECDataScraperApp:
 
                 # Accumulate only after the agent confirms the statements were
                 # persisted; the quarterly pass must never consume rejected
-                # bundles.
+                # bundles, and should use the post-agent bundle concepts (with
+                # sign fixes and concept promotions applied) when available.
+                persisted_bundles_by_type = {
+                    getattr(b, 'statement_type', None): b
+                    for b in (final_state.get('bundles') or [])
+                    if getattr(b, 'statement_type', None)
+                }
+                skipped_stmt_types = set(receipt.get('statements_skipped') or [])
                 for statement_type, statement_doc in prepared_statements:
-                    self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
+                    if statement_type in skipped_stmt_types:
+                        continue
+                    if not post_write_accumulated:
+                        bundle = persisted_bundles_by_type.get(statement_type)
+                        if bundle is not None and isinstance(getattr(bundle, 'concepts', None), list):
+                            statement_doc = dict(statement_doc)
+                            statement_doc['data'] = bundle.concepts
+                        self._accumulate_for_quarterly(cik, statement_doc, filing_doc_for_norm)
                     self._log_period_information(statement_type, reporting_period)
                     logger.info(f"✅ Agent persisted {statement_type} statement into normalize_data")
             except Exception as agent_err:

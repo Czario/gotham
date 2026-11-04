@@ -258,6 +258,13 @@ def make_persist_node(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("persist: could not update hierarchy seed metadata: %s", exc)
 
+        post_write_hook = state.get("post_write_hook")
+        if callable(post_write_hook):
+            try:
+                post_write_hook(bundles, skipped_statements)
+            except Exception as exc:  # noqa: BLE001 — never fail persist over post-write hook
+                logger.warning("persist: post-write hook failed: %s", exc, exc_info=True)
+
         logger.info(
             "persist: wrote %d/%d statement(s) for CIK %s %s (action=%s, by %s)",
             written,
