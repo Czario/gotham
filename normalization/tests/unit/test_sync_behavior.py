@@ -71,10 +71,13 @@ class TestSyncBehavior:
         
         # Mock the value repository
         mock_value_repo = Mock()
-        mock_value_repo.collection.find_one.return_value = {
+        # Dedup now uses the repository finder (the DB unique index key):
+        # (cik, concept_id, fiscal_year[, quarter]).
+        mock_value_repo.find_existing_value.return_value = {
             '_id': ObjectId(),
             'concept_id': ObjectId(),
             'value': 1000000,
+            'accession_number': 'old-acc',
             'reporting_period': {'fiscal_year': 2023, 'period_date': '2023-12-31'}
         }
         mocker.patch.object(service, '_get_value_repo_by_form_type', return_value=mock_value_repo)
@@ -103,10 +106,9 @@ class TestSyncBehavior:
             is_calculated=False
         )
         
-        # Verify
-        # Should check for existing value
-        mock_value_repo.collection.find_one.assert_called_once()
-        # Should NOT insert (because value exists)
+        # Verify: dedup runs through the repository finder (the DB unique-index
+        # key) and nothing is inserted because the period already exists.
+        mock_value_repo.find_existing_value.assert_called_once()
         mock_value_repo.collection.insert_one.assert_not_called()
     
     
@@ -121,9 +123,10 @@ class TestSyncBehavior:
         config.database = Mock()
         service = FinancialNormalizationService(config)
         
-        # Mock the value repository - return None to simulate value not exists
+        # Mock the value repository: the index-aligned finder reports no row
+        # for this period, so the value is inserted.
         mock_value_repo = Mock()
-        mock_value_repo.collection.find_one.return_value = None
+        mock_value_repo.find_existing_value.return_value = None
         mock_value_repo.collection.insert_one.return_value = Mock()
         mocker.patch.object(service, '_get_value_repo_by_form_type', return_value=mock_value_repo)
         
@@ -151,10 +154,8 @@ class TestSyncBehavior:
             is_calculated=False
         )
         
-        # Verify
-        # Should check for existing value
-        mock_value_repo.collection.find_one.assert_called_once()
-        # Should insert (because value doesn't exist)
+        # Verify: the finder reports no row for this period, so we insert.
+        mock_value_repo.find_existing_value.assert_called_once()
         mock_value_repo.collection.insert_one.assert_called_once()
     
     

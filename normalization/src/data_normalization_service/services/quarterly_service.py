@@ -1095,6 +1095,11 @@ class PeriodBasedFinancialCalculationService:
         if cache_key in self._canonical_period_date_cache:
             return self._canonical_period_date_cache[cache_key]
         
+        # When extracting from a filing, the filing's report/period date has priority
+        if default_period_date:
+            self._canonical_period_date_cache[cache_key] = default_period_date
+            return default_period_date
+
         # Query existing values for this fiscal period
         existing_values = list(self.quarterly_value_repo.collection.find(
             {
@@ -1297,41 +1302,45 @@ class PeriodBasedFinancialCalculationService:
                                 self.quarterly_value_repo.collection.find_one(unique_query)
                                 or self.quarterly_value_repo.collection.find_one(query)
                             )
-                            if is_calculated and _is_cash_flow and existing:
-                                if existing.get('value') != value or existing.get('calculated') is not True:
-                                    update_fields: Dict[str, Any] = {
-                                        'value': value,
-                                        'calculated': True,
-                                    }
-                                    if accession_number and not existing.get('accession_number'):
-                                        update_fields['accession_number'] = accession_number
-                                    if clean_reporting_period.get('period_date') and not (existing.get('reporting_period') or {}).get('period_date'):
-                                        update_fields['reporting_period.period_date'] = clean_reporting_period['period_date']
-                                    self.quarterly_value_repo.collection.update_one(
-                                        {'_id': existing['_id']},
-                                        {'$set': update_fields}
+                            if existing:
+                                existing_val = existing.get('value')
+                                try:
+                                    val_differs = (
+                                        existing_val is None
+                                        or (value is not None and abs(float(existing_val) - float(value)) > max(abs(float(value)) * 1e-6, 1.0))
                                     )
-                                    saved_count += 1
-                                    logger.debug(
-                                        f"Updated cashflow value to deaccumulated {value:,.0f} (calculated=True) for {concept} on {period_date}"
-                                    )
-                                else:
-                                    if accession_number and not existing.get('accession_number'):
-                                        self.quarterly_value_repo.collection.update_one(
-                                            {'_id': existing['_id']},
-                                            {'$set': {'accession_number': accession_number}}
-                                        )
-                                    skipped_exists += 1
-                            elif (accession_number and existing
-                                    and not existing.get('accession_number')):
-                                logger.debug(f"Updating existing quarterly value with missing accession_number for {concept} on {period_date}")
+                                except (TypeError, ValueError):
+                                    val_differs = existing_val != value
+
+                                update_fields: Dict[str, Any] = {
+                                    'reporting_period': clean_reporting_period,
+                                }
+                                if value is not None:
+                                    update_fields['value'] = value
+                                if is_calculated:
+                                    update_fields['calculated'] = True
+                                if accession_number:
+                                    update_fields['accession_number'] = accession_number
+                                if statement_type:
+                                    update_fields['statement_type'] = statement_type
+
+                                if val_differs and existing_val is not None and value is not None:
+                                    update_fields['corrected_from'] = existing_val
+                                    update_fields['corrected_at'] = datetime.utcnow()
+
+                                update_op: Dict[str, Any] = {'$set': update_fields}
+                                if 'earning_data' in existing:
+                                    update_op['$unset'] = {'earning_data': ''}
+
                                 self.quarterly_value_repo.collection.update_one(
                                     {'_id': existing['_id']},
-                                    {'$set': {'accession_number': accession_number}}
+                                    update_op,
                                 )
-                                skipped_exists += 1
+                                saved_count += 1
+                                logger.debug(
+                                    f"Upserted quarterly value for {concept} on {clean_reporting_period.get('period_date')}"
+                                )
                             else:
-                                logger.debug(f"Value already exists for {concept} on {period_date}, skipping (DuplicateKeyError)")
                                 skipped_exists += 1
 
                         break  # Exit retry loop on success
@@ -1341,6 +1350,28 @@ class PeriodBasedFinancialCalculationService:
                             raise
 
             logger.info(f"Saved {saved_count} values for period {period_data.period_date} (skipped {skipped_no_concept} no concept, {skipped_exists} existing)")
+
+            # Align any remaining rows in the quarter to canonical period date
+            quarter = period_data.reporting_period.get('quarter') if hasattr(period_data.reporting_period, 'get') else None
+            canon_date = clean_reporting_period.get('period_date') if 'clean_reporting_period' in locals() else None
+            canon_end = clean_reporting_period.get('end_date') if 'clean_reporting_period' in locals() else None
+            if period_data.fiscal_year and quarter and canon_date:
+                align_query = {
+                    'cik': company_cik,
+                    'reporting_period.fiscal_year': period_data.fiscal_year,
+                    'reporting_period.quarter': quarter,
+                    'reporting_period.period_date': {'$ne': canon_date},
+                }
+                align_set = {'reporting_period.period_date': canon_date}
+                if canon_end:
+                    align_set['reporting_period.end_date'] = canon_end
+                self.quarterly_value_repo.collection.update_many(
+                    align_query,
+                    {
+                        '$set': align_set,
+                        '$unset': {'reporting_period.start_date': ''},
+                    }
+                )
 
             # Only warn when values were genuinely lost (concept lookup failed).
             # saved_count == 0 with everything in skipped_exists is normal on reruns/reload

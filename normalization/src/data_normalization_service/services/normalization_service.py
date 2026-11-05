@@ -833,7 +833,72 @@ class FinancialNormalizationService:
                 [f["concept"] for f in self.last_write_failures][:10],
             )
 
+        # Align dates across the fiscal period so older/divergent rows in the DB
+        # (e.g. from earnings releases with off-by-one dates) do not produce split columns.
+        rp = statement.reporting_period or {}
+        fy = rp.get('fiscal_year')
+        pd = rp.get('period_date')
+        ed = rp.get('end_date')
+        q = rp.get('quarter') if not _is_annual_form_type(filing.form_type) else None
+        if fy and pd:
+            self._align_period_dates_for_fiscal_period(
+                company_cik=statement.company_cik,
+                fiscal_year=fy,
+                quarter=q,
+                canonical_period_date=pd,
+                canonical_end_date=ed,
+                form_type=filing.form_type,
+            )
+
         return True
+
+    def _align_period_dates_for_fiscal_period(
+        self,
+        company_cik: str,
+        fiscal_year: int,
+        quarter: Optional[int],
+        canonical_period_date: str,
+        canonical_end_date: Any,
+        form_type: str = '10-Q',
+    ) -> None:
+        """Align all existing records for this fiscal period to the canonical filing period date.
+
+        When a filing is processed, its period_date and end_date are canonical. Any pre-existing
+        records for the same company and fiscal period (e.g. from earnings releases with slightly
+        different dates) must be aligned to the canonical period date and end date so that
+        duplicate/split period columns (such as '2026-06-28 FY2026 (Q3)' vs '2026-06-27 FY2026 (Q3)')
+        do not appear.
+        """
+        value_repo = self._get_value_repo_by_form_type(form_type)
+        query: Dict[str, Any] = {
+            'cik': company_cik,
+            'reporting_period.fiscal_year': fiscal_year,
+            'reporting_period.period_date': {'$ne': canonical_period_date},
+        }
+        if quarter is not None:
+            query['reporting_period.quarter'] = quarter
+
+        update_set: Dict[str, Any] = {
+            'reporting_period.period_date': canonical_period_date,
+        }
+        if canonical_end_date:
+            update_set['reporting_period.end_date'] = canonical_end_date
+
+        try:
+            res = value_repo.collection.update_many(
+                query,
+                {
+                    '$set': update_set,
+                    '$unset': {'reporting_period.start_date': ''},
+                },
+            )
+            if res.modified_count > 0:
+                logger.info(
+                    "Aligned %d existing record(s) for %s FY%s Q%s to canonical period date %s",
+                    res.modified_count, company_cik, fiscal_year, quarter, canonical_period_date,
+                )
+        except Exception as exc:
+            logger.warning("Failed to align period dates for %s FY%s Q%s: %s", company_cik, fiscal_year, quarter, exc)
 
     def normalize_statement_in_memory(
         self,
@@ -1546,132 +1611,69 @@ class FinancialNormalizationService:
         )
         
         if existing_value:
-            # A repaired bundle is explicitly allowed to update the existing
-            # period value. Ordinary reprocessing remains insert/skip-only.
+            # When there is existing data in any quarter, priority is ALWAYS given to the
+            # extracted document from the filing. Properly update dates, values, accession numbers,
+            # and all other fields as extracted.
+            existing_val = existing_value.get('value')
+            try:
+                val_differs = existing_val is None or abs(
+                    float(existing_val) - float(value)
+                ) > max(abs(float(value)) * 1e-6, 1.0)
+            except (TypeError, ValueError):
+                val_differs = existing_val != value
+
+            update_fields: Dict[str, Any] = {
+                'value': value,
+                'reporting_period': clean_reporting_period,
+                'calculated': is_calculated,
+            }
+            if filing.accession_number:
+                update_fields['accession_number'] = filing.accession_number
+            if filing.form_type:
+                update_fields['form_type'] = filing.form_type
+            if statement.statement_type:
+                update_fields['statement_type'] = statement.statement_type
+            if item.get('source'):
+                update_fields['source'] = item.get('source')
+            if item.get('fact_id'):
+                update_fields['fact_id'] = item.get('fact_id')
+            if item.get('decimals') is not None:
+                update_fields['decimals'] = item.get('decimals')
+
+            if val_differs and existing_val is not None:
+                update_fields['corrected_from'] = existing_val
+                update_fields['corrected_at'] = datetime.utcnow()
+
             if item.get('repaired'):
-                repair_fields = {
-                    'value': value,
-                    'source': item.get('source', 'deterministic_identity'),
-                    'corrected_from': item.get('corrected_from'),
-                    'correction_reason': item.get('correction_reason'),
-                    'correction_source': item.get('correction_source', item.get('source')),
-                    'corrected_at': datetime.utcnow(),
-                }
-                if filing.accession_number and not existing_value.get('accession_number'):
-                    repair_fields['accession_number'] = filing.accession_number
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']},
-                    {'$set': repair_fields}
-                )
+                update_fields['source'] = item.get('source', 'deterministic_identity')
+                if item.get('corrected_from') is not None:
+                    update_fields['corrected_from'] = item.get('corrected_from')
+                if item.get('correction_reason'):
+                    update_fields['correction_reason'] = item.get('correction_reason')
+                if item.get('correction_source') or item.get('source'):
+                    update_fields['correction_source'] = item.get('correction_source', item.get('source'))
+                update_fields['corrected_at'] = datetime.utcnow()
+
+            update_op: Dict[str, Any] = {'$set': update_fields}
+            if 'earning_data' in existing_value:
+                update_op['$unset'] = {'earning_data': ''}
+
+            value_repo.collection.update_one(
+                {'_id': existing_value['_id']},
+                update_op,
+            )
+            if val_differs:
                 logger.info(
-                    "Updated repaired value for concept %s: %s -> %s",
-                    concept_id, item.get('corrected_from'), value,
-                )
-            # --reload: non-destructive upsert.
-            # If the value is already correct, preserve it and fill any missing gaps in the document.
-            # If the value differs, update/correct the incorrect value and refresh metadata.
-            elif replace_existing:
-                existing_val = existing_value.get('value')
-                try:
-                    val_differs = existing_val is None or abs(
-                        float(existing_val) - float(value)
-                    ) > max(abs(float(value)) * 1e-6, 1.0)
-                except (TypeError, ValueError):
-                    val_differs = existing_val != value
-
-                if val_differs:
-                    # Incorrect value: correct it in-place
-                    correct_fields = {
-                        'value': value,
-                        'reporting_period': clean_reporting_period,
-                        'source': item.get('source'),
-                        'calculated': is_calculated,
-                        'fact_id': item.get('fact_id'),
-                        'decimals': item.get('decimals'),
-                        'form_type': filing.form_type,
-                    }
-                    if filing.accession_number:
-                        correct_fields['accession_number'] = filing.accession_number
-                    if existing_val is not None:
-                        correct_fields['corrected_from'] = existing_val
-                        correct_fields['corrected_at'] = datetime.utcnow()
-                    value_repo.collection.update_one(
-                        {'_id': existing_value['_id']},
-                        {'$set': {k: v for k, v in correct_fields.items() if v is not None}},
-                    )
-                    logger.info(
-                        "Reload: corrected value for concept %s: %s -> %s (period %s)",
-                        concept_id, existing_val, value, clean_reporting_period.get('period_date', 'unknown'),
-                    )
-                else:
-                    # Value already correct: preserve it and fill any missing gaps in the doc
-                    gap_fields = {}
-                    if filing.accession_number and not existing_value.get('accession_number'):
-                        gap_fields['accession_number'] = filing.accession_number
-                    if item.get('decimals') is not None and existing_value.get('decimals') is None:
-                        gap_fields['decimals'] = item.get('decimals')
-                    if item.get('fact_id') and not existing_value.get('fact_id'):
-                        gap_fields['fact_id'] = item.get('fact_id')
-                    if item.get('source') and not existing_value.get('source'):
-                        gap_fields['source'] = item.get('source')
-                    if filing.form_type and not existing_value.get('form_type'):
-                        gap_fields['form_type'] = filing.form_type
-                    if statement.statement_type and not existing_value.get('statement_type'):
-                        gap_fields['statement_type'] = statement.statement_type
-
-                    existing_rp = existing_value.get('reporting_period') or {}
-                    for k, v in clean_reporting_period.items():
-                        if k not in existing_rp and v is not None:
-                            gap_fields[f'reporting_period.{k}'] = v
-
-                    if gap_fields:
-                        value_repo.collection.update_one(
-                            {'_id': existing_value['_id']},
-                            {'$set': gap_fields},
-                        )
-                        logger.info(
-                            "Reload: concept %s already correct; filled missing gap(s) %s",
-                            concept_id, list(gap_fields.keys()),
-                        )
-                    else:
-                        logger.debug(
-                            "Reload: concept %s already correct, no missing gaps",
-                            concept_id,
-                        )
-            # If value exists but is missing accession_number, update it
-            elif filing.accession_number and not existing_value.get('accession_number'):
-                logger.debug(f"Updating existing value with missing accession_number for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']},
-                    {'$set': {'accession_number': filing.accession_number}}
+                    "Upsert: corrected value for concept %s: %s -> %s (period %s, accession %s)",
+                    concept_id, existing_val, value, clean_reporting_period.get('period_date', 'unknown'),
+                    filing.accession_number,
                 )
             else:
-                # The DB keeps ONE value per concept per period by design.  If a
-                # second fact for the same period carries a materially different
-                # value (e.g. a beginning- vs end-of-period instant that mapped
-                # to the same period), say so loudly instead of dropping it
-                # silently.
-                existing_val = existing_value.get('value')
-                try:
-                    differs = existing_val is not None and abs(
-                        float(existing_val) - float(value)
-                    ) > max(abs(float(value)) * 1e-6, 1.0)
-                except (TypeError, ValueError):
-                    differs = existing_val != value
-                if differs:
-                    logger.warning(
-                        "Same-period value differs for concept %s (period %s): "
-                        "stored=%s new=%s (item period=%s) — keeping stored "
-                        "(one value per concept per period by design)",
-                        concept_id,
-                        clean_reporting_period.get('period_date', 'unknown'),
-                        existing_val, value, item.get('period'),
-                    )
-                else:
-                    logger.debug(
-                        f"Value already exists for concept {concept_id}, period "
-                        f"{clean_reporting_period.get('period_date', 'unknown')}, skipping insertion"
-                    )
+                logger.debug(
+                    "Upsert: updated dates/accession/metadata for concept %s (period %s, accession %s)",
+                    concept_id, clean_reporting_period.get('period_date', 'unknown'),
+                    filing.accession_number,
+                )
             return existing_value['_id']
         
         # Extract metadata from metadata-only dimensional facts
@@ -1705,8 +1707,26 @@ class FinancialNormalizationService:
             })
         
         # Insert the value (only new data)
-        insert_result = value_repo.collection.insert_one(value_doc_dict)
-        logger.debug(f"Inserted new value for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
+        try:
+            insert_result = value_repo.collection.insert_one(value_doc_dict)
+            logger.debug(f"Inserted new value for concept {concept_id}, period {clean_reporting_period.get('period_date', 'unknown')}")
+        except DuplicateKeyError:
+            dup_query: Dict[str, Any] = {
+                'concept_id': concept_id,
+                'cik': statement.company_cik,
+                'reporting_period.fiscal_year': clean_reporting_period.get('fiscal_year'),
+            }
+            if clean_reporting_period.get('quarter') is not None:
+                dup_query['reporting_period.quarter'] = clean_reporting_period['quarter']
+            dup_update: Dict[str, Any] = {'$set': value_doc_dict}
+            dup_update['$unset'] = {'earning_data': ''}
+            value_repo.collection.update_one(dup_query, dup_update)
+            logger.info(
+                "Upsert (DuplicateKeyError): updated value for concept %s (period %s, accession %s)",
+                concept_id, clean_reporting_period.get('period_date', 'unknown'), filing.accession_number,
+            )
+            existing_doc = value_repo.collection.find_one(dup_query)
+            return existing_doc['_id'] if existing_doc else None
         
         # Validate critical data preservation
         if item.get('fact_id') and not value_doc.fact_id:
@@ -2242,15 +2262,39 @@ class FinancialNormalizationService:
         existing_value = value_repo.collection.find_one(existing_query)
         
         if existing_value:
-            # If value exists but is missing accession_number, update it
-            if filing.accession_number and not existing_value.get('accession_number'):
-                logger.debug(f"Updating existing normalized cashflow value with missing accession_number for concept {concept_id}, Q{quarter} {fiscal_year}")
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']},
-                    {'$set': {'accession_number': filing.accession_number}}
-                )
-            else:
-                logger.debug(f"Normalized cashflow value already exists for concept {concept_id}, Q{quarter} {fiscal_year}, skipping insertion")
+            update_fields: Dict[str, Any] = {
+                'value': value,
+                'reporting_period': reporting_period,
+                'calculated': is_calculated,
+            }
+            if filing.accession_number:
+                update_fields['accession_number'] = filing.accession_number
+            if filing.form_type:
+                update_fields['form_type'] = filing.form_type
+            if statement.statement_type:
+                update_fields['statement_type'] = statement.statement_type
+
+            existing_val = existing_value.get('value')
+            try:
+                val_differs = existing_val is None or abs(
+                    float(existing_val) - float(value)
+                ) > max(abs(float(value)) * 1e-6, 1.0)
+            except (TypeError, ValueError):
+                val_differs = existing_val != value
+
+            if val_differs and existing_val is not None:
+                update_fields['corrected_from'] = existing_val
+                update_fields['corrected_at'] = datetime.utcnow()
+
+            update_op: Dict[str, Any] = {'$set': update_fields}
+            if 'earning_data' in existing_value:
+                update_op['$unset'] = {'earning_data': ''}
+
+            value_repo.collection.update_one(
+                {'_id': existing_value['_id']},
+                update_op,
+            )
+            logger.debug(f"Upserted normalized cashflow value for concept {concept_id}, Q{quarter} {fiscal_year}")
             return
         
         from ..core.models import ValueDocument
@@ -3162,78 +3206,66 @@ class FinancialNormalizationService:
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
         
         existing_value = value_repo.find_dimensional_existing_value(
-            dimensional_concept_id, clean_reporting_period
+            dimensional_concept_id, clean_reporting_period, company_cik=statement.company_cik
         )
         
         if existing_value:
-            if replace_existing:
-                existing_val = existing_value.get('value')
-                new_val = dimension_data.get('value')
-                try:
-                    val_differs = (
-                        existing_val is None
-                        or (new_val is not None and abs(float(existing_val) - float(new_val)) > max(abs(float(new_val)) * 1e-6, 1.0))
-                    )
-                except (TypeError, ValueError):
-                    val_differs = existing_val != new_val
+            # When there is existing data in any quarter, priority is ALWAYS given to the
+            # extracted document from the filing. Properly update dates, values, accession numbers,
+            # and all other fields as extracted.
+            existing_val = existing_value.get('value')
+            new_val = dimension_data.get('value')
+            try:
+                val_differs = (
+                    existing_val is None
+                    or (new_val is not None and abs(float(existing_val) - float(new_val)) > max(abs(float(new_val)) * 1e-6, 1.0))
+                )
+            except (TypeError, ValueError):
+                val_differs = existing_val != new_val
 
-                if val_differs and new_val is not None:
-                    # Incorrect dimensional value: correct it in-place
-                    replacement = {'form_type': filing.form_type, 'value': new_val}
-                    if dimension_data.get('fact_id') is not None:
-                        replacement['fact_id'] = dimension_data.get('fact_id')
-                    if dimension_data.get('decimals') is not None:
-                        replacement['decimals'] = dimension_data.get('decimals')
-                    if filing.accession_number:
-                        replacement['accession_number'] = filing.accession_number
-                    if existing_val is not None:
-                        replacement['corrected_from'] = existing_val
-                        replacement['corrected_at'] = datetime.utcnow()
-                    value_repo.collection.update_one(
-                        {'_id': existing_value['_id']}, {'$set': replacement}
-                    )
-                    logger.info(
-                        "Reload: corrected dimensional value for %s: %s -> %s",
-                        dimensional_concept_id, existing_val, new_val,
-                    )
-                else:
-                    # Already correct: preserve and fill missing gaps
-                    gap_fields = {}
-                    if filing.accession_number and not existing_value.get('accession_number'):
-                        gap_fields['accession_number'] = filing.accession_number
-                    if dimension_data.get('decimals') is not None and existing_value.get('decimals') is None:
-                        gap_fields['decimals'] = dimension_data.get('decimals')
-                    if dimension_data.get('fact_id') and not existing_value.get('fact_id'):
-                        gap_fields['fact_id'] = dimension_data.get('fact_id')
-                    if filing.form_type and not existing_value.get('form_type'):
-                        gap_fields['form_type'] = filing.form_type
-                    if statement.statement_type and not existing_value.get('statement_type'):
-                        gap_fields['statement_type'] = statement.statement_type
+            replacement: Dict[str, Any] = {
+                'reporting_period': clean_reporting_period,
+                'calculated': False,
+                'dimension_value': True,
+                'dimensional_concept_id': dimensional_concept_id,
+                'concept_id': dimensional_concept_id,
+            }
+            if new_val is not None:
+                replacement['value'] = new_val
+            if filing.form_type:
+                replacement['form_type'] = filing.form_type
+            if statement.statement_type:
+                replacement['statement_type'] = statement.statement_type
+            if filing.accession_number:
+                replacement['accession_number'] = filing.accession_number
+            if dimension_data.get('fact_id') is not None:
+                replacement['fact_id'] = dimension_data.get('fact_id')
+            if dimension_data.get('decimals') is not None:
+                replacement['decimals'] = dimension_data.get('decimals')
 
-                    existing_rp = existing_value.get('reporting_period') or {}
-                    for k, v in clean_reporting_period.items():
-                        if k not in existing_rp and v is not None:
-                            gap_fields[f'reporting_period.{k}'] = v
+            if val_differs and existing_val is not None and new_val is not None:
+                replacement['corrected_from'] = existing_val
+                replacement['corrected_at'] = datetime.utcnow()
 
-                    if gap_fields:
-                        value_repo.collection.update_one(
-                            {'_id': existing_value['_id']}, {'$set': gap_fields}
-                        )
-                        logger.debug(
-                            "Reload: dimensional value %s already correct; filled gap(s) %s",
-                            dimensional_concept_id, list(gap_fields.keys()),
-                        )
-            # If value exists but is missing accession_number, update it
-            elif filing.accession_number and not existing_value.get('accession_number'):
-                logger.debug(f"Updating existing dimensional value with missing accession_number for dimensional_concept_id {dimensional_concept_id}, "
-                            f"period {clean_reporting_period}")
-                value_repo.collection.update_one(
-                    {'_id': existing_value['_id']},
-                    {'$set': {'accession_number': filing.accession_number}}
+            update_op: Dict[str, Any] = {'$set': replacement}
+            if 'earning_data' in existing_value:
+                update_op['$unset'] = {'earning_data': ''}
+
+            value_repo.collection.update_one(
+                {'_id': existing_value['_id']}, update_op
+            )
+            if val_differs:
+                logger.info(
+                    "Upsert: corrected dimensional value for %s: %s -> %s (period %s, accession %s)",
+                    dimensional_concept_id, existing_val, new_val,
+                    clean_reporting_period.get('period_date', 'unknown'), filing.accession_number,
                 )
             else:
-                logger.debug(f"Dimensional value already exists for dimensional_concept_id {dimensional_concept_id}, "
-                            f"period {clean_reporting_period}")
+                logger.debug(
+                    "Upsert: updated dimensional metadata/dates for %s (period %s, accession %s)",
+                    dimensional_concept_id, clean_reporting_period.get('period_date', 'unknown'),
+                    filing.accession_number,
+                )
             return
         
         dimensional_value_doc = ValueDocument(
@@ -3253,5 +3285,21 @@ class FinancialNormalizationService:
         value_doc_dict['calculated'] = False
         if filing.accession_number:
             value_doc_dict['accession_number'] = filing.accession_number
-        value_repo.collection.insert_one(value_doc_dict)
-        logger.debug(f"Created dimensional value: {dimension_data.get('value')} for dimensional_concept_id {dimensional_concept_id}")
+        try:
+            value_repo.collection.insert_one(value_doc_dict)
+            logger.debug(f"Created dimensional value: {dimension_data.get('value')} for dimensional_concept_id {dimensional_concept_id}")
+        except DuplicateKeyError:
+            dup_query: Dict[str, Any] = {
+                'concept_id': dimensional_concept_id,
+                'cik': statement.company_cik,
+                'reporting_period.fiscal_year': clean_reporting_period.get('fiscal_year'),
+            }
+            if clean_reporting_period.get('quarter') is not None:
+                dup_query['reporting_period.quarter'] = clean_reporting_period['quarter']
+            dup_update: Dict[str, Any] = {'$set': value_doc_dict}
+            dup_update['$unset'] = {'earning_data': ''}
+            value_repo.collection.update_one(dup_query, dup_update)
+            logger.info(
+                "Upsert (DuplicateKeyError): updated dimensional value for %s (period %s, accession %s)",
+                dimensional_concept_id, clean_reporting_period.get('period_date', 'unknown'), filing.accession_number,
+            )

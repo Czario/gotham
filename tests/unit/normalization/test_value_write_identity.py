@@ -103,18 +103,29 @@ def test_dedup_finder_ignores_drifting_metadata(service):
     repo.collection.insert_one.assert_not_called()
 
 
-def test_normal_rerun_is_insert_only(service):
+def test_extracted_document_upserts_with_priority_and_updates_dates_and_accession(service):
+    """When a document is extracted from a filing, it always takes priority over existing data,
+    updating dates, values, accession numbers, and all other fields."""
     repo = Mock()
-    # The row already carries an accession, so the only possible branch is the
-    # plain "already exists -> skip" one.
+    existing_id = ObjectId()
     repo.find_existing_value.return_value = {
-        "_id": ObjectId(), "value": 111111.0, "accession_number": "acc-0",
+        "_id": existing_id, "value": 111111.0, "accession_number": "acc-0",
+        "reporting_period": {"fiscal_year": 2026, "quarter": 3, "period_date": "2026-06-28"},
     }
     service._get_value_repo_by_form_type = Mock(return_value=repo)
 
-    service._create_value_record(ObjectId(), _statement(), _filing(), dict(ITEM), 999.0)
+    result = service._create_value_record(ObjectId(), _statement(), _filing(), dict(ITEM), 999.0)
 
-    repo.collection.update_one.assert_not_called()  # ordinary reruns never overwrite
+    assert result == existing_id
+    repo.collection.insert_one.assert_not_called()
+    repo.collection.update_one.assert_called_once()
+    update = repo.collection.update_one.call_args.args[1]["$set"]
+    assert update["value"] == 999.0
+    assert update["reporting_period"]["period_date"] == "2026-06-30"
+    assert update["accession_number"] == "acc-1"
+    assert update["calculated"] is False
+    assert update["corrected_from"] == 111111.0
+    assert "corrected_at" in update
 
 
 def test_reload_replaces_the_existing_period_row(service):
@@ -140,15 +151,16 @@ def test_reload_replaces_the_existing_period_row(service):
     assert "corrected_at" in update
 
 
-def test_reload_preserves_already_correct_value_and_fills_gaps(service):
-    """When a value is already correct, reload preserves the value and fills in missing gaps."""
+def test_extracted_document_updates_dates_and_accession_when_value_same(service):
+    """When a value is already correct, extracted filing still updates dates, accession, and metadata."""
     repo = Mock()
     existing_id = ObjectId()
-    # Existing row already has the correct value 999.0, but missing accession_number, decimals, fact_id
+    # Existing row already has value 999.0, but with older date 2026-06-28 and older accession acc-0
     repo.find_existing_value.return_value = {
         "_id": existing_id,
         "value": 999.0,
-        "reporting_period": {"fiscal_year": 2026, "quarter": 3},
+        "accession_number": "acc-0",
+        "reporting_period": {"fiscal_year": 2026, "quarter": 3, "period_date": "2026-06-28"},
     }
     service._get_value_repo_by_form_type = Mock(return_value=repo)
 
@@ -158,32 +170,33 @@ def test_reload_preserves_already_correct_value_and_fills_gaps(service):
     item_with_gaps["source"] = "as_reported"
 
     result = service._create_value_record(
-        ObjectId(), _statement(), _filing(), item_with_gaps, 999.0, replace_existing=True
+        ObjectId(), _statement(), _filing(), item_with_gaps, 999.0
     )
 
     assert result == existing_id
     repo.collection.insert_one.assert_not_called()
     update = repo.collection.update_one.call_args.args[1]["$set"]
-    # Value is NOT overwritten
-    assert "value" not in update
+    # Value is updated without flagging corrected_from
+    assert update["value"] == 999.0
     assert "corrected_from" not in update
-    # Missing gaps are filled
+    # Dates, accession, and fields are updated from the extracted filing
     assert update["accession_number"] == "acc-1"
     assert update["decimals"] == 2
     assert update["fact_id"] == "fact-abc"
     assert update["source"] == "as_reported"
     assert update["form_type"] == "10-Q"
     assert update["statement_type"] == "income"
-    assert update["reporting_period.period_date"] == "2026-06-30"
+    assert update["reporting_period"]["period_date"] == "2026-06-30"
 
 
-def test_reload_dimensional_value_preserves_correct_and_fills_gaps(service):
+def test_reload_dimensional_value_updates_dates_and_accession(service):
     repo = Mock()
     existing_id = ObjectId()
     repo.find_dimensional_existing_value.return_value = {
         "_id": existing_id,
         "value": 500.0,
-        "reporting_period": {"fiscal_year": 2026, "quarter": 3},
+        "accession_number": "old-acc",
+        "reporting_period": {"fiscal_year": 2026, "quarter": 3, "period_date": "2026-06-28"},
     }
     service._get_value_repo_by_form_type = Mock(return_value=repo)
 
@@ -197,13 +210,14 @@ def test_reload_dimensional_value_preserves_correct_and_fills_gaps(service):
     )
 
     update = repo.collection.update_one.call_args.args[1]["$set"]
-    assert "value" not in update
+    assert update["value"] == 500.0
+    assert "corrected_from" not in update
     assert update["accession_number"] == "acc-1"
     assert update["fact_id"] == "dim-fact-1"
     assert update["decimals"] == 0
     assert update["form_type"] == "10-Q"
     assert update["statement_type"] == "income"
-    assert update["reporting_period.period_date"] == "2026-06-30"
+    assert update["reporting_period"]["period_date"] == "2026-06-30"
 
 
 def test_reload_dimensional_value_corrects_differing_value(service):
@@ -378,10 +392,11 @@ def test_conflicting_period_row_no_longer_crashes(mocker):
                 company_doc={"cik": "0000320193", "name": "Apple Inc."},
             )
 
-        # A) ordinary rerun: no crash, existing row untouched
+        # A) extracted filing bundle: upsert gives priority, properly updating value and dates
         assert service.persist_statement_bundle(bundle()) is True
         assert db["concept_values_quarterly"].count_documents({}) == 1
-        assert db["concept_values_quarterly"].find_one({})["value"] == 111111.0
+        assert db["concept_values_quarterly"].find_one({})["value"] == 999.0
+        assert db["concept_values_quarterly"].find_one({})["reporting_period"]["period_date"] == "2026-06-30"
 
         # B) reload: no crash, the row is REPLACED in place
         assert service.persist_statement_bundle(bundle(), replace_existing=True) is True

@@ -536,18 +536,35 @@ class ValueRepository:
         if dimension_value and dimensional_concept_id is not None:
             query["dimensional_concept_id"] = dimensional_concept_id
 
-        return self.collection.find_one(query)
+        doc = self.collection.find_one(query)
+        if doc is None and not dimension_value:
+            # Fallback: check without dimension_value constraint to match any
+            # legacy document occupying this unique index slot (cik, concept_id, fy, q)
+            fallback_query = dict(query)
+            fallback_query.pop("dimension_value", None)
+            doc = self.collection.find_one(fallback_query)
+        return doc
 
-    def find_dimensional_existing_value(self, dimensional_concept_id: ObjectId, reporting_period: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def find_dimensional_existing_value(
+        self,
+        dimensional_concept_id: ObjectId,
+        reporting_period: Dict[str, Any],
+        company_cik: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Find existing dimensional value to prevent duplicates.
 
-        FIX: same full-subdocument-match bug as find_existing_value above —
-        now matches on fiscal_year + quarter only.
+        Matches on fiscal_year + quarter (and company_cik if provided).
+        Supports matching where the concept is stored in either dimensional_concept_id
+        or concept_id, and with dimension_value True or False (to handle legacy/earnings rows).
         """
         query: Dict[str, Any] = {
-            "dimensional_concept_id": dimensional_concept_id,
-            "dimension_value": True,
+            "$or": [
+                {"dimensional_concept_id": dimensional_concept_id},
+                {"concept_id": dimensional_concept_id},
+            ],
         }
+        if company_cik is not None:
+            query["cik"] = company_cik
         if reporting_period.get("fiscal_year") is not None:
             query["reporting_period.fiscal_year"] = reporting_period["fiscal_year"]
         if reporting_period.get("quarter") is not None:
