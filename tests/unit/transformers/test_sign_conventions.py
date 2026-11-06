@@ -71,3 +71,35 @@ def test_payments_for_other_investing_is_negative_outflow():
         label="Other"
     )
     assert res == -1584000000.0
+
+
+def test_other_noncash_income_expense_is_negative_deduction():
+    """Other non-cash adjustments that subtract from net income are shown in parentheses (negative)."""
+    # Apple Q2 6M raw XBRL fact is positive 1,717M with weight -1.0 -> presentation is -1,717M
+    res_sub = SignConventionHandler.apply_sign_conventions(
+        value=1717000000.0,
+        concept="us-gaap:OtherNoncashIncomeExpense",
+        statement_type="cashflow",
+        calc_weight=-1.0,
+        label="Other"
+    )
+    assert res_sub == -1717000000.0
+
+    # Without explicit weight, default to presentation deduction (-abs(value))
+    res_default = SignConventionHandler.apply_sign_conventions(
+        value=1717000000.0,
+        concept="us-gaap:OtherNoncashIncomeExpense",
+        statement_type="cashflow",
+        label="Other"
+    )
+    assert res_default == -1717000000.0
+
+    # If weight is +1.0 (an add-back), it stays positive
+    res_add = SignConventionHandler.apply_sign_conventions(
+        value=1717000000.0,
+        concept="us-gaap:OtherNoncashIncomeExpense",
+        statement_type="cashflow",
+        calc_weight=1.0,
+        label="Other"
+    )
+    assert res_add == 1717000000.0

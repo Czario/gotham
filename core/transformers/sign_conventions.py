@@ -148,6 +148,12 @@ class SignConventionHandler:
             if 'paymentsforproceedsfromotherinvestingactivities' in local_lower:
                 return -abs(float(value))
 
+            # 4. Other noncash income/expense (shown in parens when subtracted in operating cash flows)
+            if 'othernoncashincomeexpense' in local_lower:
+                if calc_weight is not None and calc_weight == 1.0:
+                    return abs(float(value))
+                return -abs(float(value))
+
             return cls._apply_cash_flow_conventions(value, concept, label)
         
         elif 'balance' in statement_type_lower or 'position' in statement_type_lower:
