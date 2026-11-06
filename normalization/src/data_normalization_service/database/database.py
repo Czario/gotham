@@ -534,7 +534,10 @@ class ValueRepository:
             query["reporting_period.quarter"] = reporting_period["quarter"]
 
         if dimension_value and dimensional_concept_id is not None:
-            query["dimensional_concept_id"] = dimensional_concept_id
+            query["$or"] = [
+                {"concept_id": dimensional_concept_id},
+                {"dimensional_concept_id": dimensional_concept_id},
+            ]
 
         doc = self.collection.find_one(query)
         if doc is None and not dimension_value:
@@ -579,7 +582,13 @@ class ValueRepository:
 
     def find_by_dimensional_concept_id(self, dimensional_concept_id: ObjectId) -> Iterator[Dict[str, Any]]:
         """Find all values for a specific dimensional concept."""
-        cursor = self.collection.find({"dimensional_concept_id": dimensional_concept_id, "dimension_value": True})
+        cursor = self.collection.find({
+            "$or": [
+                {"concept_id": dimensional_concept_id},
+                {"dimensional_concept_id": dimensional_concept_id},
+            ],
+            "dimension_value": True,
+        })
         for doc in cursor:
             yield doc
 

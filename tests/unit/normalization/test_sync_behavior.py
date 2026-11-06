@@ -233,10 +233,14 @@ class TestSyncBehavior:
 
         value_collection.update_one.assert_called_once_with(
             {'_id': old_unique},
-            {'$set': {
-                'concept_id': winner_id,
-                'dimensional_concept_id': winner_id,
-            }},
+            {
+                '$set': {
+                    'concept_id': winner_id,
+                },
+                '$unset': {
+                    'dimensional_concept_id': '',
+                },
+            },
         )
         value_collection.delete_one.assert_called_once_with({'_id': old_collision})
         concept_collection.delete_one.assert_called_once_with({'_id': loser_id})

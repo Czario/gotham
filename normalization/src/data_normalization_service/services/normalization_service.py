@@ -507,6 +507,7 @@ class FinancialNormalizationService:
                 label = dim_data.get('fact_label') or dim_data.get('label') or dim_info.concept.split(':')[-1]
             dimensional_concepts.append({
                 'parent_concept': dim_info.parent_concept,
+                'container_concept': dim_data.get('_container_concept'),
                 'segment_type': dim_info.segment_type,
                 'concept': dim_info.concept,
                 'label': clean_label(label),
@@ -752,16 +753,12 @@ class FinancialNormalizationService:
 
         # PHASE 3: Dimensional concepts
         dimensional_concept_mapping: dict = {}
-        parent_concepts_with_dimensions = {
-            item.get('concept'): True
-            for item in statement.financial_data
-            if item.get('dimensional_facts')
-        }
-
         for dim in bundle.dimensional_concepts:
-            if dim['parent_concept'] not in parent_concepts_with_dimensions:
-                continue
-            parent_concept_id = concept_mapping.get(dim['parent_concept'])
+            parent_concept_name = dim['parent_concept']
+            parent_concept_id = concept_mapping.get(parent_concept_name)
+            if not parent_concept_id and dim.get('container_concept'):
+                parent_concept_id = concept_mapping.get(dim['container_concept'])
+                parent_concept_name = dim['container_concept']
             if parent_concept_id:
                 try:
                     dim_concept_id = self._get_or_create_dimensional_concept(
@@ -775,6 +772,8 @@ class FinancialNormalizationService:
                         parent_header=dim.get('parent_header'),  # NEW: grouping header awareness
                     )
                     dimensional_concept_mapping[(dim['parent_concept'], dim['concept'])] = dim_concept_id
+                    if dim.get('container_concept'):
+                        dimensional_concept_mapping[(dim['container_concept'], dim['concept'])] = dim_concept_id
                 except Exception as e:
                     logger.warning(f"Error creating dimensional concept {dim['concept']}: {e}")
 
@@ -883,6 +882,7 @@ class FinancialNormalizationService:
 
         or_conditions: list[Dict[str, Any]] = [
             {'reporting_period.period_date': {'$ne': canonical_period_date}},
+            {'dimensional_concept_id': {'$exists': True}},
         ]
         if canonical_end_date:
             or_conditions.append({'reporting_period.end_date': {'$ne': canonical_end_date}})
@@ -905,7 +905,10 @@ class FinancialNormalizationService:
                 query,
                 {
                     '$set': update_set,
-                    '$unset': {'reporting_period.start_date': ''},
+                    '$unset': {
+                        'reporting_period.start_date': '',
+                        'dimensional_concept_id': '',
+                    },
                 },
             )
             if res.modified_count > 0:
@@ -2415,7 +2418,28 @@ class FinancialNormalizationService:
                     logger.debug(f"Skipping dimensional fact with unknown segment info: {dimension_data}")
                     continue
                 
-                dimensional_concept_id = dimensional_concept_mapping.get((item['concept'], concept))
+                true_parent = dimension_data.get('concept_name', item['concept'])
+                dimensional_concept_id = (
+                    dimensional_concept_mapping.get((item['concept'], concept))
+                    or dimensional_concept_mapping.get((true_parent, concept))
+                )
+                
+                # Dynamic fallback: ensure all segmentation data across all companies is captured
+                if not dimensional_concept_id:
+                    parent_id = concept_mapping.get(true_parent) or concept_mapping.get(item['concept']) or concept_id
+                    if parent_id:
+                        try:
+                            dimensional_concept_id = self._get_or_create_dimensional_concept(
+                                concept_id=parent_id,
+                                company_cik=statement.company_cik,
+                                statement_type=statement.statement_type,
+                                dimension_data=dimension_data,
+                                form_type=filing.form_type,
+                            )
+                            dimensional_concept_mapping[(item['concept'], concept)] = dimensional_concept_id
+                            dimensional_concept_mapping[(true_parent, concept)] = dimensional_concept_id
+                        except Exception as e:
+                            logger.warning(f"Error dynamically creating dimensional concept {concept} for {item['concept']}: {e}")
                 
                 if dimensional_concept_id:
                     # Only create value record if there's an actual value
@@ -2436,7 +2460,7 @@ class FinancialNormalizationService:
                             logger.debug(f"Found dimensional metadata without value for {item['concept']} -> {concept}: {metadata_fields}")
                         processed_dimensional_count += 1
                 else:
-                    logger.warning(f"Pre-created dimensional concept not found for {item['concept']} -> {concept}")
+                    logger.warning(f"Dimensional concept could not be resolved for {item['concept']} -> {concept}")
             except Exception as e:
                 logger.warning(f"Error processing dimensional data for {item['concept']}: {e}")
         
@@ -2704,10 +2728,14 @@ class FinancialNormalizationService:
                     try:
                         values.update_one(
                             {'_id': value['_id']},
-                            {'$set': {
-                                'concept_id': winner_id,
-                                'dimensional_concept_id': winner_id,
-                            }},
+                            {
+                                '$set': {
+                                    'concept_id': winner_id,
+                                },
+                                '$unset': {
+                                    'dimensional_concept_id': '',
+                                },
+                            },
                         )
                         moved += 1
                     except DuplicateKeyError:
@@ -2766,6 +2794,7 @@ class FinancialNormalizationService:
                         logger.debug(f"Dimensional fact parent mismatch: array container='{item['concept']}', "
                                    f"concept_name='{true_parent_concept}' - using concept_name as true parent")
                         
+                    dimension_data['_container_concept'] = item['concept']
                     dim_info = DimensionalConceptInfo(
                         parent_concept=true_parent_concept,  # Use the explicit parent from concept_name
                         segment_type=segment_type,
@@ -3266,7 +3295,6 @@ class FinancialNormalizationService:
                 'reporting_period': clean_reporting_period,
                 'calculated': False,
                 'dimension_value': True,
-                'dimensional_concept_id': dimensional_concept_id,
                 'concept_id': dimensional_concept_id,
             }
             if new_val is not None:
@@ -3286,9 +3314,13 @@ class FinancialNormalizationService:
                 replacement['corrected_from'] = existing_val
                 replacement['corrected_at'] = datetime.utcnow()
 
-            update_op: Dict[str, Any] = {'$set': replacement}
+            unset_fields: Dict[str, Any] = {'dimensional_concept_id': ''}
             if 'earning_data' in existing_value:
-                update_op['$unset'] = {'earning_data': ''}
+                unset_fields['earning_data'] = ''
+            update_op: Dict[str, Any] = {
+                '$set': replacement,
+                '$unset': unset_fields,
+            }
 
             value_repo.collection.update_one(
                 {'_id': existing_value['_id']}, update_op
@@ -3316,17 +3348,17 @@ class FinancialNormalizationService:
             value=dimension_data.get('value'),
             created_at=statement.created_at,
             dimension_value=True,
-            dimensional_concept_id=dimensional_concept_id,
             accession_number=filing.accession_number,
         )
         
         value_doc_dict = dimensional_value_doc.to_dict()
         value_doc_dict['calculated'] = False
+        value_doc_dict.pop('dimensional_concept_id', None)
         if filing.accession_number:
             value_doc_dict['accession_number'] = filing.accession_number
         try:
             value_repo.collection.insert_one(value_doc_dict)
-            logger.debug(f"Created dimensional value: {dimension_data.get('value')} for dimensional_concept_id {dimensional_concept_id}")
+            logger.debug(f"Created dimensional value: {dimension_data.get('value')} for concept_id {dimensional_concept_id}")
         except DuplicateKeyError:
             dup_query: Dict[str, Any] = {
                 'concept_id': dimensional_concept_id,
@@ -3335,8 +3367,13 @@ class FinancialNormalizationService:
             }
             if clean_reporting_period.get('quarter') is not None:
                 dup_query['reporting_period.quarter'] = clean_reporting_period['quarter']
-            dup_update: Dict[str, Any] = {'$set': value_doc_dict}
-            dup_update['$unset'] = {'earning_data': ''}
+            dup_unset: Dict[str, Any] = {'dimensional_concept_id': ''}
+            if 'earning_data' in value_doc_dict:
+                dup_unset['earning_data'] = ''
+            dup_update: Dict[str, Any] = {
+                '$set': value_doc_dict,
+                '$unset': dup_unset,
+            }
             value_repo.collection.update_one(dup_query, dup_update)
             logger.info(
                 "Upsert (DuplicateKeyError): updated dimensional value for %s (period %s, accession %s)",

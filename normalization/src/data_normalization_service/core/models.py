@@ -189,9 +189,7 @@ class ValueDocument:
         if self.source is not None:
             result["source"] = self.source
 
-        # Add dimensional-specific fields if this is a dimensional value
-        if self.dimension_value and self.dimensional_concept_id is not None:
-            result["dimensional_concept_id"] = self.dimensional_concept_id
+        # Note: dimensional_concept_id is not stored in db value documents (only used for hierarchy)
 
         return result
 
