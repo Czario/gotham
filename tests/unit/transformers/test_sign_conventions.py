@@ -64,13 +64,34 @@ def test_share_based_compensation_is_always_positive_add_back():
 
 
 def test_payments_for_other_investing_is_negative_outflow():
-    res = SignConventionHandler.apply_sign_conventions(
+    # Apple Q2 6M raw XBRL fact is positive 1,584M with weight -1.0 -> presentation is -1,584M
+    res_sub = SignConventionHandler.apply_sign_conventions(
+        value=1584000000.0,
+        concept="us-gaap:PaymentsForProceedsFromOtherInvestingActivities",
+        statement_type="cashflow",
+        calc_weight=-1.0,
+        label="Other"
+    )
+    assert res_sub == -1584000000.0
+
+    # Without explicit weight, default to negative outflow (-abs(value))
+    res_default = SignConventionHandler.apply_sign_conventions(
         value=1584000000.0,
         concept="us-gaap:PaymentsForProceedsFromOtherInvestingActivities",
         statement_type="cashflow",
         label="Other"
     )
-    assert res == -1584000000.0
+    assert res_default == -1584000000.0
+
+    # If weight is +1.0 (an inflow / proceeds), it stays positive
+    res_add = SignConventionHandler.apply_sign_conventions(
+        value=1584000000.0,
+        concept="us-gaap:PaymentsForProceedsFromOtherInvestingActivities",
+        statement_type="cashflow",
+        calc_weight=1.0,
+        label="Other"
+    )
+    assert res_add == 1584000000.0
 
 
 def test_other_noncash_income_expense_is_negative_deduction():

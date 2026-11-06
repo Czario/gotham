@@ -146,6 +146,8 @@ class SignConventionHandler:
             
             # 3. Payments for other investing activities (shown in parens as outflow in filings)
             if 'paymentsforproceedsfromotherinvestingactivities' in local_lower:
+                if calc_weight is not None and calc_weight == 1.0:
+                    return abs(float(value))
                 return -abs(float(value))
 
             # 4. Other noncash income/expense (shown in parens when subtracted in operating cash flows)
@@ -197,7 +199,6 @@ class SignConventionHandler:
         # These concepts report the NET result, so preserve the original sign
         net_change_patterns = [
             'proceedsfrompayments',  # e.g., ProceedsFromPaymentsForOtherFinancingActivities
-            'paymentsforproceeds',   # e.g., PaymentsForProceedsFromOtherInvestingActivities
             'proceedsfromsale',      # Some "proceeds from sale" are actually net of payments
         ]
         
