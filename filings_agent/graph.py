@@ -28,7 +28,6 @@ from .nodes.normalize import make_normalize_node
 from .nodes.persist import make_persist_node
 from .nodes.repair import make_repair_node
 from .nodes.review import make_review_node
-from .nodes.sign_agent import make_sign_agent_node
 from .nodes.validate import make_validate_node
 from .nodes.xbrl_extract import make_xbrl_extract_node
 from .state import FilingAgentState
@@ -114,18 +113,6 @@ def build_filing_graph(
     graph.add_node(
         "normalize_bundle",
         _wrap(make_normalize_node(norm_service), "normalize_bundle_node", decision_chat_llm),
-    )
-
-    # 3b. Sign-convention subagent — runs on every filing, after normalization
-    #     and before validation, so validation/decide/persist all see the house
-    #     signs.  Never touches the database; never blocks a filing.
-    graph.add_node(
-        "sign_fix",
-        _wrap(
-            make_sign_agent_node(chat_llm=decision_chat_llm, on_event=on_event),
-            "sign_fix_node",
-            decision_chat_llm,
-        ),
     )
 
     # 4. Deterministic multi-suite validation node
@@ -236,11 +223,6 @@ def build_filing_graph(
 
     graph.add_conditional_edges(
         "normalize_bundle",
-        _route_after("sign_fix"),
-        {"sign_fix": "sign_fix", "__end__": END},
-    )
-    graph.add_conditional_edges(
-        "sign_fix",
         _route_after("validate"),
         {"validate": "validate", "__end__": END},
     )

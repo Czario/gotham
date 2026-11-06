@@ -1351,20 +1351,32 @@ class PeriodBasedFinancialCalculationService:
 
             logger.info(f"Saved {saved_count} values for period {period_data.period_date} (skipped {skipped_no_concept} no concept, {skipped_exists} existing)")
 
-            # Align any remaining rows in the quarter to canonical period date
+            # Align any remaining rows in the quarter to canonical period date and accession number
             quarter = period_data.reporting_period.get('quarter') if hasattr(period_data.reporting_period, 'get') else None
             canon_date = clean_reporting_period.get('period_date') if 'clean_reporting_period' in locals() else None
             canon_end = clean_reporting_period.get('end_date') if 'clean_reporting_period' in locals() else None
+            canon_acc = (
+                clean_reporting_period.get('accession_number')
+                if 'clean_reporting_period' in locals()
+                else (filing_doc.accession_number if filing_doc else None)
+            )
             if period_data.fiscal_year and quarter and canon_date:
+                align_or: list[Dict[str, Any]] = [{'reporting_period.period_date': {'$ne': canon_date}}]
+                align_set: Dict[str, Any] = {'reporting_period.period_date': canon_date}
+                if canon_end:
+                    align_or.append({'reporting_period.end_date': {'$ne': canon_end}})
+                    align_set['reporting_period.end_date'] = canon_end
+                if canon_acc:
+                    align_or.append({'accession_number': {'$ne': canon_acc}})
+                    align_or.append({'reporting_period.accession_number': {'$exists': True, '$ne': canon_acc}})
+                    align_set['accession_number'] = canon_acc
+
                 align_query = {
                     'cik': company_cik,
                     'reporting_period.fiscal_year': period_data.fiscal_year,
                     'reporting_period.quarter': quarter,
-                    'reporting_period.period_date': {'$ne': canon_date},
+                    '$or': align_or,
                 }
-                align_set = {'reporting_period.period_date': canon_date}
-                if canon_end:
-                    align_set['reporting_period.end_date'] = canon_end
                 self.quarterly_value_repo.collection.update_many(
                     align_query,
                     {

@@ -55,12 +55,7 @@ class TestAppConfig:
         assert config.database.database_name == 'test_target'
     
     @patch.dict(os.environ, {}, clear=True)
-    def test_from_env_missing_vars(self):
-        """Test default values when environment variables are missing."""
-        config = AppConfig.from_env()
-        
-        # Should use default values
-        assert config.database.mongodb_uri == 'mongodb://localhost:27017'
-        assert config.database.source_db_name == ''  # legacy field; empty by default in merged pipeline
-        assert config.database.database_name == 'normalize_data'
-        assert config.log_level == 'INFO'
+    def test_from_env_missing_mongodb_uri(self):
+        """Require MongoDB configuration instead of silently using defaults."""
+        with pytest.raises(RuntimeError, match="MONGODB_URI"):
+            AppConfig.from_env()

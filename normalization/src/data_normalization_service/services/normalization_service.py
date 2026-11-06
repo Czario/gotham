@@ -4,6 +4,7 @@ Business logic services for financial data normalization.
 from typing import Dict, Set, Optional, NamedTuple, Any, List
 from datetime import datetime
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 import logging
 
 from ..core.models import ConceptKey, ConceptDocument, ValueDocument, Company, FinancialStatement, StatementBundle
@@ -833,8 +834,9 @@ class FinancialNormalizationService:
                 [f["concept"] for f in self.last_write_failures][:10],
             )
 
-        # Align dates across the fiscal period so older/divergent rows in the DB
-        # (e.g. from earnings releases with off-by-one dates) do not produce split columns.
+        # Align dates and accession numbers across the fiscal period so older/divergent rows in the DB
+        # (e.g. from 8-K or 6-K earnings releases with off-by-one dates or separate accession numbers)
+        # do not produce split columns and use a unified canonical accession number.
         rp = statement.reporting_period or {}
         fy = rp.get('fiscal_year')
         pd = rp.get('period_date')
@@ -848,6 +850,7 @@ class FinancialNormalizationService:
                 canonical_period_date=pd,
                 canonical_end_date=ed,
                 form_type=filing.form_type,
+                canonical_accession_number=filing.accession_number,
             )
 
         return True
@@ -860,29 +863,42 @@ class FinancialNormalizationService:
         canonical_period_date: str,
         canonical_end_date: Any,
         form_type: str = '10-Q',
+        canonical_accession_number: Optional[str] = None,
     ) -> None:
-        """Align all existing records for this fiscal period to the canonical filing period date.
+        """Align all existing records for this fiscal period to the canonical filing period date and accession number.
 
-        When a filing is processed, its period_date and end_date are canonical. Any pre-existing
-        records for the same company and fiscal period (e.g. from earnings releases with slightly
-        different dates) must be aligned to the canonical period date and end date so that
-        duplicate/split period columns (such as '2026-06-28 FY2026 (Q3)' vs '2026-06-27 FY2026 (Q3)')
-        do not appear.
+        When a filing is processed, its period_date, end_date, and accession_number are canonical. Any pre-existing
+        records for the same company and fiscal period (e.g. from 8-K or 6-K earnings releases with slightly
+        different dates or accession numbers) must be aligned to the canonical period date, end date, and accession
+        number so that duplicate/split period columns do not appear and a single unified accession number is used
+        for the complete column.
         """
         value_repo = self._get_value_repo_by_form_type(form_type)
         query: Dict[str, Any] = {
             'cik': company_cik,
             'reporting_period.fiscal_year': fiscal_year,
-            'reporting_period.period_date': {'$ne': canonical_period_date},
         }
         if quarter is not None:
             query['reporting_period.quarter'] = quarter
+
+        or_conditions: list[Dict[str, Any]] = [
+            {'reporting_period.period_date': {'$ne': canonical_period_date}},
+        ]
+        if canonical_end_date:
+            or_conditions.append({'reporting_period.end_date': {'$ne': canonical_end_date}})
+        if canonical_accession_number:
+            or_conditions.append({'accession_number': {'$ne': canonical_accession_number}})
+            or_conditions.append({'reporting_period.accession_number': {'$exists': True, '$ne': canonical_accession_number}})
+
+        query['$or'] = or_conditions
 
         update_set: Dict[str, Any] = {
             'reporting_period.period_date': canonical_period_date,
         }
         if canonical_end_date:
             update_set['reporting_period.end_date'] = canonical_end_date
+        if canonical_accession_number:
+            update_set['accession_number'] = canonical_accession_number
 
         try:
             res = value_repo.collection.update_many(
@@ -894,11 +910,11 @@ class FinancialNormalizationService:
             )
             if res.modified_count > 0:
                 logger.info(
-                    "Aligned %d existing record(s) for %s FY%s Q%s to canonical period date %s",
-                    res.modified_count, company_cik, fiscal_year, quarter, canonical_period_date,
+                    "Aligned %d existing record(s) for %s FY%s Q%s to canonical period date %s, accession %s",
+                    res.modified_count, company_cik, fiscal_year, quarter, canonical_period_date, canonical_accession_number,
                 )
         except Exception as exc:
-            logger.warning("Failed to align period dates for %s FY%s Q%s: %s", company_cik, fiscal_year, quarter, exc)
+            logger.warning("Failed to align period dates/accession for %s FY%s Q%s: %s", company_cik, fiscal_year, quarter, exc)
 
     def normalize_statement_in_memory(
         self,
@@ -2667,8 +2683,10 @@ class FinancialNormalizationService:
                 reporting_period = value.get('reporting_period') or {}
                 collision_query = {
                     'cik': value.get('cik') or company_cik,
-                    'dimension_value': True,
-                    'dimensional_concept_id': winner_id,
+                    '$or': [
+                        {'concept_id': winner_id},
+                        {'dimensional_concept_id': winner_id},
+                    ],
                 }
                 if reporting_period.get('fiscal_year') is not None:
                     collision_query['reporting_period.fiscal_year'] = reporting_period['fiscal_year']
@@ -2683,14 +2701,18 @@ class FinancialNormalizationService:
                     values.delete_one({'_id': value['_id']})
                     dropped += 1
                 else:
-                    values.update_one(
-                        {'_id': value['_id']},
-                        {'$set': {
-                            'concept_id': winner_id,
-                            'dimensional_concept_id': winner_id,
-                        }},
-                    )
-                    moved += 1
+                    try:
+                        values.update_one(
+                            {'_id': value['_id']},
+                            {'$set': {
+                                'concept_id': winner_id,
+                                'dimensional_concept_id': winner_id,
+                            }},
+                        )
+                        moved += 1
+                    except DuplicateKeyError:
+                        values.delete_one({'_id': value['_id']})
+                        dropped += 1
 
             deleted = concept_repo.collection.delete_one({'_id': duplicate_id})
             removed_rows += bool(getattr(deleted, 'deleted_count', 0))
@@ -2968,17 +2990,30 @@ class FinancialNormalizationService:
             primary_axis = first_axis
             primary_member = concept
         
-        # Multi-axis facts (e.g. segment x product, segment x geography) are NOT encoded
-        # into the concept name any more.  Concatenating member names produced values like
-        # "meta:FamilyOfAppsMember_us-gaap:ServiceOtherMember" which
-        #   * dropped the axis each member belonged to,
-        #   * varied with dict iteration order (order-reversed twins in production), and
-        #   * could not separate rows that share a member but differ in line item, because
-        #     the row identity does not contain the parent line item.
-        # The full slice is now recorded as a canonical dimension signature on the row
-        # (``data_normalization_service.core.row_identity.dimension_signature``) and the row
-        # is keyed by its parent, so the concept stays a clean, reusable member name.
-        #
+        # Handle multi-dimensional cases: when multiple substantive axes exist,
+        # construct a deterministic composite concept name to distinguish sub-breakdown rows
+        # (e.g. Segment x Product, Segment x Geography) and match existing database concepts.
+        _WRAPPER_AXES = {
+            'consolidationitemsaxis',       # srt:ConsolidationItemsAxis / us-gaap:ConsolidationItemsAxis
+            'consolidationaxis',
+            'segmentreportingaxis',
+            'reportablelegalentitiesaxis',
+            'legalentityaxis',
+            'consolidatedentitiesaxis',
+        }
+        if len(meaningful_dimensions) > 1 and primary_axis and concept:
+            other_dimensions = {
+                k: v for k, v in meaningful_dimensions.items()
+                if k != primary_axis and k.lower() not in _WRAPPER_AXES
+            }
+            if other_dimensions:
+                # Sort deterministically by axis priority to ensure identical order across all runs
+                for other_axis, other_member in sorted(
+                    other_dimensions.items(), key=lambda kv: _primary_dimension_key(kv[0])
+                ):
+                    other_qualified = get_qualified_member_name(other_axis, other_member)
+                    concept = f"{concept}_{other_qualified}"
+
         # Don't clean up concept name - preserve the qualified names with namespaces
         # The qualified names are needed to match existing dimensional concepts in the database
         
@@ -3064,10 +3099,14 @@ class FinancialNormalizationService:
         # We must find the axis whose member_qname MATCHES `concept` so we use the right label,
         # rather than blindly taking the first axis (which may be a consolidation/wrapper axis).
         def _find_primary_axis_details() -> dict:
-            """Return the dimension_details entry whose member_qname matches `concept`."""
-            for _ax, _details in dimension_details.items():
-                if isinstance(_details, dict) and _details.get('member_qname') == concept:
-                    return _details
+            """Return the dimension_details entry whose member_qname matches `concept` (or the last component of a composite concept)."""
+            target_members = [concept]
+            if '_' in concept:
+                target_members.append(concept.split('_')[-1])
+            for target in target_members:
+                for _ax, _details in dimension_details.items():
+                    if isinstance(_details, dict) and _details.get('member_qname') == target:
+                        return _details
             # Fallback: return first axis details that has a member_qname
             for _ax, _details in dimension_details.items():
                 if isinstance(_details, dict) and 'member_qname' in _details:

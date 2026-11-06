@@ -108,13 +108,6 @@ AGENT_REVIEW_ENABLED: bool = os.getenv("AGENT_REVIEW_ENABLED", "1").strip().lowe
     "0", "false", "no", "off", ""
 }
 
-# Sign convention resolution is 100% deterministic by default (programmatic
-# policy enforcement first; LLM only takes over if unresolved violations remain
-# or when SIGN_AGENT_LLM_ENABLED=1).
-SIGN_AGENT_LLM_ENABLED: bool = os.getenv("SIGN_AGENT_LLM_ENABLED", "0").strip().lower() in {
-    "1", "true", "yes", "on"
-}
-
 # ── Forward-looking MD&A guidance ──────────────────────────────────────────
 GUIDANCE_ENABLED: bool = os.getenv("GUIDANCE_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off", ""

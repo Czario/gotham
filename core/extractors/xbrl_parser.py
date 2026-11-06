@@ -376,6 +376,7 @@ class FlexibleXBRLExtractor:
             filing_info = self._extract_filing_info(modelXbrl)
             filing_info['resolved_url'] = used_url     # Track which URL was actually used
             filing_info['original_url'] = filing_url   # Track original input URL
+            self.filing_info = filing_info
             
             # Extract dimensional analysis summary
             dimensional_summary = self._extract_dimensional_analysis_summary(modelXbrl)
@@ -1414,6 +1415,32 @@ class FlexibleXBRLExtractor:
         
         return line_item
     
+    def _get_target_quarter(self) -> Optional[int]:
+        """Extract the target quarter (1, 2, 3, 4) for the filing."""
+        q = (self.company_info or {}).get('fiscal_quarter')
+        if q in (1, 2, 3, 4):
+            return int(q)
+        
+        filing_info = getattr(self, 'filing_info', None) or {}
+        primary = filing_info.get('primary_period_info', {}) or {}
+        q = primary.get('quarter')
+        if q in (1, 2, 3, 4):
+            return int(q)
+            
+        fp = primary.get('fiscal_period') or filing_info.get('entity_info', {}).get('fiscal_period')
+        if isinstance(fp, str):
+            fp = fp.strip().upper()
+            if fp == 'Q1':
+                return 1
+            if fp == 'Q2':
+                return 2
+            if fp == 'Q3':
+                return 3
+            if fp in ('Q4', 'FY'):
+                return 4
+                
+        return None
+
     def _select_best_primary_fact(self, facts):
         """Select the best primary fact with improved scoring and period duration filtering"""
         
@@ -1427,7 +1454,11 @@ class FlexibleXBRLExtractor:
         from utilities.helpers.period_utils import PeriodParser, PeriodMatcher, PeriodClassifier
         
         scored_facts = []
-        target_form_type = getattr(self, 'target_form_type', None)  # Get from filing context if available
+        target_form_type = (
+            getattr(self, 'target_form_type', None)
+            or getattr(self, 'filing_form_type', None)
+            or (getattr(self, 'filing_info', None) or {}).get('entity_info', {}).get('document_type')
+        )
         
         for fact in facts:
             score = 0
@@ -1486,20 +1517,39 @@ class FlexibleXBRLExtractor:
                     
                     logger.debug(f"Period filtering for {fact.qname}: statement_type={statement_type}, is_cash_flow={is_cash_flow}, duration={duration_months:.2f} months")
                     
-                    if target_form_type == '10-Q':
+                    if target_form_type and '10-Q' in target_form_type:
                         # For quarterly filings, handle based on statement type
                         if is_cash_flow:
-                            # Cash flow: Accept YTD cumulative periods
-                            # For Q2: 6 months (Jan-Jun), Q3: 9 months (Jan-Sep), Q4: 12 months (Jan-Dec)
-                            # These are all valid for cash flow in quarterly filings
-                            logger.debug(f"Cash flow fact: duration={duration_months:.2f}, threshold=2.9")
-                            if duration_months >= 2.9:  # Any period >= ~3 months is acceptable
-                                score += 1200  # YTD period for cash flow
-                                logger.debug(f"✅ Accepted YTD cash flow period: {duration_months:.2f} months")
+                            # Cash flow: strictly use YTD cumulative periods for the target quarter
+                            # Q1: ~3 months, Q2: ~6 months, Q3: ~9 months, Q4: ~12 months
+                            target_quarter = self._get_target_quarter()
+                            if target_quarter == 1:
+                                expected_duration = 3.0
+                            elif target_quarter == 2:
+                                expected_duration = 6.0
+                            elif target_quarter == 3:
+                                expected_duration = 9.0
+                            elif target_quarter == 4:
+                                expected_duration = 12.0
                             else:
-                                # Reject monthly or other very short periods
-                                logger.debug(f"❌ Rejected too-short cash flow period: {duration_months:.2f} months")
-                                continue
+                                expected_duration = None
+
+                            if expected_duration is not None:
+                                if abs(duration_months - expected_duration) <= 1.0:
+                                    score += 2000
+                                    logger.debug(f"✅ Accepted target Q{target_quarter} cash flow period: {duration_months:.2f} months")
+                                else:
+                                    # Reject non-matching periods (e.g. 3-month income statement facts in Q2/Q3 cash flow)
+                                    logger.debug(f"❌ Rejected non-matching cash flow period for Q{target_quarter}: {duration_months:.2f} months (expected ~{expected_duration:.0f}m)")
+                                    continue
+                            else:
+                                # Fallback when quarter is unknown: prefer longer YTD cumulative periods
+                                if duration_months >= 2.9:
+                                    score += int(duration_months * 200)
+                                    logger.debug(f"✅ Accepted cash flow period: {duration_months:.2f} months")
+                                else:
+                                    logger.debug(f"❌ Rejected too-short cash flow period: {duration_months:.2f} months")
+                                    continue
                         else:
                             # Income/balance sheet: Strictly quarterly only
                             if PeriodMatcher.reject_non_quarterly_period(duration_months, target_form_type):

@@ -404,5 +404,33 @@ def test_conflicting_period_row_no_longer_crashes(mocker):
         row = db["concept_values_quarterly"].find_one({})
         assert row["value"] == 999.0
         assert row["reporting_period"]["period_date"] == "2026-06-30"
+
+        # C) Existing 8-K record not in the 10-Q has its accession_number and dates aligned to the 10-Q
+        other_concept_id = ObjectId()
+        db["concept_values_quarterly"].insert_one({
+            "cik": "0000320193",
+            "concept_id": other_concept_id,
+            "statement_type": "income",
+            "form_type": "8-K",
+            "accession_number": "0000320193-26-000001-8k",
+            "value": 123.0,
+            "reporting_period": {
+                "fiscal_year": 2026,
+                "quarter": 3,
+                "period_date": "2026-06-28",  # off-by-two dates from preliminary 8-K
+                "end_date": datetime(2026, 6, 28, tzinfo=timezone.utc),
+            },
+            "earning_data": True,
+        })
+        b10q = bundle()
+        b10q.accession_number = "0000320193-26-000020-10q"
+        assert service.persist_statement_bundle(b10q) is True
+        
+        # The 8-K row survives (was not deleted/dropped) AND its accession_number & period_date are updated
+        row_8k = db["concept_values_quarterly"].find_one({"concept_id": other_concept_id})
+        assert row_8k is not None
+        assert row_8k["accession_number"] == "0000320193-26-000020-10q"
+        assert row_8k["reporting_period"]["period_date"] == "2026-06-30"
+        assert row_8k["value"] == 123.0
     finally:
         client.drop_database("filings_agent_dedup_regression")

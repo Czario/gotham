@@ -73,7 +73,35 @@ class SignConventionHandler:
         'Cost', 'Expense', 'Loss', 'Write', 'Impairment',
         'Depreciation', 'Amortization', 'Interest', 'Tax',
     ]
-    
+
+    # Operating asset changes on the Cash Flow statement whose cash flow impact
+    # is the inverse of the raw XBRL asset balance change (-1 * change).
+    @classmethod
+    def is_cash_flow_operating_asset_change(cls, concept: str) -> bool:
+        """Return True if concept represents an operating asset change on Cash Flow.
+        
+        In SEC filing presentation tables:
+          - A decrease in an operating asset is a cash inflow (shown positive without parens).
+          - An increase in an operating asset is a cash outflow (shown negative in parens).
+        Because raw XBRL records the asset delta (Ending - Beginning), its sign is the
+        exact opposite of the presentation table. Inverting it reproduces the presentation row.
+        """
+        if not concept:
+            return False
+        local_lower = concept.rsplit(':', 1)[-1].lower()
+        if not local_lower.startswith('increasedecrease'):
+            return False
+        asset_indicators = [
+            'receivable',
+            'inventor',
+            'operatingasset',
+            'prepaid',
+            'contractwithcustomerasset',
+            'contractasset',
+            'otherasset',
+        ]
+        return any(ind in local_lower for ind in asset_indicators)
+
     @classmethod
     def apply_sign_conventions(
         cls,
@@ -84,37 +112,42 @@ class SignConventionHandler:
         label: Optional[str] = None
     ) -> Optional[float]:
         """
-        Apply sign conventions to a financial value based on SEC presentation standards.
+        Apply sign conventions to a financial value based on SEC presentation standards (Option A: Presentation Table).
         
         Args:
             value: The numeric value to adjust
-            concept: The XBRL concept name (e.g., 'us-gaap:PaymentsToAcquirePropertyPlantAndEquipment')
+            concept: The XBRL concept name (e.g., 'us-gaap:IncreaseDecreaseInAccountsReceivable')
             statement_type: Type of statement ('income_statement', 'cash_flow', 'balance_sheet', etc.)
             calc_weight: Calculation weight from XBRL (typically 1.0 or -1.0)
             label: Human-readable label for the line item
             
         Returns:
-            Adjusted value with proper sign convention applied
+            Adjusted value matching the SEC filing presentation table row.
         """
         if value is None or value == 0:
             return value
         
         # Determine statement type for context
         statement_type_lower = statement_type.lower() if statement_type else ''
-        
-        # PRIORITY 1: Apply calculation weight ONLY for cash flow statements
-        # For income statements, weights are for calculation validation only, not display
-        # SEC shows all income statement items as positive (Revenue, Expenses, Net Income all positive)
-        if calc_weight is not None and calc_weight == -1.0:
-            if 'cash' in statement_type_lower or 'flow' in statement_type_lower:
-                # In cash flow, weight -1.0 means cash outflow (show negative)
-                return -abs(value)
-            # For other statements (income, balance), ignore weight for display
-            # Calculation weights are for validation math, not presentation
-        
-        # PRIORITY 2: Statement-specific rules based on concept patterns
-        
-        if 'cash' in statement_type_lower or 'flow' in statement_type_lower:
+        is_cash_flow = 'cash' in statement_type_lower or 'flow' in statement_type_lower
+
+        if is_cash_flow:
+            local_lower = concept.rsplit(':', 1)[-1].lower() if concept else ''
+            
+            # 1. Share-based compensation is always a positive non-cash add-back
+            if 'sharebasedcompensation' in local_lower:
+                return abs(value)
+            
+            # 2. Operating asset changes: Presentation shows cash flow contribution (-1 * raw asset change)
+            # E.g. Accounts receivable decrease of 9,295 is shown positive (+9,295),
+            #      Inventory increase of 1,084 is shown negative ((1,084)).
+            if cls.is_cash_flow_operating_asset_change(concept):
+                return -float(value)
+            
+            # 3. Payments for other investing activities (shown in parens as outflow in filings)
+            if 'paymentsforproceedsfromotherinvestingactivities' in local_lower:
+                return -abs(float(value))
+
             return cls._apply_cash_flow_conventions(value, concept, label)
         
         elif 'balance' in statement_type_lower or 'position' in statement_type_lower:
@@ -204,23 +237,44 @@ class SignConventionHandler:
         label: Optional[str]
     ) -> float:
         """
-        Apply balance sheet conventions.
+        Apply balance sheet conventions to match SEC filing presentation table.
         
-        Rule: Contra-accounts are NEGATIVE (shown in parentheses in SEC filings)
-              Regular assets, liabilities, and equity are POSITIVE
+        Rule: Normal assets, liabilities, and equity are POSITIVE.
+              Only true contra-accounts (accumulated depreciation, allowance for credit
+              loss / doubtful accounts, treasury stock) are NEGATIVE.
         """
-        # Check if it's already negative
-        if value < 0:
+        if value is None or value == 0:
             return value
-        
-        search_text = f"{concept} {label or ''}".lower()
-        
-        # Check for contra-account patterns
+
+        local = concept.rsplit(':', 1)[-1].lower() if concept else ''
+        label_str = (label or '').lower()
+
+        # Regular assets (receivables, cash, inventory, PPE, etc.) are always POSITIVE.
+        # Do not treat as a contra-account even if the label contains "after allowance" or "net".
+        if (
+            'receivable' in local
+            or 'receivable' in label_str
+            or 'after allowance' in label_str
+            or 'net of allowance' in label_str
+            or 'less allowance' in label_str
+        ):
+            is_allowance_itself = (
+                'allowance' in local
+                and not any(k in local for k in ['netcurrent', 'grosscurrent', 'nontrade', 'accountsnotes'])
+            )
+            if not is_allowance_itself:
+                return abs(value)
+
+        # Check for genuine contra-accounts
         for pattern in cls.CONTRA_ACCOUNT_PATTERNS:
-            if pattern.lower() in search_text:
+            pattern_lower = pattern.lower()
+            if pattern_lower.startswith('allowance'):
+                if 'allowance' in local and not any(k in local for k in ['netcurrent', 'grosscurrent']):
+                    return -abs(value)
+            elif pattern_lower in local:
                 return -abs(value)
-        
-        # Default: keep positive for normal accounts
+
+        # Default: keep positive for normal balance sheet accounts
         return abs(value)
     
     @classmethod

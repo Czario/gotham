@@ -107,3 +107,49 @@ def test_fallback_prefers_undimensioned_fact_when_periods_rejected():
 
     best = _extractor()._select_best_primary_fact([products, total])
     assert best is total
+
+
+def test_cash_flow_q2_prefers_6m_fact_over_3m_income_fact():
+    # In Q2 10-Q, NetIncomeLoss appears as both a 3-month fact (income statement)
+    # and a 6-month fact (cash flow statement). Cash flow must select the 6-month fact.
+    q2_3m_ctx = _Ctx(datetime(2025, 12, 28), datetime(2026, 3, 29))  # ~3 months
+    q2_6m_ctx = _Ctx(datetime(2025, 9, 28), datetime(2026, 3, 29))   # ~6 months
+    fact_3m = _Fact(29_578_000_000, q2_3m_ctx, qname="us-gaap:NetIncomeLoss", cid="c_inc")
+    fact_6m = _Fact(71_675_000_000, q2_6m_ctx, qname="us-gaap:NetIncomeLoss", cid="c_cf")
+
+    ex = _extractor()
+    ex.company_info = {"fiscal_year": 2026, "fiscal_quarter": 2, "fiscal_year_end_code": "0930"}
+    ex.current_statement_type = "cash_flow"
+
+    best = ex._select_best_primary_fact([fact_3m, fact_6m])
+    assert best is fact_6m
+
+
+def test_cash_flow_q3_prefers_9m_fact_over_3m_and_6m_facts():
+    # In Q3 10-Q, cash flow must select the 9-month cumulative fact.
+    q3_3m_ctx = _Ctx(datetime(2026, 3, 29), datetime(2026, 6, 28))   # ~3 months
+    q3_9m_ctx = _Ctx(datetime(2025, 9, 28), datetime(2026, 6, 28))   # ~9 months
+    fact_3m = _Fact(29_789_000_000, q3_3m_ctx, qname="us-gaap:NetIncomeLoss", cid="c_inc")
+    fact_9m = _Fact(101_464_000_000, q3_9m_ctx, qname="us-gaap:NetIncomeLoss", cid="c_cf")
+
+    ex = _extractor()
+    ex.company_info = {"fiscal_year": 2026, "fiscal_quarter": 3, "fiscal_year_end_code": "0930"}
+    ex.current_statement_type = "cash_flow"
+
+    best = ex._select_best_primary_fact([fact_3m, fact_9m])
+    assert best is fact_9m
+
+
+def test_income_statement_q2_prefers_3m_fact_over_6m_fact():
+    # In Q2 10-Q, income statement must select the strictly quarterly (3m) fact.
+    q2_3m_ctx = _Ctx(datetime(2025, 12, 28), datetime(2026, 3, 29))  # ~3 months
+    q2_6m_ctx = _Ctx(datetime(2025, 9, 28), datetime(2026, 3, 29))   # ~6 months
+    fact_3m = _Fact(29_578_000_000, q2_3m_ctx, qname="us-gaap:NetIncomeLoss", cid="c_inc")
+    fact_6m = _Fact(71_675_000_000, q2_6m_ctx, qname="us-gaap:NetIncomeLoss", cid="c_cf")
+
+    ex = _extractor()
+    ex.company_info = {"fiscal_year": 2026, "fiscal_quarter": 2, "fiscal_year_end_code": "0930"}
+    ex.current_statement_type = "income_statement"
+
+    best = ex._select_best_primary_fact([fact_6m, fact_3m])
+    assert best is fact_3m
