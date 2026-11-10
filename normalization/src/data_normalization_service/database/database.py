@@ -7,12 +7,23 @@ from pymongo.database import Database
 from bson import ObjectId
 from typing import Optional, Dict, Any, Iterator
 import logging
+import re as _re
 
 from ..core.models import ConceptDocument, ValueDocument, FinancialStatement, Filing, Company
 from ..core.config import DatabaseConfig
 from ..core.row_identity import dimension_signature as _dimension_signature
 
 logger = logging.getLogger(__name__)
+
+_POLLUTED_PATH_SEGMENTS = ("404", "555")
+_POLLUTED_PATH_RX = _re.compile(r"(^|\.)(404|555)(\.|$)")
+
+
+def is_polluted_path(path: Any) -> bool:
+    """True when path carries a page-number/pollution segment (404/555)."""
+    if not path:
+        return False
+    return any(seg in _POLLUTED_PATH_SEGMENTS for seg in str(path).split("."))
 
 
 class DatabaseConnection:
@@ -115,7 +126,7 @@ class ConceptRepository:
             self._collection = self.db_connection.target_db[self.collection_name]
         return self._collection
 
-    def find_existing(self, company_cik: str, statement_type: str, concept: str, dimension_concept: bool = False, parent_concept: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def find_existing(self, company_cik: str, statement_type: str, concept: str, dimension_concept: bool = False, parent_concept: Optional[str] = None, label: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Find existing concept (regular or dimensional).
 
         ``parent_concept`` scopes the lookup for ``custom:`` grouping headers:
@@ -123,22 +134,78 @@ class ConceptRepository:
         ``custom:ProductSegmentation`` under Revenue AND Cost of Revenue), so
         matching on name alone collapses them into one row and orphans every
         parent but the last writer.
+        Excludes 404/555 polluted paths.
         """
         logger.debug(f"Querying concept: company_cik={company_cik}, statement_type={statement_type}, concept={concept}, dimension_concept={dimension_concept}, parent_concept={parent_concept}")
+        # 1. Exact match on concept name
         query: Dict[str, Any] = {
             "cik": company_cik,
             "statement_type": statement_type,
             "concept": concept,
-            "dimension_concept": dimension_concept
+            "dimension_concept": dimension_concept,
+            "path": {"$not": _POLLUTED_PATH_RX},
         }
         if parent_concept is not None:
             query["parent_concept"] = parent_concept
         result = self.collection.find_one(query)
         if result:
             logger.debug(f"Found existing concept: {concept}")
-        else:
-            logger.debug(f"Concept not found in DB: company_cik={company_cik}, statement_type={statement_type}, concept={concept}")
-        return result
+            return result
+
+        # 2. Match via aliases array (in-place updated or historically aliased tags)
+        alias_query: Dict[str, Any] = {
+            "cik": company_cik,
+            "statement_type": statement_type,
+            "aliases": concept,
+            "dimension_concept": dimension_concept,
+            "path": {"$not": _POLLUTED_PATH_RX},
+        }
+        if parent_concept is not None:
+            alias_query["parent_concept"] = parent_concept
+        result = self.collection.find_one(alias_query)
+        if result:
+            logger.debug(f"Found existing concept via aliases: {concept}")
+            return result
+
+        # 3. Match via canonical equivalence class (for regular line items)
+        if not dimension_concept and not str(concept).startswith("custom:"):
+            from ..core.concept_canonicalization import equivalence_class
+            eq_class = equivalence_class(concept)
+            if len(eq_class) > 1:
+                canon_query: Dict[str, Any] = {
+                    "cik": company_cik,
+                    "statement_type": statement_type,
+                    "dimension_concept": False,
+                    "path": {"$not": _POLLUTED_PATH_RX},
+                    "$or": [
+                        {"concept": {"$in": list(eq_class)}},
+                        {"aliases": {"$in": list(eq_class)}},
+                    ]
+                }
+                result = self.collection.find_one(canon_query)
+                if result:
+                    logger.debug(f"Found existing concept via canonical equivalence: {concept} -> {result.get('concept')}")
+                    return result
+
+        # 4. Semantic label fallback under same statement (for placed line items)
+        if label and not dimension_concept and not str(concept).startswith("custom:"):
+            from ..utils.label_cleaning import clean_label as _clean_label
+            target_lbl = _clean_label(label)
+            if target_lbl:
+                lbl_query: Dict[str, Any] = {
+                    "cik": company_cik,
+                    "statement_type": statement_type,
+                    "dimension_concept": False,
+                    "path": {"$not": _POLLUTED_PATH_RX},
+                }
+                if parent_concept is not None:
+                    lbl_query["parent_concept"] = parent_concept
+                for doc in self.collection.find(lbl_query):
+                    if _clean_label(doc.get("label")) == target_lbl and not is_polluted_path(doc.get("path")):
+                        return doc
+
+        logger.debug(f"Concept not found in DB: company_cik={company_cik}, statement_type={statement_type}, concept={concept}")
+        return None
 
     def find_concept_reference_for_hierarchy(self, statement_type: str, concept: str, dimension_concept: bool = False) -> Optional[Dict[str, Any]]:
         """
@@ -224,7 +291,7 @@ class ConceptRepository:
         
         return result
 
-    def find_dimensional_existing(self, company_cik: str, statement_type: str, segment_type: str, concept: str, parent_concept_id: Optional[ObjectId] = None, context_id: Optional[str] = None, dimension_signature: Optional[str] = None, parent_header: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def find_dimensional_existing(self, company_cik: str, statement_type: str, segment_type: str, concept: str, parent_concept_id: Optional[ObjectId] = None, context_id: Optional[str] = None, dimension_signature: Optional[str] = None, parent_header: Optional[str] = None, label: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Find an existing dimensional concept.
 
         Identity is ``(cik, statement_type, parent concept, member, dimensional
@@ -234,11 +301,18 @@ class ConceptRepository:
         Including ``parent_header`` ensures the same member routed through
         different custom grouping headers (e.g. custom:ProductSegmentation vs.
         bare) is treated as a distinct document.
+        ``label`` provides fallback semantic matching when a company changes or
+        refines its XBRL taxonomy tag for the same line item.
         """
+        import re as _re
         query = {
             "cik": company_cik,
             "statement_type": statement_type,
-            "concept": concept,
+            "$or": [
+                {"concept": concept},
+                {"aliases": concept},
+                {"concept": {"$regex": f"_{_re.escape(concept)}$"}},
+            ],
             "dimension_concept": True,
         }
         if parent_concept_id:
@@ -251,45 +325,58 @@ class ConceptRepository:
             query["parent_header"] = parent_header
         else:
             query["parent_header"] = {"$in": [None, ""]}
-            result = self.collection.find_one(query)
-            if result:
-                return result
-            # Legacy fallback with dimension_signature missing. Reuse the same
-            # parent-header scope for old rows with absent/null header metadata.
-            if dimension_signature is not None:
-                lq = {
-                    "cik": company_cik,
-                    "statement_type": statement_type,
-                    "concept": concept,
-                    "dimension_concept": True,
-                    "dimension_signature": {"$exists": False},
-                    "parent_header": {"$in": [None, ""]},
-                }
-                if parent_concept_id:
-                    lq["concept_id"] = parent_concept_id
-                return self.collection.find_one(lq)
-            return None
 
         result = self.collection.find_one(query)
         if result:
             return result
 
-        # Legacy rows written before dimension_signature existed: match on the
-        # parent+member identity only, so we REUSE (and stop creating new
-        # duplicates) rather than insert another row.
+        # Legacy fallback with dimension_signature missing. Reuse the same
+        # parent-header scope for old rows with absent/null header metadata.
         if dimension_signature is not None:
-            legacy_query = {
+            lq = {
                 "cik": company_cik,
                 "statement_type": statement_type,
-                "concept": concept,
+                "$or": [
+                    {"concept": concept},
+                    {"aliases": concept},
+                    {"concept": {"$regex": f"_{_re.escape(concept)}$"}},
+                ],
                 "dimension_concept": True,
                 "dimension_signature": {"$exists": False},
             }
             if parent_concept_id:
-                legacy_query["concept_id"] = parent_concept_id
+                lq["concept_id"] = parent_concept_id
             if parent_header:
-                legacy_query["parent_header"] = parent_header
-            return self.collection.find_one(legacy_query)
+                lq["parent_header"] = parent_header
+            else:
+                lq["parent_header"] = {"$in": [None, ""]}
+            res = self.collection.find_one(lq)
+            if res:
+                return res
+
+        # Semantic label fallback under same parent: if incoming concept tag changed
+        # (e.g. meta:FamilyOfAppsMember -> us-gaap:AdvertisingMember), match the existing
+        # placed row with the same cleaned label so it is updated in place.
+        if label:
+            from ..utils.label_cleaning import clean_label as _clean_label
+            cleaned_target = _clean_label(label)
+            if cleaned_target:
+                label_query: Dict[str, Any] = {
+                    "cik": company_cik,
+                    "statement_type": statement_type,
+                    "dimension_concept": True,
+                    "path": {"$not": _POLLUTED_PATH_RX},
+                }
+                if parent_concept_id:
+                    label_query["concept_id"] = parent_concept_id
+                if parent_header:
+                    label_query["parent_header"] = parent_header
+                else:
+                    label_query["parent_header"] = {"$in": [None, ""]}
+                for doc in self.collection.find(label_query):
+                    if _clean_label(doc.get("label")) == cleaned_target and not is_polluted_path(doc.get("path")):
+                        return doc
+
         return None
 
     def find_dimensional_candidates_by_parent_name(
@@ -300,6 +387,7 @@ class ConceptRepository:
         parent_concept_name: str,
         dimension_signature: str,
         parent_header: Optional[str] = None,
+        label: Optional[str] = None,
     ) -> list[Dict[str, Any]]:
         """Find same-slice dimensional rows whose parent ObjectId drifted.
 
@@ -310,27 +398,43 @@ class ConceptRepository:
         semantic parent name, dimension signature, and grouping header.
         Legacy signatures are recomputed from the stored dimension payload.
         """
+        import re as _re
         query: Dict[str, Any] = {
             "cik": company_cik,
             "statement_type": statement_type,
-            "concept": concept,
+            "$or": [
+                {"concept": concept},
+                {"aliases": concept},
+                {"concept": {"$regex": f"_{_re.escape(concept)}$"}},
+            ],
             "dimension_concept": True,
             "concept_name": parent_concept_name,
+            "path": {"$not": _POLLUTED_PATH_RX},
         }
         if parent_header:
             query["parent_header"] = parent_header
         else:
-            query["$or"] = [
-                {"parent_header": {"$exists": False}},
-                {"parent_header": {"$in": [None, ""]}},
-            ]
+            query["parent_header"] = {"$in": [None, ""]}
 
-        return [
+        candidates = [
             row for row in self.collection.find(query)
             if _dimension_signature(
                 row.get("dimensions"), row.get("dimension_details")
             ) == dimension_signature
+            and not is_polluted_path(row.get("path"))
         ]
+        if label and len(candidates) > 1:
+            from ..utils.label_cleaning import clean_label as _clean_label
+            target_lbl = _clean_label(label)
+            if target_lbl:
+                matching_lbl = [r for r in candidates if _clean_label(r.get("label")) == target_lbl]
+                if matching_lbl:
+                    return matching_lbl
+        return candidates
+
+    def find_by_id(self, concept_id: ObjectId) -> Optional[Dict[str, Any]]:
+        """Find a concept by its _id."""
+        return self.collection.find_one({"_id": concept_id})
 
     def find_by_concept_id(self, concept_id: ObjectId) -> Iterator[Dict[str, Any]]:
         """Find all dimensional concepts for a given concept_id."""

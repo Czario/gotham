@@ -44,6 +44,13 @@ _EQUIVALENCE_CLASSES = [
         "us-gaap:SalesRevenueServicesNet",
         "us-gaap:RevenueFromContractWithCustomerIncludingAssessedTax",
     ),
+    # --- Cost of Revenue / Cost of Goods Sold variants ---
+    (
+        "us-gaap:CostOfRevenue",
+        "us-gaap:CostOfGoodsAndServicesSold",
+        "us-gaap:CostOfGoodsSold",
+        "us-gaap:CostOfServices",
+    ),
     # --- Net change in cash: ASU 2016-18 restricted-cash inclusion (2018) ---
     (
         "us-gaap:CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",

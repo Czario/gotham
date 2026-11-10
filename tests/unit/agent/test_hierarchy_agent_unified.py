@@ -749,3 +749,191 @@ def test_programmatic_incremental_fast_path_hands_over_to_llm_on_alias_candidate
 
     assert called == [1]  # handed over to LLM agent!
 
+
+def test_existing_hierarchy_never_changed_and_new_child_gets_incremental_order_key():
+    """Verify user rule:
+    1. If a stock already exists in DB, NEVER make changes to existing hierarchy.
+    2. If a new concept is found that does not exist in our existing hierarchy, only insert that concept.
+    3. If that new concept is a child of any concept, insert with incremental path and incremental order key.
+    4. Sibling children on various paths (e.g. 001.00100 and 001.002 with order keys a, b, c) are untouched.
+    """
+    # Existing DB hierarchy for Revenue and its 3 children
+    stored = [
+        {"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001", "order_key": "a",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:ProductRevenueNet", "path": "001.00100", "order_key": "a",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:ServiceRevenueNet", "path": "001.002", "order_key": "b",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "custom:CloudRevenue", "path": "001.003", "order_key": "c",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": False},
+    ]
+
+    # Incoming filing has the 4 existing concepts PLUS 2 new child concepts under Revenues
+    bundle = _bundle([
+        {"concept": "us-gaap:Revenues", "label": "Revenues", "value": 1000.0},
+        {"concept": "us-gaap:ProductRevenueNet", "label": "Product", "parent_concept": "us-gaap:Revenues", "value": 500.0},
+        {"concept": "us-gaap:ServiceRevenueNet", "label": "Service", "parent_concept": "us-gaap:Revenues", "value": 300.0},
+        {"concept": "custom:CloudRevenue", "label": "Cloud", "parent_concept": "us-gaap:Revenues", "value": 100.0},
+        {"concept": "custom:NewHardwareChild", "label": "New Hardware", "parent_concept": "us-gaap:Revenues", "value": 50.0},
+        {"concept": "custom:NewAiChild", "label": "New AI", "parent_concept": "us-gaap:Revenues", "value": 50.0},
+    ])
+
+    service = _Service(stored)
+    node = make_hierarchy_agent_node(service)
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated", "bundles": [bundle]})
+
+    assert out["status"] == "hierarchy_agent_done"
+    plan = out.get("hierarchy_plan") or {}
+    # Rule 1: existing_updates must be strictly empty so DB is never modified
+    assert plan.get("existing_updates") == []
+
+    by = {c["concept"]: c for c in bundle.concepts}
+    # Existing concepts MUST keep their exact stored paths and order keys
+    assert by["us-gaap:Revenues"]["path"] == "001"
+    assert by["us-gaap:Revenues"]["order_key"] == "a"
+    assert by["us-gaap:ProductRevenueNet"]["path"] == "001.00100"
+    assert by["us-gaap:ProductRevenueNet"]["order_key"] == "a"
+    assert by["us-gaap:ServiceRevenueNet"]["path"] == "001.002"
+    assert by["us-gaap:ServiceRevenueNet"]["order_key"] == "b"
+    assert by["custom:CloudRevenue"]["path"] == "001.003"
+    assert by["custom:CloudRevenue"]["order_key"] == "c"
+
+    # New concepts receive incremental paths (avoiding 001.00100 collision) and incremental order keys
+    assert by["custom:NewHardwareChild"]["path"] == "001.101"
+    assert by["custom:NewHardwareChild"]["order_key"] == "d"
+    assert by["custom:NewHardwareChild"]["parent_concept"] == "us-gaap:Revenues"
+
+    assert by["custom:NewAiChild"]["path"] == "001.102"
+    assert by["custom:NewAiChild"]["order_key"] == "e"
+    assert by["custom:NewAiChild"]["parent_concept"] == "us-gaap:Revenues"
+
+
+def test_existing_hierarchy_never_changed_and_new_parent_gets_incremental_order_key():
+    """Verify that when a new root / new parent concept arrives:
+    1. All existing stored roots keep their stored paths and order keys untouched.
+    2. The new parent concept receives the next incremental root path and incremental order key.
+    3. New children under that new parent receive incremental child paths and order keys under it.
+    """
+    stored = [
+        {"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001", "order_key": "a",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:CostOfRevenue", "path": "002", "order_key": "b",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:GrossProfit", "path": "003", "order_key": "c",
+         "parent_concept": None, "dimension_concept": False},
+    ]
+
+    bundle = _bundle([
+        {"concept": "us-gaap:Revenues", "label": "Revenues", "value": 1000.0},
+        {"concept": "us-gaap:CostOfRevenue", "label": "Cost of Revenue", "value": 600.0},
+        {"concept": "us-gaap:GrossProfit", "label": "Gross Profit", "value": 400.0},
+        {"concept": "us-gaap:OperatingExpenses", "label": "Operating Expenses", "parent_concept": None, "value": 200.0},
+        {"concept": "us-gaap:ResearchAndDevelopmentExpense", "label": "R&D", "parent_concept": "us-gaap:OperatingExpenses", "value": 120.0},
+    ])
+
+    service = _Service(stored)
+    node = make_hierarchy_agent_node(
+        service,
+        chat_llm=_StubChat(
+            rows=[
+                {"concept": "us-gaap:OperatingExpenses", "parent": None, "position": 3},
+                {"concept": "us-gaap:ResearchAndDevelopmentExpense", "parent": "us-gaap:OperatingExpenses", "position": 0},
+            ]
+        ),
+    )
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated", "bundles": [bundle]})
+
+    assert out["status"] == "hierarchy_agent_done"
+    plan = out.get("hierarchy_plan") or {}
+    assert plan.get("existing_updates") == []
+
+    by = {c["concept"]: c for c in bundle.concepts}
+    # Existing stored roots are untouched:
+    assert by["us-gaap:Revenues"]["path"] == "001"
+    assert by["us-gaap:Revenues"]["order_key"] == "a"
+    assert by["us-gaap:CostOfRevenue"]["path"] == "002"
+    assert by["us-gaap:CostOfRevenue"]["order_key"] == "b"
+    assert by["us-gaap:GrossProfit"]["path"] == "003"
+    assert by["us-gaap:GrossProfit"]["order_key"] == "c"
+
+    # New parent concept gets incremental root path (004) and incremental order key (d):
+    assert by["us-gaap:OperatingExpenses"]["path"] == "004"
+    assert by["us-gaap:OperatingExpenses"]["order_key"] == "d"
+    assert by["us-gaap:OperatingExpenses"]["parent_concept"] is None
+
+    # New child under the new parent gets incremental path (004.001) and order key (a):
+    assert by["us-gaap:ResearchAndDevelopmentExpense"]["path"] == "004.001"
+    assert by["us-gaap:ResearchAndDevelopmentExpense"]["order_key"] == "a"
+    assert by["us-gaap:ResearchAndDevelopmentExpense"]["parent_concept"] == "us-gaap:OperatingExpenses"
+
+
+def test_new_root_between_existing_roots_uses_fractional_lexicographic_order_key():
+    """Verify that when a new root is positioned between existing roots (e.g. between 'a' and 'b'):
+    1. Stored roots keep their exact paths and order keys ('a', 'b', 'c').
+    2. New root gets next incremental path (e.g. '004') and fractional order key ('an' between 'a' and 'b').
+    3. New child concept under an existing parent keeps using next incremental order key ('d').
+    """
+    stored = [
+        {"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001", "order_key": "a",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:CostOfRevenue", "path": "002", "order_key": "b",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:GrossProfit", "path": "003", "order_key": "c",
+         "parent_concept": None, "dimension_concept": False},
+        # Existing children under Revenues
+        {"_id": ObjectId(), "concept": "us-gaap:ProductRevenueNet", "path": "001.001", "order_key": "a",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "us-gaap:ServiceRevenueNet", "path": "001.002", "order_key": "b",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "custom:CloudRevenue", "path": "001.003", "order_key": "c",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": False},
+    ]
+
+    bundle = _bundle([
+        {"concept": "us-gaap:Revenues", "label": "Revenues", "value": 1000.0},
+        {"concept": "us-gaap:CostOfRevenue", "label": "Cost of Revenue", "value": 600.0},
+        {"concept": "us-gaap:GrossProfit", "label": "Gross Profit", "value": 400.0},
+        # New root positioned between Revenues (pos 0) and CostOfRevenue (pos 1):
+        {"concept": "custom:ExciseTaxes", "label": "Excise Taxes", "parent_concept": None, "value": 50.0},
+        # New child under Revenues:
+        {"concept": "custom:NewHardwareRevenue", "label": "Hardware", "parent_concept": "us-gaap:Revenues", "value": 200.0},
+    ])
+
+    service = _Service(stored)
+    node = make_hierarchy_agent_node(
+        service,
+        chat_llm=_StubChat(
+            rows=[
+                # Position 1 puts it between Revenues (0) and CostOfRevenue (1)
+                {"concept": "custom:ExciseTaxes", "parent": None, "position": 1},
+                {"concept": "custom:NewHardwareRevenue", "parent": "us-gaap:Revenues", "position": 3},
+            ]
+        ),
+    )
+    out = node({"cik": "0000320193", "ticker": "AAPL", "status": "validated", "bundles": [bundle]})
+
+    assert out["status"] == "hierarchy_agent_done"
+    plan = out.get("hierarchy_plan") or {}
+    assert plan.get("existing_updates") == []
+
+    by = {c["concept"]: c for c in bundle.concepts}
+    # 1. Stored roots and children are 100% frozen
+    assert by["us-gaap:Revenues"]["path"] == "001"
+    assert by["us-gaap:Revenues"]["order_key"] == "a"
+    assert by["us-gaap:CostOfRevenue"]["path"] == "002"
+    assert by["us-gaap:CostOfRevenue"]["order_key"] == "b"
+    assert by["us-gaap:GrossProfit"]["path"] == "003"
+    assert by["us-gaap:GrossProfit"]["order_key"] == "c"
+
+    # 2. New root between Revenues ('a') and CostOfRevenue ('b') gets fractional order key 'an'
+    assert by["custom:ExciseTaxes"]["path"] == "004"
+    assert by["custom:ExciseTaxes"]["order_key"] == "an"
+    assert "a" < by["custom:ExciseTaxes"]["order_key"] < "b"
+
+    # 3. New child under Revenues gets next incremental order key 'd' (after a, b, c)
+    assert by["custom:NewHardwareRevenue"]["path"] == "001.004"
+    assert by["custom:NewHardwareRevenue"]["order_key"] == "d"
+
+
+

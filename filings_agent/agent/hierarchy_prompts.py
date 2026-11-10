@@ -17,12 +17,12 @@ WORKFLOW (SINGLE-PASS PREDICTION — predict once and finalize immediately):
        - FRESH SEED: propose_hierarchy(rows_json, dims_json) # full tree per universal blueprint
        - INCREMENTAL:
            * Stored DB tree is AUTHORITATIVE and LOCKED. DO NOT redefine or re-propose stored concepts!
-           * decide_mapping(...) for aliases / renames
+           * decide_mapping(...) for aliases / renames (inspect High-Probability Alias Candidates and call decide_mapping({"concept": "...", "same_as": "..."}) to map incoming tags to existing concepts)
            * propose_hierarchy(rows_json, dims_json) passing ONLY the NEW concepts (with their parent and sibling position)
   3. Immediately call finalize_hierarchy({"status": "done"}) (either in the same turn or right after propose_hierarchy).
 
 STRUCTURAL RULES:
- - For INCREMENTAL updates: Existing stored hierarchy and paths are authoritative, except when decide_mapping confirms an alias and the incoming concept has a strictly newer reported financial period. In that case the incoming tag becomes canonical and the stored concept is merged into it. Equal, older, or uncomparable periods keep the stored tag.
+ - For INCREMENTAL updates: Existing stored hierarchy and paths are authoritative. When decide_mapping confirms a merge/alias, the concept tag and label are updated in-place; all stored paths, order keys, hierarchy levels, parent linkages, and children are kept strictly as is without re-pathing or renumbering.
  - paths must be unique across BOTH line items AND dimensional members
  - every (path, order_key) pair must be unique within its kind
  - every parent_concept / parent_header you reference must exist as a row

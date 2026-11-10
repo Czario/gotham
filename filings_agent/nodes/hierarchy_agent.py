@@ -37,6 +37,71 @@ def _order_key(position: int) -> str:
     return "".join(reversed(chars))
 
 
+def _order_key_index(key: Optional[str]) -> int:
+    """Return 0-based position corresponding to _order_key (a->0, z->25, aa->26, etc.)."""
+    if not key or not isinstance(key, str):
+        return -1
+    res = 0
+    for ch in key.strip().lower():
+        if "a" <= ch <= "z":
+            res = res * 26 + (ord(ch) - ord("a") + 1)
+        else:
+            return -1
+    return res - 1
+
+
+def _fractional_order_key(prev_key: Optional[str], next_key: Optional[str]) -> str:
+    """Return a lexicographically sorted string key K such that prev_key < K < next_key."""
+    if not prev_key and not next_key:
+        return "a"
+    if not prev_key and next_key:
+        if len(next_key) == 1 and next_key > "a":
+            return chr((ord("`") + ord(next_key[0])) // 2)
+        return "0n"
+    if prev_key and not next_key:
+        idx = _order_key_index(prev_key)
+        if idx >= 0:
+            return _order_key(idx + 1)
+        return prev_key + "n"
+
+    p, n = prev_key, next_key
+    i = 0
+    while i < len(p) and i < len(n) and p[i] == n[i]:
+        i += 1
+    prefix = p[:i]
+    c_low = ord(p[i]) if i < len(p) else ord("`")
+    c_high = ord(n[i]) if i < len(n) else ord("{")
+
+    if c_high - c_low > 1:
+        mid_char = chr((c_low + c_high) // 2)
+        cand = prefix + mid_char
+        if p < cand < n:
+            return cand
+
+    cand = p + "n"
+    if p < cand < n:
+        return cand
+    cand = p + "m"
+    if p < cand < n:
+        return cand
+    return p + "n"
+
+
+def _lookup_identity(id_map: Optional[dict], concept: Any, parent: Any, is_dim: bool = False, header: Any = None) -> Any:
+    """Robust lookup supporting (concept, parent, is_dim, header), 3-tuple, or (concept, parent)."""
+    if not id_map:
+        return None
+    for k in (
+        (concept, parent, is_dim, header),
+        (concept, parent, is_dim),
+        (concept, parent),
+        concept,
+    ):
+        if k in id_map:
+            return id_map[k]
+    return None
+
+
 def _period_info(value: Any) -> tuple[Optional[tuple[int, int, int]], Optional[str]]:
     """Return an orderable (year, month, day) and display label for a period."""
     if isinstance(value, dict):
@@ -272,39 +337,65 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
         return ""
 
     def _sibling_rank(r: dict) -> tuple:
+        c = r.get("concept")
+        p = r.get("parent")
+        # 1. Stored rows: preserve order strictly by stored order_key
+        stored_ok = r.get("order_key")
+        if not stored_ok and identity_order_keys:
+            stored_ok = _lookup_identity(identity_order_keys, c, p, False)
+        if stored_ok and isinstance(stored_ok, str):
+            idx = _order_key_index(stored_ok)
+            if idx >= 0:
+                return (float(idx), row_seq.get(id(r), 0))
+        # 2. For root concepts (parent is None): determine relative rank among roots
+        if not p:
+            pos = _explicit_pos(r)
+            if pos is not None:
+                return (float(pos) - 0.5, row_seq.get(id(r), 0))
+            # If no explicit pos, check relative position in norm_rows among roots
+            prev_root_idx = -1
+            next_root_idx = None
+            r_seq = row_seq.get(id(r), 0)
+            for other in norm_rows:
+                if other.get("parent") or other.get("hide") or str(other.get("path") or "") == "555":
+                    continue
+                o_ok = other.get("order_key") or (_lookup_identity(identity_order_keys, other.get("concept"), None, False) if identity_order_keys else None)
+                if o_ok and isinstance(o_ok, str):
+                    o_idx = _order_key_index(o_ok)
+                    if o_idx >= 0:
+                        o_seq = row_seq.get(id(other), 0)
+                        if o_seq < r_seq:
+                            prev_root_idx = max(prev_root_idx, o_idx)
+                        elif o_seq > r_seq and next_root_idx is None:
+                            next_root_idx = o_idx
+            if prev_root_idx >= 0 and next_root_idx is not None:
+                return ((prev_root_idx + next_root_idx) / 2.0, r_seq)
+            if prev_root_idx >= 0:
+                return (float(prev_root_idx) + 0.5, r_seq)
+            if next_root_idx is not None:
+                return (float(next_root_idx) - 0.5, r_seq)
+            return (1000.0, r_seq)
+
+        # 3. For child rows: explicit position or append after stored siblings
         pos = _explicit_pos(r)
         if pos is not None:
-            return (pos, row_seq.get(id(r), 0))
-        # Stored rows: preserve order by stored order_key or stored order
-        ok = r.get("order_key")
-        if not ok and identity_order_keys:
-            ok = identity_order_keys.get((r.get("concept"), r.get("parent"), False))
-        if ok and isinstance(ok, str):
-            p = _order_key_to_pos(ok)
-            if p is not None:
-                return (p, row_seq.get(id(r), 0))
-        for k in ("position", "order", "index"):
-            val = r.get(k)
-            if val is not None:
-                try:
-                    return (int(val), row_seq.get(id(r), 0))
-                except (ValueError, TypeError):
-                    pass
-        # Unpositioned new rows naturally append after existing siblings
-        return (1000 + row_seq.get(id(r), 0), row_seq.get(id(r), 0))
+            return (1000.0 + pos, row_seq.get(id(r), 0))
+        return (2000.0 + row_seq.get(id(r), 0), row_seq.get(id(r), 0))
 
     def _walk(parent: Optional[str], ancestors: frozenset = frozenset()) -> None:
         base = _base(parent)
         children = sorted(by_parent.get(parent, []), key=_sibling_rank)
-        # order_keys that will be kept by stored rows (no explicit position),
-        # so a newly-inserted sibling can never collide with them.
+        # Collect order_keys already in use by stored siblings under this parent
         local_order: set[str] = set()
         for r in children:
-            if _is_555(r) or _explicit_pos(r) is not None:
+            if _is_555(r):
                 continue
-            ok = (identity_order_keys or {}).get((r["concept"], r.get("parent"), False))
+            ok = r.get("order_key")
+            if not ok and identity_order_keys:
+                ok = _lookup_identity(identity_order_keys, r["concept"], r.get("parent"), False)
             if ok and str(ok):
                 local_order.add(str(ok))
+
         for idx, r in enumerate(children):
             if _is_555(r):
                 r["path"] = "555"
@@ -313,45 +404,82 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
             else:
                 stored = stored_paths.get(r["concept"]) if stored_paths else None
                 if stored is None and identity_paths:
-                    stored = identity_paths.get((r["concept"], r.get("parent"), False))
-                reclaim = bool(
+                    stored = _lookup_identity(identity_paths, r["concept"], r.get("parent"), False)
+                is_stored = bool(
                     stored
                     and stored != "555"
                     and stored not in claimed
                     and (not base or str(stored).startswith(f"{base}."))
                 )
-                if reclaim:
+                if is_stored:
+                    # Existing stored row: PRESERVE EXACT STORED PATH AND ORDER KEY
                     cand = str(stored)
+                    r["path"] = cand
+                    r["level"] = len(cand.split(".")) - 1
+                    stored_ok = _lookup_identity(identity_order_keys, r["concept"], r.get("parent"), False)
+                    if not stored_ok and r.get("order_key"):
+                        stored_ok = r.get("order_key")
+                    r["order_key"] = str(stored_ok) if stored_ok else "a"
+                    local_order.add(str(r["order_key"]))
+                    used.add(cand)
+                    claimed.add(cand)
                 else:
-                    n = 1
+                    # NEW row: allocate incremental path and incremental order key
+                    # Find max numeric suffix among direct children under base in used
+                    max_suffix = 0
+                    for p in used:
+                        if base and p.startswith(f"{base}."):
+                            suffix_str = p[len(base) + 1:]
+                            if "." not in suffix_str and suffix_str.isdigit():
+                                max_suffix = max(max_suffix, int(suffix_str))
+                        elif not base and "." not in p and p.isdigit():
+                            max_suffix = max(max_suffix, int(p))
+                    n = max_suffix + 1
                     cand = f"{base}.{n:03d}" if base else f"{n:03d}"
-                    while cand in used:
+                    while cand in used or n in (404, 555):
                         n += 1
                         cand = f"{base}.{n:03d}" if base else f"{n:03d}"
-                r["path"] = cand
-                r["level"] = len(cand.split(".")) - 1
-                if _explicit_pos(r) is not None:
-                    # Agent explicitly ordered this row: order_key follows its
-                    # position in the sorted sibling list.
-                    ok = _order_key(idx)
-                    while ok in local_order:
-                        idx += 1
-                        ok = _order_key(idx)
-                    r["order_key"] = ok
-                else:
-                    ok = (identity_order_keys or {}).get((r["concept"], r.get("parent"), False))
-                    if ok and str(ok):
-                        r["order_key"] = str(ok)
+                    r["path"] = cand
+                    r["level"] = len(cand.split(".")) - 1
+                    used.add(cand)
+                    claimed.add(cand)
+
+                    # Order key assignment
+                    if not base:
+                        # Root concept (parent is None): use Fractional / Lexicographic Ordering!
+                        prev_ok: Optional[str] = None
+                        for s_r in children[:idx]:
+                            if s_r.get("order_key") and not _is_555(s_r):
+                                prev_ok = str(s_r["order_key"])
+                        next_ok: Optional[str] = None
+                        for s_r in children[idx + 1:]:
+                            if s_r.get("order_key") and not _is_555(s_r):
+                                next_ok = str(s_r["order_key"])
+                                break
+                            elif identity_order_keys:
+                                cand_ok = _lookup_identity(identity_order_keys, s_r.get("concept"), None, False)
+                                if cand_ok:
+                                    next_ok = str(cand_ok)
+                                    break
+                        ok = _fractional_order_key(prev_ok, next_ok)
+                        while ok in local_order:
+                            ok = _fractional_order_key(ok, next_ok)
+                        r["order_key"] = ok
+                        local_order.add(ok)
                     else:
-                        k = idx
-                        ok2 = _order_key(k)
-                        while ok2 in local_order:
-                            k += 1
-                            ok2 = _order_key(k)
-                        r["order_key"] = ok2
-                local_order.add(str(r["order_key"]))
-                used.add(cand)
-                claimed.add(cand)
+                        # Child concept (parent is not None): use same next incremental as existing
+                        if local_order:
+                            max_idx = max((_order_key_index(ok) for ok in local_order if _order_key_index(ok) >= 0), default=-1)
+                            next_idx = max_idx + 1
+                        else:
+                            next_idx = 0
+                        ok = _order_key(next_idx)
+                        while ok in local_order:
+                            next_idx += 1
+                            ok = _order_key(next_idx)
+                        r["order_key"] = ok
+                        local_order.add(ok)
+
             path_by_concept.setdefault(r["concept"], str(r["path"]))
             path_by_parent_and_concept[(r.get("parent"), r["concept"])] = str(r["path"])
             if r["concept"] not in ancestors:
@@ -359,15 +487,36 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
 
     _walk(None)
     # rows whose parent was never proposed/stored become roots
+    used_root_order_indices = {
+        _order_key_index(str(r["order_key"]))
+        for r in norm_rows
+        if r.get("order_key") and _order_key_index(str(r["order_key"])) >= 0
+    }
+    if identity_order_keys:
+        used_root_order_indices.update(
+            _order_key_index(str(ok)) for ok in identity_order_keys.values() if _order_key_index(str(ok)) >= 0
+        )
     for r in norm_rows:
         if not r.get("path"):
-            n = 1
-            while f"{n:03d}" in used:
+            max_root_suffix = 0
+            for p in used:
+                if "." not in p and p.isdigit():
+                    max_root_suffix = max(max_root_suffix, int(p))
+            n = max_root_suffix + 1
+            cand = f"{n:03d}"
+            while cand in used:
                 n += 1
-            r["path"] = f"{n:03d}"
-            r["order_key"] = _order_key(n - 1)
+                cand = f"{n:03d}"
+            r["path"] = cand
+            # incremental order key for root
+            max_root_idx = max(used_root_order_indices, default=-1)
+            next_idx = max_root_idx + 1
+            ok = _order_key(next_idx)
+            used_root_order_indices.add(next_idx)
+            r["order_key"] = ok
             r["level"] = 0
-            used.add(r["path"])
+            used.add(cand)
+            claimed.add(cand)
             path_by_concept[r["concept"]] = r["path"]
             path_by_parent_and_concept[(r.get("parent"), r["concept"])] = r["path"]
 
@@ -403,14 +552,11 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
         norm_dims,
         key=lambda d: (_dim_base(d), _pos(d, dim_seq.get(id(d), 0)), dim_seq.get(id(d), 0)),
     )
-    dim_counters: dict[str, int] = defaultdict(int)
     for d in sorted_dims:
         base = _dim_base(d)
-        # Reuse a stored member path so re-runs do not drift it to a new slot
-        # (the path is already in ``used``, so only its own row may reclaim it).
-        stored_dim = (identity_paths or {}).get((
-            d.get("concept"), d.get("parent_concept"), True, d.get("parent_header")
-        ))
+        stored_dim = _lookup_identity(
+            identity_paths, d.get("concept"), d.get("parent_concept"), True, d.get("parent_header")
+        )
         if (
             stored_dim
             and stored_dim != "555"
@@ -418,26 +564,57 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
             and (not base or str(stored_dim).startswith(f"{base}."))
         ):
             cand = str(stored_dim)
-            pos_idx = len(cand.split(".")) - 1
+            d["path"] = cand
+            stored_dim_ok = _lookup_identity(
+                identity_order_keys, d.get("concept"), d.get("parent_concept"), True, d.get("parent_header")
+            )
+            if stored_dim_ok and str(stored_dim_ok):
+                d["order_key"] = str(stored_dim_ok)
+            else:
+                d["order_key"] = d.get("order_key") or "a"
+            d["level"] = len(cand.split(".")) - 1
+            used.add(cand)
+            claimed.add(cand)
         else:
-            dim_counters[base] += 1
-            pos_idx = dim_counters[base]
-            cand = f"{base}.{pos_idx:03d}" if base else f"{pos_idx:03d}"
-            while cand in used:
-                dim_counters[base] += 1
-                pos_idx = dim_counters[base]
-                cand = f"{base}.{pos_idx:03d}" if base else f"{pos_idx:03d}"
-        d["path"] = cand
-        stored_dim_ok = (identity_order_keys or {}).get((
-            d.get("concept"), d.get("parent_concept"), True, d.get("parent_header")
-        ))
-        if stored_dim_ok and str(stored_dim_ok):
-            d["order_key"] = str(stored_dim_ok)
-        else:
-            d["order_key"] = _order_key(pos_idx - 1)
-        d["level"] = len(cand.split(".")) - 1
-        used.add(cand)
-        claimed.add(cand)
+            # New dimensional concept: next incremental path & order key under base
+            max_suffix = 0
+            for p in used:
+                if base and p.startswith(f"{base}."):
+                    suffix_str = p[len(base) + 1:]
+                    if "." not in suffix_str and suffix_str.isdigit():
+                        max_suffix = max(max_suffix, int(suffix_str))
+                elif not base and "." not in p and p.isdigit():
+                    max_suffix = max(max_suffix, int(p))
+            n = max_suffix + 1
+            cand = f"{base}.{n:03d}" if base else f"{n:03d}"
+            while cand in used or n in (404, 555):
+                n += 1
+                cand = f"{base}.{n:03d}" if base else f"{n:03d}"
+            d["path"] = cand
+            d["level"] = len(cand.split(".")) - 1
+            used.add(cand)
+            claimed.add(cand)
+
+            # Sibling order keys for dims under base
+            local_dim_order = set()
+            for sd in sorted_dims:
+                if _dim_base(sd) == base:
+                    s_ok = _lookup_identity(identity_order_keys, sd.get("concept"), sd.get("parent_concept"), True, sd.get("parent_header"))
+                    if s_ok:
+                        local_dim_order.add(str(s_ok))
+                    elif sd.get("order_key"):
+                        local_dim_order.add(str(sd.get("order_key")))
+            if local_dim_order:
+                max_ok_idx = max((_order_key_index(ok) for ok in local_dim_order if _order_key_index(ok) >= 0), default=-1)
+                next_ok_idx = max_ok_idx + 1
+            else:
+                next_ok_idx = 0
+            new_ok = _order_key(next_ok_idx)
+            while new_ok in local_dim_order:
+                next_ok_idx += 1
+                new_ok = _order_key(next_ok_idx)
+            d["order_key"] = new_ok
+            local_dim_order.add(new_ok)
 
     return norm_rows, sorted_dims
 
@@ -454,20 +631,27 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
     if not callable(resolver):
         return [], {}, set(), {}, {}
     repo: Any = resolver(getattr(bundle, "form_type", None))
+    from normalization.src.data_normalization_service.database.database import is_polluted_path, _POLLUTED_PATH_RX
     try:
-        main = list(repo.collection.find({
-            "cik": getattr(bundle, "company_cik", None),
-            "statement_type": getattr(bundle, "statement_type", None),
-            "dimension_concept": False,
-        }))
+        main = [
+            r for r in repo.collection.find({
+                "cik": getattr(bundle, "company_cik", None),
+                "statement_type": getattr(bundle, "statement_type", None),
+                "dimension_concept": False,
+                "path": {"$not": _POLLUTED_PATH_RX},
+            }) if not is_polluted_path(r.get("path"))
+        ]
     except Exception:
         main = []
     try:
-        dims = list(repo.collection.find({
-            "cik": getattr(bundle, "company_cik", None),
-            "statement_type": getattr(bundle, "statement_type", None),
-            "dimension_concept": True,
-        }))
+        dims = [
+            r for r in repo.collection.find({
+                "cik": getattr(bundle, "company_cik", None),
+                "statement_type": getattr(bundle, "statement_type", None),
+                "dimension_concept": True,
+                "path": {"$not": _POLLUTED_PATH_RX},
+            }) if not is_polluted_path(r.get("path"))
+        ]
     except Exception:
         dims = []
     def _tree_key(s: dict) -> tuple:
@@ -547,6 +731,20 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
         identity_paths.setdefault(key, str(s["path"]))
         if s.get("order_key") is not None:
             identity_order_keys.setdefault(key, str(s["order_key"]))
+
+        # Also register aliases so incoming concepts matching an alias find stored placement
+        if s.get("aliases") and isinstance(s.get("aliases"), list):
+            for alias in s["aliases"]:
+                if alias and alias != s["concept"]:
+                    alias_key = (
+                        alias,
+                        s.get("parent_concept"),
+                        bool(s.get("dimension_concept")),
+                        s.get("parent_header"),
+                    )
+                    identity_paths.setdefault(alias_key, str(s["path"]))
+                    if s.get("order_key") is not None:
+                        identity_order_keys.setdefault(alias_key, str(s["order_key"]))
     return stored, path_by_concept, occupied, identity_paths, identity_order_keys
 
 
@@ -868,7 +1066,16 @@ def make_hierarchy_agent_node(
             # Compute the diff deterministically. If there are no new concepts,
             # stored paths are authoritative and we bypass the LLM entirely.
             proposal: dict = {"merges": {}, "rows": [], "dims": []}
-            stored_names = {r.get("concept") for r in stored if r.get("concept")}
+            stored_names = set()
+            for r in stored:
+                c = r.get("concept")
+                if c:
+                    stored_names.add(c)
+                    if "_" in c:
+                        stored_names.add(c.split("_")[-1])
+                for al in r.get("aliases") or []:
+                    if al:
+                        stored_names.add(al)
             filing_names = {r.get("concept") for r in filing_rows if r.get("concept")}
             new_concepts = filing_names - stored_names
             if stored and not new_concepts:
@@ -977,10 +1184,11 @@ def make_hierarchy_agent_node(
                             f"Stored rows: {len(stored)}, New incoming concepts: {len(new_concepts)}. "
                             f"The existing stored hierarchy in DB is verified ground truth — DO NOT redefine it completely.\n\n"
                             f"{context_dump}\n\n"
-                            f"Predict ONCE: if any new concept is an alias/rename of a stored concept, call decide_mapping(); "
-                            f"for new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
-                            f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically), "
-                            f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
+                            f"Predict ONCE:\n"
+                            f"1. Check the 'High-Probability Alias Candidates' above: if any new concept is an alias/synonym of a stored concept (representing the same economic line item), call decide_mapping({{\"concept\": \"<incoming>\", \"same_as\": \"<stored>\"}});\n"
+                            f"2. For genuinely new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
+                            f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically);\n"
+                            f"3. Immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
                         )
                     try:
                         _ = run_agent_loop(
@@ -1045,9 +1253,32 @@ def make_hierarchy_agent_node(
                 for r in rows if r.get("concept") and str(r["concept"]).startswith("custom:")
             }
 
+            # Index stored concepts by concept name and header parent
+            stored_by_concept: dict[str, dict] = {}
+            stored_header_by_parent: dict[tuple, dict] = {}
+            for s in stored:
+                if not s.get("concept") or s.get("dimension_concept"):
+                    continue
+                if str(s["concept"]).startswith("custom:"):
+                    stored_header_by_parent[(s["concept"], s.get("parent_concept"))] = s
+                else:
+                    stored_by_concept[s["concept"]] = s
+
             for item in list(concrete) + list(abstracts):
                 if not isinstance(item, dict) or not item.get("concept"):
                     continue
+                # If this item was already stored in DB, strictly retain its stored path and order_key
+                stored_entry = stored_by_concept.get(str(item["concept"]))
+                if stored_entry and stored_entry.get("path"):
+                    item["path"] = stored_entry["path"]
+                    item["order_key"] = stored_entry.get("order_key")
+                    item["hierarchy_level"] = stored_entry.get("hierarchy_level", stored_entry.get("level", 0))
+                    item["level"] = item["hierarchy_level"]
+                    item["parent_concept"] = stored_entry.get("parent_concept")
+                    item["_hierarchy_resolved"] = True
+                    item["hierarchy_source"] = "stored"
+                    continue
+
                 if str(item["concept"]).startswith("custom:"):
                     planned = plan_header_by_parent.get((item["concept"], item.get("parent_concept")))
                 else:
@@ -1110,11 +1341,23 @@ def make_hierarchy_agent_node(
             for dim in getattr(bundle, "dimensional_concepts", None) or []:
                 if not isinstance(dim, dict):
                     continue
+
+                # If this dimensional concept was already stored in DB, strictly retain its stored values
+                stored_dim_path = _lookup_identity(
+                    identity_paths, dim.get("concept"), dim.get("parent_concept"), True, dim.get("parent_header")
+                )
+                if stored_dim_path:
+                    dim["path"] = stored_dim_path
+                    dim["order_key"] = _lookup_identity(
+                        identity_order_keys, dim.get("concept"), dim.get("parent_concept"), True, dim.get("parent_header")
+                    )
+                    dim["hierarchy_level"] = len(str(stored_dim_path).split(".")) - 1
+                    dim["level"] = dim["hierarchy_level"]
+                    dim["_hierarchy_resolved"] = True
+                    dim["hierarchy_source"] = "stored"
+                    continue
                 
                 target = dim.get("_concept_target") or dim.get("concept")
-                # The agent might have also changed the parent_concept during the merge,
-                # but the simplest is to just look up by target concept. Wait, dim_plan is keyed by (parent, concept).
-                # If we don't know the new parent, we might not find it. But we can search for the concept.
                 entry = dim_plan.get((dim.get("parent_concept"), target))
                 if not entry:
                     # Fallback: search dim_plan for ANY entry matching the target concept
@@ -1175,40 +1418,16 @@ def make_hierarchy_agent_node(
                         if isinstance(item, dict) and item.get("concept") == concept:
                             item["_concept_target"] = same_as
 
-            # queue stored main-row path updates that the agent changed
-            stored_by_concept: dict[str, dict] = {}
-            stored_header_by_parent: dict[tuple, dict] = {}
-            for s in stored:
-                if not s.get("concept") or s.get("dimension_concept"):
-                    continue
-                if str(s["concept"]).startswith("custom:"):
-                    stored_header_by_parent[(s["concept"], s.get("parent_concept"))] = s
-                else:
-                    stored_by_concept[s["concept"]] = s
+            # Invariant: If a stock already exists in DB (stored is not empty),
+            # NEVER make any changes to the existing hierarchy in the DB!
+            # Only newly inserted concepts receive paths/order keys; existing concepts are immutable.
             existing_updates = []
-            for r in rows:
-                concept = r.get("concept")
-                if not concept:
-                    continue
-                if str(concept).startswith("custom:"):
-                    sv = stored_header_by_parent.get((concept, r.get("parent")))
-                else:
-                    sv = stored_by_concept.get(str(concept))
-                if sv and r.get("path") and (
-                    str(sv.get("path", "")) != str(r["path"])
-                    or str(sv.get("order_key", "")) != str(r.get("order_key", ""))
-                ):
-                    existing_updates.append({
-                        "_id": sv.get("_id"),
-                        "concept": concept,
-                        "form_type": getattr(bundle, "form_type", None),
-                        "path": r["path"],
-                        "order_key": r.get("order_key"),
-                        "hierarchy_level": r.get("level", 0),
-                        "level": r.get("level", 0),
-                        "parent_concept": r.get("parent"),
-                        "reason": "agent_hierarchy:unified",
-                    })
+            if not stored:
+                # Fresh seed — no existing stored rows to update
+                pass
+            else:
+                # Existing stock: strictly zero updates to existing stored hierarchy
+                existing_updates = []
             total_updates += len(existing_updates)
             all_promotions.extend(promotions)
             reasoned_about += 1

@@ -88,8 +88,13 @@ def test_promotion_moves_values_and_deletes_only_the_concept_row(mocker):
 
     # 1) values move onto the winner's id …
     move_call = value_repo.collection.update_many.call_args
-    assert move_call[0][0] == {"concept_id": loser["_id"]}
-    assert move_call[0][1] == {"$set": {"concept_id": winner["_id"]}}
+    assert move_call[0][0] == {
+        "$or": [
+            {"concept_id": loser["_id"]},
+            {"dimensional_concept_id": loser["_id"]},
+        ]
+    }
+    assert move_call[0][1]["$set"] == {"concept_id": winner["_id"]}
 
     # 2) the loser concept row is deleted — and NOTHING else destructive happens
     concept_repo.collection.delete_one.assert_called_once_with({"_id": loser["_id"]})
@@ -98,45 +103,31 @@ def test_promotion_moves_values_and_deletes_only_the_concept_row(mocker):
 
 
 def test_promotion_creates_the_winner_when_absent(mocker):
-    """The winner is created UNPLACED while the loser still owns its slot
-    (an occupied (path, order_key) would be rejected by the insert guard), then
-    moved into the loser's slot once the loser row is deleted."""
+    """When the winner tag does not exist as an independent concept in DB,
+    the stored row is updated in-place by its _id (zero deletion, zero collision)."""
     service = _service(mocker)
     loser = {"_id": ObjectId(), "concept": OLD_TAG, "label": "Revenues",
              "path": "001", "order_key": "a", "parent_concept": None,
-             "parent_path": None}
-    winner_id = ObjectId()
-    winner = {"_id": winner_id, "concept": NEW_TAG, "path": None}
+             "parent_path": None, "aliases": []}
 
     concept_repo = Mock()
-    # loser found, winner missing, winner found after creation
-    concept_repo.find_existing.side_effect = [loser, None, winner]
+    concept_repo.find_existing.side_effect = [loser, None]
     concept_repo.collection.find.return_value = []
-    concept_repo.collection.delete_one.return_value = Mock(deleted_count=1)
-    value_repo = Mock()
-    value_repo.collection.update_many.return_value = Mock(modified_count=0)
+    concept_repo.collection.update_one.return_value = Mock(modified_count=1)
 
     mocker.patch.object(service, "_get_concept_repo_by_form_type", return_value=concept_repo)
-    mocker.patch.object(service, "_get_value_repo_by_form_type", return_value=value_repo)
-    create = mocker.patch.object(service, "_create_concept", return_value=winner_id)
     service._concept_alias_store = Mock()
     service._concept_alias_store.promote.return_value = 0
 
     receipt = service.promote_concept("0000789019", "income", "10-Q", OLD_TAG, NEW_TAG)
 
-    create.assert_called_once()
-    assert create.call_args[0][0] == "0000789019"
-    assert create.call_args[0][2]["concept"] == NEW_TAG
-    # created UNPLACED — the loser still occupies the slot at insert time
-    assert "path" not in create.call_args[0][2]
-    assert "order_key" not in create.call_args[0][2]
-    assert receipt["deleted"] is True
-
-    # … then the winner reclaims the loser's now-free placement
-    place = concept_repo.collection.update_one.call_args
-    assert place[0][0] == {"_id": winner_id}
-    assert place[0][1]["$set"]["path"] == "001"
-    assert place[0][1]["$set"]["order_key"] == "a"
+    assert receipt["deleted"] is False
+    assert receipt["in_place_updated"] is True
+    # in-place update by _id preserves placement and values
+    update_call = concept_repo.collection.update_one.call_args_list[0]
+    assert update_call[0][0] == {"_id": loser["_id"]}
+    assert update_call[0][1]["$set"]["concept"] == NEW_TAG
+    assert OLD_TAG in update_call[0][1]["$set"]["aliases"]
 
 
 def test_promotion_does_not_repath_an_existing_winner(mocker):

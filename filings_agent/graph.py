@@ -30,6 +30,7 @@ from .nodes.repair import make_repair_node
 from .nodes.review import make_review_node
 from .nodes.validate import make_validate_node
 from .nodes.xbrl_extract import make_xbrl_extract_node
+from .nodes.targeted_extract import make_targeted_extract_node
 from .state import FilingAgentState
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,16 @@ def build_filing_graph(
     graph.add_node(
         "normalize_bundle",
         _wrap(make_normalize_node(norm_service), "normalize_bundle_node", decision_chat_llm),
+    )
+
+    # 3b. Targeted text extraction node (for placed concepts missing from XBRL)
+    graph.add_node(
+        "targeted_text_extract",
+        _wrap(
+            make_targeted_extract_node(norm_service, chat_llm=decision_chat_llm, on_event=on_event),
+            "targeted_text_extract_node",
+            decision_chat_llm,
+        ),
     )
 
     # 4. Deterministic multi-suite validation node
@@ -223,6 +234,11 @@ def build_filing_graph(
 
     graph.add_conditional_edges(
         "normalize_bundle",
+        _route_after("targeted_text_extract"),
+        {"targeted_text_extract": "targeted_text_extract", "__end__": END},
+    )
+    graph.add_conditional_edges(
+        "targeted_text_extract",
         _route_after("validate"),
         {"validate": "validate", "__end__": END},
     )

@@ -45,7 +45,7 @@ def test_single_axis_keeps_clean_member_name():
 
 
 def test_multi_axis_preserves_sub_breakdown_composite():
-    """Multi-axis facts combine deterministically to prevent collisions."""
+    """Multi-axis facts preserve the clean, specific member name without composite underscore concatenation."""
     data = _dim(
         {
             SEGMENT_AXIS: "meta:FamilyOfAppsMember",
@@ -54,8 +54,8 @@ def test_multi_axis_preserves_sub_breakdown_composite():
     )
     segment_type, concept = _service()._determine_segment_info(data)
 
-    assert segment_type == "business_segment"
-    assert concept == "meta:FamilyOfAppsMember_us-gaap:AdvertisingMember"
+    assert segment_type == "product_service"
+    assert concept == "us-gaap:AdvertisingMember"
 
 
 def test_naming_is_independent_of_dict_order():
@@ -71,7 +71,7 @@ def test_naming_is_independent_of_dict_order():
     first = _service()._determine_segment_info(_dim(axes_a))
     second = _service()._determine_segment_info(_dim(axes_b))
     assert first == second
-    assert first[1] == "meta:FamilyOfAppsMember_us-gaap:AdvertisingMember"
+    assert first[1] == "us-gaap:AdvertisingMember"
 
     # Repeated calls are stable too (no set/dict-order dependence).
     assert len({_service()._determine_segment_info(_dim(axes_a)) for _ in range(5)}) == 1
@@ -92,7 +92,7 @@ def test_wrapper_axes_do_not_produce_composite_names():
 
 
 def test_geographic_and_product_deterministic_naming():
-    """Product x geography combines deterministically to separate rows."""
+    """Product x geography prioritizes product over geography without underscore concatenation."""
     data = _dim(
         {
             "StatementGeographicalAxis": "srt:NorthAmericaMember",
@@ -100,5 +100,5 @@ def test_geographic_and_product_deterministic_naming():
         }
     )
     segment_type, concept = _service()._determine_segment_info(data)
-    assert segment_type == "geographic_segment"
-    assert concept == "srt:NorthAmericaMember_gtls:SpecialtyProductsMember"
+    assert segment_type == "product_service"
+    assert concept == "gtls:SpecialtyProductsMember"

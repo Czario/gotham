@@ -8,11 +8,20 @@ the surviving tag.
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
-from typing import Any
+from typing import Any, Optional
 
 from langchain_core.tools import tool
 from utilities.helpers.period_utils import is_annual_form
+
+
+def _concept_tokens(concept: Optional[str], label: Optional[str] = None) -> set[str]:
+    """Tokenize a concept name (and optional label) for heuristic similarity."""
+    text = f"{concept or ''} {label or ''}"
+    words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+", text)
+    stopwords = {"us", "gaap", "custom", "and", "or", "of", "in", "the", "for", "with", "member", "axis", "line", "items"}
+    return {w.lower() for w in words if len(w) > 2 and w.lower() not in stopwords}
 
 
 def fmt_row(row: dict) -> str:
@@ -178,17 +187,41 @@ def build_unified_hierarchy_tools(
                 lbl = r.get("label") or ""
                 p = r.get("parent_concept") or r.get("parent")
 
-                q = c.split(":")[-1].lower()
-                candidates = [
-                    sr for sr in stored_rows
-                    if not sr.get("dimension_concept")
-                    and q in str(sr.get("concept", "")).lower()
-                ][:3]
-                cands = [
-                    f"{sr.get('concept')} (latest_period={sr.get('latest_period') or 'unknown'})"
-                    for sr in candidates
-                ]
-                cand_str = f" | Candidates to merge with: {cands}" if cands else ""
+                # Heuristic / semantic candidate finding for AI decide_mapping
+                c_tokens = _concept_tokens(c, lbl)
+                candidate_matches = []
+                for sr in stored_rows:
+                    if sr.get("dimension_concept"):
+                        continue
+                    sr_concept = str(sr.get("concept", ""))
+                    sr_label = sr.get("label") or ""
+                    sr_tokens = _concept_tokens(sr_concept, sr_label)
+                    overlap = c_tokens & sr_tokens
+                    exact_label_match = bool(lbl and sr_label and lbl.strip().lower() == sr_label.strip().lower())
+                    is_absent = sr in stored_absent
+                    
+                    score = len(overlap)
+                    if exact_label_match:
+                        score += 5
+                    if is_absent:
+                        score += 2
+                    
+                    if score >= 2 or exact_label_match or (overlap and is_absent):
+                        reasons = []
+                        if exact_label_match:
+                            reasons.append("exact label match")
+                        if overlap:
+                            reasons.append(f"shared keywords: {list(overlap)[:3]}")
+                        if is_absent:
+                            reasons.append("previously reported but absent in this filing")
+                        reason_desc = f" ({', '.join(reasons)})" if reasons else ""
+                        candidate_matches.append((
+                            score,
+                            f"{sr_concept}{reason_desc}"
+                        ))
+                candidate_matches.sort(key=lambda x: x[0], reverse=True)
+                top_cands = [item[1] for item in candidate_matches[:3]]
+                cand_str = f" | High-Probability Alias Candidates to merge with: {top_cands}" if top_cands else ""
                 incoming_period = f"; incoming latest_period={r.get('latest_period') or 'unknown'}"
 
                 parent_info = ""
@@ -347,20 +380,9 @@ def build_unified_hierarchy_tools(
                 and (s.get("parent_concept") or s.get("parent")) == same_as
             ]
             proposal["merges"][concept]["children"] = children
-            if children:
-                listing = "; ".join(
-                    f"{c['concept']} (now {c.get('path')})" for c in children
-                )
-                return (
-                    f"OK — '{concept}' becomes the surviving name; '{same_as}' is retired. "
-                    f"{period_decision} Its {len(children)} dimensional child(ren) must follow it: {listing}. "
-                    f"Re-parent EACH under '{concept}' with "
-                    f"move_row({{\"concept\": \"<child>\", \"parent_concept\": \"{concept}\"}}), "
-                    "then run check_hierarchy() before finalizing."
-                )
             return (
-                f"OK — '{concept}' will become the surviving name; "
-                f"'{same_as}' is retired (no dimensional children). {period_decision}"
+                f"OK — '{same_as}' merges into '{concept}'. {period_decision} "
+                f"Concept tag and label updated in-place; stored path, order key, and any dimensional children are preserved as is."
             )
         return f"OK — '{concept}' merges into existing '{same_as}'. {period_decision}"
 
@@ -373,12 +395,20 @@ def build_unified_hierarchy_tools(
         # 1. Base main rows from stored
         merged_away = set()
         incoming_aliases: dict[str, str] = {}
+        merge_renames: dict[str, tuple[str, Optional[str]]] = {}
         for c, m in (proposal.get("merges") or {}).items():
             if isinstance(m, dict):
                 same_as = m.get("same_as")
                 if same_as:
+                    incoming_label = next(
+                        (r.get("label") for r in filing_rows if r.get("concept") == c),
+                        None,
+                    )
                     if m.get("keep_tag") == "incoming":
-                        merged_away.add(same_as)
+                        # Stored concept same_as updates its concept to c and label to incoming_label.
+                        # Stored placement (path, order_key, level, children) is kept as is!
+                        merge_renames[str(same_as)] = (str(c), incoming_label)
+                        incoming_aliases[str(c)] = str(same_as)
                     else:
                         merged_away.add(c)
                         incoming_aliases[str(c)] = str(same_as)
@@ -419,21 +449,43 @@ def build_unified_hierarchy_tools(
                     return True
             return False
 
-        stored_main = [
-            {
-                "concept": s["concept"],
-                "parent": s.get("parent_concept") or s.get("parent"),
-                "label": s.get("label"),
-                "order": s.get("order"),
-                "order_key": s.get("order_key"),
-                "level": s.get("level", 0),
-                "abstract": s.get("abstract", False),
-                "_is_stored": True,
-            }
-            for s in stored_rows
-            if not s.get("dimension_concept") and s.get("concept") and s["concept"] not in merged_away
-            and not _is_removed(s["concept"], s.get("parent_concept"))
-        ]
+        stored_main = []
+        for s in stored_rows:
+            if s.get("dimension_concept") or not s.get("concept"):
+                continue
+            orig_concept = s["concept"]
+            if orig_concept in merge_renames:
+                new_c, new_lbl = merge_renames[orig_concept]
+                item = {
+                    "concept": new_c,
+                    "parent": s.get("parent_concept") or s.get("parent"),
+                    "label": new_lbl or s.get("label"),
+                    "order": s.get("order"),
+                    "order_key": s.get("order_key"),
+                    "level": s.get("level", 0),
+                    "abstract": s.get("abstract", False),
+                    "_is_stored": True,
+                }
+            else:
+                if orig_concept in merged_away:
+                    continue
+                item = {
+                    "concept": orig_concept,
+                    "parent": s.get("parent_concept") or s.get("parent"),
+                    "label": s.get("label"),
+                    "order": s.get("order"),
+                    "order_key": s.get("order_key"),
+                    "level": s.get("level", 0),
+                    "abstract": s.get("abstract", False),
+                    "_is_stored": True,
+                }
+            # Remap parent if parent was renamed in merge
+            p = item.get("parent")
+            if p and str(p) in merge_renames:
+                item["parent"] = merge_renames[str(p)][0]
+
+            if not _is_removed(item["concept"], item.get("parent")):
+                stored_main.append(item)
         stored_main_concepts = {s["concept"] for s in stored_main}
         parsed_row_concepts = {
             r.get("concept") for r in effective_rows if r.get("concept")
@@ -463,21 +515,34 @@ def build_unified_hierarchy_tools(
             final_rows = merged
 
         # 2. Base dimensional members from stored
-        stored_dims = [
-            {
-                "concept": s.get("concept") or s.get("member"),
-                "parent_concept": s.get("parent_concept") or s.get("parent"),
-                "label": s.get("label"),
+        stored_dims = []
+        for s in stored_rows:
+            if not s.get("dimension_concept") or not (s.get("concept") or s.get("member")):
+                continue
+            orig_concept = s.get("concept") or s.get("member")
+            orig_parent = s.get("parent_concept") or s.get("parent")
+            new_concept = orig_concept
+            new_label = s.get("label")
+            new_parent = orig_parent
+
+            if orig_concept in merge_renames:
+                new_concept, new_label = merge_renames[orig_concept]
+                new_label = new_label or s.get("label")
+            if orig_parent and str(orig_parent) in merge_renames:
+                new_parent = merge_renames[str(orig_parent)][0]
+
+            item = {
+                "concept": new_concept,
+                "parent_concept": new_parent,
+                "label": new_label,
                 "segment_type": s.get("segment_type"),
                 "parent_header": s.get("parent_header"),
                 "order": s.get("order"),
                 "order_key": s.get("order_key"),
                 "_is_stored": True,
             }
-            for s in stored_rows
-            if s.get("dimension_concept") and (s.get("concept") or s.get("member"))
-            and not _is_removed(s.get("concept") or s.get("member"), s.get("parent_concept"))
-        ]
+            if not _is_removed(item["concept"], item.get("parent_concept")):
+                stored_dims.append(item)
         stored_dim_concepts = {d["concept"] for d in stored_dims}
         parsed_dim_concepts = {
             d.get("concept") or d.get("member")

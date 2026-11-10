@@ -17,6 +17,7 @@ from ..database import (
     CompanyRepository,
     DatabaseTracker
 )
+from ..database.database import is_polluted_path, _POLLUTED_PATH_RX
 from ..core.config import AppConfig
 from ..core.concept_canonicalization import canonical_concept
 from ..core.row_identity import row_key_str, dimension_signature as _dim_sig
@@ -1111,6 +1112,7 @@ class FinancialNormalizationService:
             item['concept'],
             dimension_concept=item.get('dimension', False),
             parent_concept=parent_scope,
+            label=item.get('label'),
         )
         adopted_legacy_header = False
         if existing is None and parent_scope is not None:
@@ -1151,6 +1153,7 @@ class FinancialNormalizationService:
 
         if existing:
             concept_id = existing['_id']
+            incoming_concept = item.get('concept')
             if adopted_legacy_header:
                 # The hierarchy agent approved the new placement. Repair the
                 # legacy row in place; the later parent-link phase fills in the
@@ -1171,17 +1174,44 @@ class FinancialNormalizationService:
                     "for %s %s (ID %s); skipped duplicate creation",
                     item['concept'], parent_scope, cik, statement_type, concept_id,
                 )
-            # Self-heal labels persisted before cleaning existed.
-            cleaned_existing_label = clean_label(existing.get('label'))
-            if cleaned_existing_label and cleaned_existing_label != existing.get('label'):
-                concept_repo.collection.update_one(
-                    {'_id': concept_id}, {'$set': {'label': cleaned_existing_label}}
-                )
-                logger.debug(
-                    f"Cleaned stored label for existing concept {item['concept']}: "
-                    f"{existing.get('label')!r} -> {cleaned_existing_label!r}"
-                )
-            logger.debug(f"Reusing existing concept: {item['concept']} (ID: {concept_id}) - keeping concept as-is")
+            else:
+                # Self-heal / in-place update of concept document:
+                # - Reuses existing concept_id
+                # - Updates label if cleaned incoming label differs
+                # - Updates form_type if provided and differs
+                # - Adds both existing concept and incoming concept to aliases array
+                # - Updates updated_at timestamp
+                # - Keeps path and order_key strictly frozen!
+                cleaned_existing_label = clean_label(existing.get('label'))
+                cleaned_incoming_label = clean_label(item.get('label'))
+                update_fields: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+                if cleaned_incoming_label and cleaned_incoming_label != existing.get('label'):
+                    update_fields["label"] = cleaned_incoming_label
+                elif cleaned_existing_label and cleaned_existing_label != existing.get('label'):
+                    update_fields["label"] = cleaned_existing_label
+
+                if form_type and form_type != existing.get('form_type'):
+                    update_fields["form_type"] = form_type
+
+                incoming_concept = item.get('concept')
+                existing_concept = existing.get('concept')
+                aliases_to_add = set()
+                if existing.get('aliases') and isinstance(existing.get('aliases'), list):
+                    aliases_to_add.update(existing['aliases'])
+                if existing_concept:
+                    aliases_to_add.add(existing_concept)
+                if incoming_concept:
+                    aliases_to_add.add(incoming_concept)
+
+                if incoming_concept and incoming_concept != existing_concept:
+                    update_fields["concept"] = incoming_concept
+
+                update_op: Dict[str, Any] = {"$set": update_fields}
+                if aliases_to_add:
+                    update_op["$addToSet"] = {"aliases": {"$each": sorted(list(aliases_to_add))}}
+
+                concept_repo.collection.update_one({'_id': concept_id}, update_op)
+            logger.debug(f"Reusing existing concept: {incoming_concept} (ID: {concept_id}) - updated in-place")
         else:
             # Only create new concept if it doesn't exist
             logger.debug(f"Creating new concept: {item['concept']}")
@@ -1274,26 +1304,41 @@ class FinancialNormalizationService:
         )
         winner_created = False
         if not winner:
-            item = dict(winner_item or {})
-            item.update(
-                {
-                    "concept": to_concept,
-                    "label": item.get("label") or loser.get("label"),
-                    "abstract": False,
-                    "dimension": loser.get("dimension", False),
-                }
+            # IN-PLACE ID-BASED UPDATE:
+            # When the target tag does not already exist as a separate row in the DB,
+            # update the stored concept row in-place by its _id.
+            # Its _id, path, order_key, hierarchy_level, and all values pointing to it
+            # remain completely untouched — zero movement, zero collision, zero deletion.
+            aliases = list(loser.get("aliases") or [])
+            if from_concept not in aliases:
+                aliases.append(from_concept)
+            new_label = (winner_item or {}).get("label") or loser.get("label")
+            update_fields: dict[str, Any] = {
+                "concept": to_concept,
+                "label": new_label,
+                "aliases": aliases,
+            }
+            if loser.get("canonical_concept") in (None, from_concept):
+                update_fields["canonical_concept"] = to_concept
+            concept_repo.collection.update_one(
+                {"_id": loser["_id"]},
+                {"$set": update_fields},
             )
-            # The loser still occupies its (path, order_key) slot, and the
-            # insert guard rejects a second row in an occupied slot — so the
-            # winner is inserted unplaced and moved into the loser's slot once
-            # the loser row is deleted at step 4.
-            item.pop("path", None)
-            item.pop("order_key", None)
-            winner_id = self._create_concept(cik, statement_type, item, form_type)
-            winner = concept_repo.find_existing(
-                cik, statement_type, to_concept, dimension_concept=False
-            ) or {"_id": winner_id, "concept": to_concept, "path": None}
-            winner_created = True
+            concept_repo.collection.update_many(
+                {
+                    "cik": cik,
+                    "statement_type": statement_type,
+                    "parent_concept": from_concept,
+                },
+                {"$set": {"parent_concept": to_concept}},
+            )
+            receipt["values_moved"] = 0
+            receipt["deleted"] = False
+            receipt["in_place_updated"] = True
+            receipt["alias_rows_repointed"] = self._repoint_concept_aliases(
+                cik, statement_type, form_type, from_concept, to_concept
+            )
+            return receipt
         winner_id = winner["_id"]
 
         # 1) MOVE values — repoint, never delete.  The value collection has a
@@ -1303,8 +1348,16 @@ class FinancialNormalizationService:
         #    only the genuine same-period duplicate.
         try:
             moved = value_repo.collection.update_many(
-                {"concept_id": loser["_id"]},
-                {"$set": {"concept_id": winner_id}},
+                {
+                    "$or": [
+                        {"concept_id": loser["_id"]},
+                        {"dimensional_concept_id": loser["_id"]},
+                    ]
+                },
+                {
+                    "$set": {"concept_id": winner_id},
+                    "$unset": {"dimensional_concept_id": ""},
+                },
             )
             receipt["values_moved"] = getattr(moved, "modified_count", 0)
         except Exception as exc:  # noqa: BLE001 — likely a unique-key collision
@@ -1408,9 +1461,23 @@ class FinancialNormalizationService:
             cik, statement_type, form_type, from_concept, to_concept
         )
 
-        # 4) Hard-delete the losing concept row (the only destructive step).
-        deleted = concept_repo.collection.delete_one({"_id": loser["_id"]})
-        receipt["deleted"] = bool(getattr(deleted, "deleted_count", 0))
+        # 4) Hard-delete the losing concept row only if NO values remain pointing to it!
+        count_fn = getattr(value_repo.collection, "count_documents", None)
+        remaining = count_fn({
+            "$or": [
+                {"concept_id": loser["_id"]},
+                {"dimensional_concept_id": loser["_id"]},
+            ]
+        }) if callable(count_fn) else 0
+        if isinstance(remaining, int) and remaining > 0:
+            logger.error(
+                "promote_concept: REFUSING to delete concept %s (%s) because %s value(s) still point to it!",
+                loser["_id"], from_concept, remaining
+            )
+            receipt["deleted"] = False
+        else:
+            deleted = concept_repo.collection.delete_one({"_id": loser["_id"]})
+            receipt["deleted"] = bool(getattr(deleted, "deleted_count", 0))
 
         # 4b) A freshly-created winner was inserted unplaced; the loser's slot
         #     is free now, so hand it over so the line item keeps its position.
@@ -1610,6 +1677,17 @@ class FinancialNormalizationService:
         # Annual values are keyed by fiscal year, without a quarter.
         if _is_annual_form_type(filing.form_type):
             clean_reporting_period.pop('quarter', None)
+
+        # Never insert values for polluted 404/555 concepts (mirrors earning_agent)
+        concept_path = item.get('path')
+        if not concept_path:
+            concept_repo = self._get_concept_repo_by_form_type(filing.form_type)
+            finder = getattr(concept_repo, 'find_by_id', None)
+            concept_doc = finder(concept_id) if callable(finder) else None
+            concept_path = (concept_doc or {}).get('path')
+        if is_polluted_path(concept_path):
+            logger.info("Skipping value record for concept %s with polluted path %s", concept_id, concept_path)
+            return None
 
         # Get the appropriate value repository based on form type
         value_repo = self._get_value_repo_by_form_type(filing.form_type)
@@ -2551,10 +2629,12 @@ class FinancialNormalizationService:
         _signature = _dim_sig(
             dimension_data.get('dimensions'), dimension_data.get('dimension_details')
         )
+        incoming_label = dimension_data.get('label')
         existing = concept_repo.find_dimensional_existing(
             company_cik, statement_type, segment_type, concept, concept_id,
             dimension_signature=_signature,
             parent_header=parent_header,
+            label=incoming_label,
         )
         parent_concept_name = dimension_data.get('concept_name')
         semantic_candidates = []
@@ -2569,6 +2649,7 @@ class FinancialNormalizationService:
                 parent_concept_name,
                 _signature,
                 parent_header=parent_header,
+                label=incoming_label,
             ) or [])
 
         if semantic_candidates:
@@ -2595,9 +2676,13 @@ class FinancialNormalizationService:
                             str(row.get('_id')),
                         ),
                     )
+            # Only unplaced or polluted rows with matching label can be treated as duplicate
             duplicates = [
                 row for row in semantic_candidates
                 if row.get('_id') != existing.get('_id')
+                and not is_polluted_path(row.get('path'))
+                and row.get('path') in (None, "", "404", "555", existing.get('path'))
+                and clean_label(row.get('label')) == clean_label(existing.get('label'))
             ]
             if duplicates:
                 self._coalesce_dimensional_concept_rows(
@@ -2616,15 +2701,29 @@ class FinancialNormalizationService:
                 logger.debug(f"Dimensional concept {concept} found with different segment_type: "
                            f"existing={existing.get('segment_type')}, determined={segment_type}. Using existing.")
             updates = {}
-            # Self-heal labels persisted before cleaning existed.
+            if existing.get('concept') != concept:
+                updates['concept'] = concept
+                old_concept = existing.get('concept')
+                if old_concept:
+                    concept_repo.collection.update_one(
+                        {'_id': dimensional_concept_id},
+                        {'$addToSet': {'aliases': old_concept}}
+                    )
+            # Update label when merging / reusing
+            cleaned_incoming_label = clean_label(dimension_data.get('label'))
             cleaned_existing_label = clean_label(existing.get('label'))
-            if cleaned_existing_label and cleaned_existing_label != existing.get('label'):
+            if cleaned_incoming_label and cleaned_incoming_label != existing.get('label'):
+                updates['label'] = cleaned_incoming_label
+            elif cleaned_existing_label and cleaned_existing_label != existing.get('label'):
                 updates['label'] = cleaned_existing_label
-            if assigned_path and existing.get('path') != assigned_path:
+
+            # When merging or reusing any concept, KEEP existing path and order_key AS IS!
+            # Only set path/order_key if existing had NONE (unplaced legacy concept)
+            if not existing.get('path') and assigned_path:
                 updates['path'] = assigned_path
                 updates['hierarchy_level'] = len(assigned_path.split('.')) - 1
                 updates['level'] = updates['hierarchy_level']
-            if assigned_order_key and existing.get('order_key') != assigned_order_key:
+            if not existing.get('order_key') and assigned_order_key:
                 updates['order_key'] = assigned_order_key
             # Parent ObjectIds can change when a parent concept is promoted or
             # repaired. Keep this member attached to the current parent while
@@ -2693,14 +2792,31 @@ class FinancialNormalizationService:
         """
         values = value_repo.collection
         moved = dropped = removed_rows = 0
+        winner_doc = concept_repo.collection.find_one({'_id': winner_id})
+        winner_label = clean_label((winner_doc or {}).get('label'))
         for duplicate in duplicate_rows:
             duplicate_id = duplicate.get('_id')
             if not duplicate_id or duplicate_id == winner_id:
                 continue
+            dup_path = duplicate.get('path')
+            # Hard refusal: Placed concepts are structural hierarchy rows and must NEVER be deleted or coalesced!
+            if not is_polluted_path(dup_path) and dup_path not in (None, "", "404", "555"):
+                logger.warning(
+                    "Refusing to coalesce placed concept %s (path %s, label %r) into %s",
+                    duplicate_id, dup_path, duplicate.get('label'), winner_id,
+                )
+                continue
+            dup_label = clean_label(duplicate.get('label'))
+            if winner_label and dup_label and winner_label != dup_label:
+                logger.warning(
+                    "Refusing to coalesce concept %s (label %r) into %s (label %r): labels differ",
+                    duplicate_id, duplicate.get('label'), winner_id, (winner_doc or {}).get('label'),
+                )
+                continue
             old_values = list(values.find({
                 '$or': [
                     {'dimensional_concept_id': duplicate_id},
-                    {'concept_id': duplicate_id, 'dimension_value': True},
+                    {'concept_id': duplicate_id},
                 ],
             }))
             for value in old_values:
@@ -2742,8 +2858,22 @@ class FinancialNormalizationService:
                         values.delete_one({'_id': value['_id']})
                         dropped += 1
 
-            deleted = concept_repo.collection.delete_one({'_id': duplicate_id})
-            removed_rows += bool(getattr(deleted, 'deleted_count', 0))
+            # Safety check: do NOT delete if any value still references duplicate_id
+            count_fn = getattr(values, 'count_documents', None)
+            remaining_vals = count_fn({
+                '$or': [
+                    {'concept_id': duplicate_id},
+                    {'dimensional_concept_id': duplicate_id},
+                ]
+            }) if callable(count_fn) else 0
+            if isinstance(remaining_vals, int) and remaining_vals > 0:
+                logger.error(
+                    "Refusing to delete concept %s because %s value(s) still point to it!",
+                    duplicate_id, remaining_vals,
+                )
+            else:
+                deleted = concept_repo.collection.delete_one({'_id': duplicate_id})
+                removed_rows += bool(getattr(deleted, 'deleted_count', 0))
 
         if removed_rows:
             logger.warning(
@@ -2862,51 +2992,59 @@ class FinancialNormalizationService:
         primary_axis = None
         primary_member = None
         
-        # Priority 1: Business/Geographic segments (most specific)
+        # Priority 1: Product/Service segments (most specific operational breakdown)
         for axis_name, member_name in meaningful_dimensions.items():
             axis_lower = axis_name.lower()
-            if 'statementbusinesssegments' in axis_lower:
-                segment_type = 'business_segment'
+            if 'product' in axis_lower or 'service' in axis_lower:
+                segment_type = 'product_service'
                 concept = get_qualified_member_name(axis_name, member_name)
                 primary_axis = axis_name
                 primary_member = concept
                 break
-            elif 'statementgeographical' in axis_lower or 'geographic' in axis_lower:
-                segment_type = 'geographic_segment'
-                concept = get_qualified_member_name(axis_name, member_name)
-                primary_axis = axis_name
-                primary_member = concept
-                break
-        
-        # Priority 2: Investment/Financial Instrument breakdowns
+
+        # Priority 2: Cash/Securities/Investment schedule breakdowns
         if not segment_type:
             for axis_name, member_name in meaningful_dimensions.items():
                 axis_lower = axis_name.lower()
-                if 'investmenttype' in axis_lower:
-                    segment_type = 'investment_type'
+                if (
+                    ('scheduleof' in axis_lower and ('cash' in axis_lower or 'securities' in axis_lower))
+                    or 'investmenttype' in axis_lower
+                    or 'fairvaluebyfairvaluehierarchylevel' in axis_lower
+                ):
+                    if 'investmenttype' in axis_lower:
+                        segment_type = 'investment_type'
+                    elif 'fairvalue' in axis_lower:
+                        segment_type = 'fair_value_level'
+                    else:
+                        segment_type = 'cash_securities_schedule'
                     concept = get_qualified_member_name(axis_name, member_name)
                     primary_axis = axis_name
                     primary_member = concept
                     break
-                elif 'fairvaluebyfairvaluehierarchylevel' in axis_lower:
-                    segment_type = 'fair_value_level'
-                    concept = get_qualified_member_name(axis_name, member_name)
-                    primary_axis = axis_name
-                    primary_member = concept
-                    break
-        
-        # Priority 3: Derivative/Risk instruments
+
+        # Priority 3: Geographic segments
         if not segment_type:
             for axis_name, member_name in meaningful_dimensions.items():
                 axis_lower = axis_name.lower()
-                if 'derivativeinstrumentrisk' in axis_lower:
-                    segment_type = 'derivative_risk'
+                if 'statementgeographical' in axis_lower or 'geographic' in axis_lower:
+                    segment_type = 'geographic_segment'
                     concept = get_qualified_member_name(axis_name, member_name)
                     primary_axis = axis_name
                     primary_member = concept
                     break
-        
-        # Priority 4: Equity/Comprehensive income components
+
+        # Priority 4: Business segments (container segments)
+        if not segment_type:
+            for axis_name, member_name in meaningful_dimensions.items():
+                axis_lower = axis_name.lower()
+                if 'statementbusinesssegments' in axis_lower:
+                    segment_type = 'business_segment'
+                    concept = get_qualified_member_name(axis_name, member_name)
+                    primary_axis = axis_name
+                    primary_member = concept
+                    break
+
+        # Priority 5: Equity/Comprehensive income components
         if not segment_type:
             for axis_name, member_name in meaningful_dimensions.items():
                 axis_lower = axis_name.lower()
@@ -2922,42 +3060,19 @@ class FinancialNormalizationService:
                     primary_axis = axis_name
                     primary_member = concept
                     break
-        
-        # Priority 5: Consolidation segments
+
+        # Priority 6: Derivative/Risk instruments
         if not segment_type:
             for axis_name, member_name in meaningful_dimensions.items():
                 axis_lower = axis_name.lower()
-                if 'consolidationitems' in axis_lower:
-                    segment_type = 'consolidation'
+                if 'derivativeinstrumentrisk' in axis_lower:
+                    segment_type = 'derivative_risk'
                     concept = get_qualified_member_name(axis_name, member_name)
                     primary_axis = axis_name
                     primary_member = concept
                     break
-        
-        # Priority 6: Cash/Securities schedule breakdowns
-        if not segment_type:
-            for axis_name, member_name in meaningful_dimensions.items():
-                axis_lower = axis_name.lower()
-                if ('scheduleof' in axis_lower and 
-                    ('cash' in axis_lower or 'securities' in axis_lower)):
-                    segment_type = 'cash_securities_schedule'
-                    concept = get_qualified_member_name(axis_name, member_name)
-                    primary_axis = axis_name
-                    primary_member = concept
-                    break
-        
-        # Priority 7: Product/Service segments
-        if not segment_type:
-            for axis_name, member_name in meaningful_dimensions.items():
-                axis_lower = axis_name.lower()
-                if ('product' in axis_lower or 'service' in axis_lower):
-                    segment_type = 'product_service'
-                    concept = get_qualified_member_name(axis_name, member_name)
-                    primary_axis = axis_name
-                    primary_member = concept
-                    break
-        
-        # Priority 8: Nature of expense
+
+        # Priority 7: Nature of expense
         if not segment_type:
             for axis_name, member_name in meaningful_dimensions.items():
                 axis_lower = axis_name.lower()
@@ -2968,10 +3083,7 @@ class FinancialNormalizationService:
                     primary_member = concept
                     break
 
-        # Priority 9: Typed date dimensions (e.g. performance obligation timing).
-        # These axes carry a raw date string as the "member" rather than a named
-        # explicit member.  Build a stable, human-identifiable concept key so the
-        # UI never displays a bare date as a concept name.
+        # Priority 8: Typed date dimensions
         if not segment_type:
             import re as _re
             _DATE_RE = _re.compile(r'^\d{4}-\d{2}-\d{2}$')
@@ -2982,7 +3094,6 @@ class FinancialNormalizationService:
                         segment_type = 'performance_obligation'
                         concept = f'us-gaap:RevenueRemainingPerformanceObligation_{member_name}'
                     else:
-                        # Generic typed-date axis — derive a readable segment type
                         axis_clean = axis_name.replace('Axis', '').lower()
                         segment_type = f'typed_date_{axis_clean}' if axis_clean else 'typed_date'
                         concept = f'{axis_clean}_{member_name}' if axis_clean else member_name
@@ -2990,16 +3101,26 @@ class FinancialNormalizationService:
                     primary_member = concept
                     break
 
+        # Priority 9: Consolidation segments
+        if not segment_type:
+            for axis_name, member_name in meaningful_dimensions.items():
+                axis_lower = axis_name.lower()
+                if 'consolidationitems' in axis_lower:
+                    segment_type = 'consolidation'
+                    concept = get_qualified_member_name(axis_name, member_name)
+                    primary_axis = axis_name
+                    primary_member = concept
+                    break
+
         # Fallback: use a deterministic primary dimension and derive a descriptive
-        # segment type from its axis.  Dict iteration order is not stable across
-        # runs, so an arbitrary pick here previously produced order-reversed
-        # duplicate concepts for the same fact (435 such twins in production).
+        # segment type from its axis.
         def _primary_dimension_key(axis_name: str) -> tuple:
             lowered = str(axis_name).lower()
             return (
-                0 if "segment" in lowered else 1,
-                0 if "product" in lowered else 1,
+                0 if "product" in lowered or "service" in lowered else 1,
+                0 if "cash" in lowered or "securit" in lowered or "investment" in lowered else 1,
                 0 if "geograph" in lowered else 1,
+                0 if "segment" in lowered else 1,
                 lowered,
             )
 
@@ -3010,7 +3131,6 @@ class FinancialNormalizationService:
             
             # Create segment type from axis name
             axis_clean = first_axis.replace('Axis', '').lower()
-            # Remove common prefixes to get cleaner names
             for prefix in ['statementof', 'scheduleof', 'us_gaap_', 'usgaap']:
                 axis_clean = axis_clean.replace(prefix, '')
             
@@ -3018,30 +3138,10 @@ class FinancialNormalizationService:
             concept = get_qualified_member_name(first_axis, first_member)
             primary_axis = first_axis
             primary_member = concept
-        
-        # Handle multi-dimensional cases: when multiple substantive axes exist,
-        # construct a deterministic composite concept name to distinguish sub-breakdown rows
-        # (e.g. Segment x Product, Segment x Geography) and match existing database concepts.
-        _WRAPPER_AXES = {
-            'consolidationitemsaxis',       # srt:ConsolidationItemsAxis / us-gaap:ConsolidationItemsAxis
-            'consolidationaxis',
-            'segmentreportingaxis',
-            'reportablelegalentitiesaxis',
-            'legalentityaxis',
-            'consolidatedentitiesaxis',
-        }
-        if len(meaningful_dimensions) > 1 and primary_axis and concept:
-            other_dimensions = {
-                k: v for k, v in meaningful_dimensions.items()
-                if k != primary_axis and k.lower() not in _WRAPPER_AXES
-            }
-            if other_dimensions:
-                # Sort deterministically by axis priority to ensure identical order across all runs
-                for other_axis, other_member in sorted(
-                    other_dimensions.items(), key=lambda kv: _primary_dimension_key(kv[0])
-                ):
-                    other_qualified = get_qualified_member_name(other_axis, other_member)
-                    concept = f"{concept}_{other_qualified}"
+
+        # Never synthesize composite concepts with '_' (e.g. 'A_B').
+        # Concepts must remain clean, authentic single XBRL members.
+        # The full multi-dimensional slice is preserved in dimension_signature.
 
         # Don't clean up concept name - preserve the qualified names with namespaces
         # The qualified names are needed to match existing dimensional concepts in the database
@@ -3268,6 +3368,17 @@ class FinancialNormalizationService:
         }
         if _is_annual_form_type(filing.form_type):
             clean_reporting_period.pop('quarter', None)
+
+        # Never insert values for polluted 404/555 concepts (mirrors earning_agent)
+        concept_repo = self._get_concept_repo_by_form_type(filing.form_type)
+        finder = getattr(concept_repo, 'find_by_id', None)
+        dim_doc = finder(dimensional_concept_id) if callable(finder) else None
+        if dim_doc and is_polluted_path(dim_doc.get("path")):
+            logger.info(
+                "Skipping dimensional value write for polluted concept %s with path %s",
+                dimensional_concept_id, dim_doc.get("path"),
+            )
+            return
 
         # Check for existing dimensional value to prevent duplicates
         # Get the appropriate value repository based on form type
