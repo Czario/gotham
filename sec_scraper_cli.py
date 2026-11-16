@@ -2474,9 +2474,10 @@ class SECDataScraperApp:
                     _html_text = statements_data.get('html_content')
                     if not _html_text:
                         _tkr = agent_state.get('ticker') or ''
+                        _html_base = Path(self.html_download_path or os.getenv('SEC_HTML_DOWNLOAD_PATH') or (Path.home() / 'sec_html_filings'))
                         for _cand_html in (
-                            Path(f"/Users/aijaz/sec_html_filings/{_tkr}/{accession_number}.htm"),
-                            Path(f"/Users/aijaz/sec_html_filings/{cik}/{accession_number}.htm"),
+                            _html_base / _tkr / f"{accession_number}.htm",
+                            _html_base / str(cik) / f"{accession_number}.htm",
                         ):
                             if _cand_html.is_file():
                                 try:
@@ -3301,8 +3302,8 @@ def main(argv: Optional[Sequence[str]] = None):
         from utilities.helpers.logger_config import LoggerConfig
         LoggerConfig.setup_logging(level='INFO', console_output=False)
 
-    # Always write full detailed logs for every run into gotham/logs/
-    _run_logs_dir = Path('/Users/aijaz/TrueGrids/all_projects/gotham/logs')
+    # Always write full detailed logs for every run into <repo>/logs/
+    _run_logs_dir = Path(__file__).resolve().parent / 'logs'
     _run_logs_dir.mkdir(parents=True, exist_ok=True)
     _run_log_file = _run_logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     _file_handler = logging.FileHandler(_run_log_file, encoding='utf-8')
