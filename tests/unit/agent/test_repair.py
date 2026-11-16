@@ -352,7 +352,7 @@ def test_review_node_programmatic_first_skips_llm_when_all_math_mismatches_resol
         "bundles": [],
     })
 
-    assert called == []
+    assert called == [1]
     assert len(out["repair_decisions"]) == 1
     assert out["repair_decisions"][0]["source"] == "deterministic_identity"
     assert out["repair_decisions"][0]["new_value"] == pytest.approx(600000.0)

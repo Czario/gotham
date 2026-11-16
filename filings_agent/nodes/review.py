@@ -99,45 +99,39 @@ def make_review_node(*, chat_llm: Any = None, on_event: Any = None) -> Callable[
             ) not in resolved_keys
         ]
 
-        # Report mode is intentionally deterministic and non-mutating: do not
-        # spend an LLM call on a proposal that CorrectionGate will reject.
+        # Run the ADK Review Agent whenever AGENT_REVIEW_ENABLED and not in report mode,
+        # using HTML table tools to verify signs/values against the SEC .htm filing.
+        # Fall back to deterministic proposals only if the agent loop is unavailable.
         if config.AGENT_REVIEW_ENABLED and config.AGENT_MODE != "report":
             from ..hooks import report_call
 
-            if chat_llm is None and fallback and not unresolved_findings:
+            try:
                 report_call(
-                    f"  [review]  ⚡ programmatic review "
-                    f"({len(fallback)} math identity repair(s) resolved deterministically)"
+                    f"  [review]  consulting review agent "
+                    f"({len(findings)} finding(s), mode={config.AGENT_MODE})"
                 )
-                proposals = list(fallback)
-            else:
-                try:
-                    report_call(
-                        f"  [review]  consulting review agent "
-                        f"({len(findings)} finding(s), mode={config.AGENT_MODE})"
+                from ..tools.html_table_tools import build_html_table_tools
+                tools = list(build_review_tools(state.get("bundles") or [], proposals)) + list(
+                    build_html_table_tools(
+                        html_text=state.get("html_text"),
+                        accession_number=state.get("accession_number"),
+                        ticker=state.get("ticker"),
                     )
-                    from ..tools.html_table_tools import build_html_table_tools
-                    tools = list(build_review_tools(state.get("bundles") or [], proposals)) + list(
-                        build_html_table_tools(
-                            html_text=state.get("html_text"),
-                            accession_number=state.get("accession_number"),
-                            ticker=state.get("ticker"),
-                        )
-                    )
-                    system, initial = _review_prompt(findings)
-                    result = run_agent_loop(
-                        system,
-                        initial,
-                        tools,
-                        ticker=state.get("ticker", state.get("cik", "?")),
-                        finalize_name="finalize_review",
-                        chat_llm=chat_llm,
-                        on_event=on_event,
-                    )
-                    if isinstance(result, dict) and isinstance(result.get("repairs"), list):
-                        proposals.extend(x for x in result["repairs"] if isinstance(x, dict))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("agent review unavailable; using deterministic fallback: %s", exc)
+                )
+                system, initial = _review_prompt(findings)
+                result = run_agent_loop(
+                    system,
+                    initial,
+                    tools,
+                    ticker=state.get("ticker", state.get("cik", "?")),
+                    finalize_name="finalize_review",
+                    chat_llm=chat_llm,
+                    on_event=on_event,
+                )
+                if isinstance(result, dict) and isinstance(result.get("repairs"), list):
+                    proposals.extend(x for x in result["repairs"] if isinstance(x, dict))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent review unavailable; using deterministic fallback: %s", exc)
 
         if not proposals:
             proposals = fallback

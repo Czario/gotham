@@ -380,14 +380,32 @@ class CompanyFactsReconciliationService:
                     f"{gap['period_str']} = {match['value']} (cik {cik})")
                 continue
 
+            raw_val = float(match["value"]) if isinstance(match["value"], (int, float)) else match["value"]
+            if isinstance(raw_val, float) and raw_val != 0:
+                c_low = str(gap.get("concept") or match.get("short_tag") or "").lower()
+                can_flip_naturally = any(
+                    k in c_low
+                    for k in ("netincome", "operatingincome", "incomeloss", "increasedecrease", "changein", "othercomprehensive", "profitloss", "gainloss")
+                )
+                if not can_flip_naturally:
+                    stored_signs = {
+                        (-1 if float(sv["value"]) < 0 else 1)
+                        for sv in vcoll.find(
+                            {"cik": cik, "concept_id": concept_id, "dimension_value": False, "source": {"$ne": "sec_companyfacts"}},
+                            projection={"value": 1},
+                        )
+                        if isinstance(sv.get("value"), (int, float)) and sv["value"] != 0
+                    }
+                    if len(stored_signs) == 1:
+                        raw_val = float(next(iter(stored_signs))) * abs(raw_val)
+
             value_doc = ValueDocument(
                 concept_id=concept_id,
                 company_cik=cik,
                 statement_type=gap["statement_type"],
                 form_type=form_type,
                 reporting_period=reporting_period,
-                value=float(match["value"]) if isinstance(match["value"], (int, float))
-                else match["value"],
+                value=raw_val,
                 created_at=datetime.now(),
                 dimension_value=False,
                 decimals=str(match["decimals"]) if match["decimals"] is not None else None,

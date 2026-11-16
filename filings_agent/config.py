@@ -103,7 +103,7 @@ STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "0").strip().lower() not in
 #   "report" — validate and record findings, never modify values (default)
 #   "repair" — apply provenance-tagged corrections / gap fills
 #   "strict" — as repair, but corrections require explicit approval
-AGENT_MODE: str = os.getenv("AGENT_MODE", "report").strip().lower()
+AGENT_MODE: str = os.getenv("AGENT_MODE", "strict").strip().lower()
 
 # Enables the LLM JUDGE for the final write decision (P8).  Off by default:
 # the deterministic decision policy (an explicit WriteDecision) is used instead.

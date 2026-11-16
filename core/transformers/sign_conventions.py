@@ -91,6 +91,8 @@ class SignConventionHandler:
         local_lower = concept.rsplit(':', 1)[-1].lower()
         if not local_lower.startswith('increasedecrease'):
             return False
+        if any(liab in local_lower for liab in ('payable', 'liabilit', 'accrued')):
+            return False
         asset_indicators = [
             'receivable',
             'inventor',
@@ -247,6 +249,14 @@ class SignConventionHandler:
         if value < 0:
             return value
         
+        # Dividends/distributions received from equity-method investments are operating inflows
+        if 'equitymethodinvestmentdividends' in concept_normalized:
+            return value
+
+        # Supplemental non-cash disclosures preserve their reported XBRL sign
+        if any(k in concept_normalized for k in ('incurredbutnotyetpaid', 'noncash')):
+            return value
+
         # Check for outflow patterns (should be negative)
         for pattern in cls.CASH_OUTFLOW_PATTERNS:
             if pattern.lower() in search_text:
@@ -288,6 +298,9 @@ class SignConventionHandler:
             or 'after allowance' in label_str
             or 'net of allowance' in label_str
             or 'less allowance' in label_str
+            or 'afteraccumulateddepreciation' in local
+            or 'netofaccumulateddepreciation' in local
+            or 'after accumulated depreciation' in label_str
         ):
             is_allowance_itself = (
                 'allowance' in local
@@ -295,6 +308,10 @@ class SignConventionHandler:
             )
             if not is_allowance_itself:
                 return abs(value)
+
+        # Preserve genuine negative/positive balances on OCI and Retained Earnings/Deficit
+        if any(k in local for k in ('accumulatedothercomprehensive', 'retainedearnings', 'deficit')):
+            return value
 
         # Check for genuine contra-accounts
         for pattern in cls.CONTRA_ACCOUNT_PATTERNS:
