@@ -6,6 +6,9 @@ actually reaching ``ChatOpenAI`` is a correctness property, not a tuning detail.
 """
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 from filings_agent import config
@@ -14,6 +17,7 @@ from filings_agent.llm import build_chat_llm
 
 def _openai_kwargs(monkeypatch, **overrides) -> dict:
     """Capture the kwargs ``build_chat_llm`` hands to ChatOpenAI."""
+    monkeypatch.setattr(config, "MODEL_NAME", "test-deepseek-model")
     for key, value in overrides.items():
         monkeypatch.setattr(config, key, value)
 
@@ -23,9 +27,9 @@ def _openai_kwargs(monkeypatch, **overrides) -> dict:
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    import langchain_openai
-
-    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setitem(
+        sys.modules, "langchain_openai", SimpleNamespace(ChatOpenAI=FakeChatOpenAI)
+    )
     monkeypatch.setattr(config, "DEEPSEEK_API_KEY", "test-key")
     monkeypatch.setattr("filings_agent.llm.LLM_CACHE_ENABLED", False)
     build_chat_llm(provider="deepseek")
@@ -84,10 +88,22 @@ def test_explicit_max_retries_argument_wins(monkeypatch):
         def __init__(self, **kwargs):
             captured.update(kwargs)
 
-    import langchain_openai
-
-    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FakeChatOpenAI)
+    monkeypatch.setitem(
+        sys.modules, "langchain_openai", SimpleNamespace(ChatOpenAI=FakeChatOpenAI)
+    )
     monkeypatch.setattr(config, "DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr(config, "MODEL_NAME", "test-deepseek-model")
     monkeypatch.setattr("filings_agent.llm.LLM_CACHE_ENABLED", False)
     build_chat_llm(provider="deepseek", max_retries=0)
     assert captured["max_retries"] == 0
+
+
+def test_chat_model_uses_configured_model(monkeypatch):
+    kwargs = _openai_kwargs(monkeypatch, MODEL_NAME="custom-deepseek-model")
+    assert kwargs["model"] == "custom-deepseek-model"
+
+
+def test_chat_model_requires_configured_model(monkeypatch):
+    monkeypatch.setattr(config, "MODEL_NAME", "")
+    with pytest.raises(ValueError, match="MODEL_NAME must be set"):
+        build_chat_llm(provider="deepseek")

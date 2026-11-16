@@ -80,46 +80,28 @@ def make_targeted_extract_node(
         accession_number = str(state.get("accession_number") or "")
 
         repo_resolver = getattr(norm_service, "_get_concept_repo_by_form_type", None)
-        if not callable(repo_resolver):
-            return state
+        concept_repo = repo_resolver(form_type) if callable(repo_resolver) else None
+        sec_presentation = state.get("sec_presentation") or {}
 
-        concept_repo = repo_resolver(form_type)
+        # If html_text is available and rendered_html_tables haven't been parsed yet, enrich sec_presentation
+        html_text_pre = state.get("html_text")
+        if html_text_pre and isinstance(sec_presentation, dict) and not sec_presentation.get("rendered_html_tables"):
+            try:
+                from core.extractors.sec_presentation_extractor import build_sec_presentation_snapshot
+                sec_presentation = build_sec_presentation_snapshot(
+                    statement_docs=state.get("statement_docs"),
+                    html_text=html_text_pre,
+                )
+            except Exception:
+                pass
 
-        # 1. Collect missing targeted concepts across statements
+        sign_fixes = list(state.get("sign_fixes") or [])
+
+        # 1. Collect missing targeted concepts across statements (from stored DB targets AND SEC presentation)
         missing_by_stmt: dict[str, list[dict]] = {}
         for bundle in bundles:
             stmt_type = getattr(bundle, "statement_type", None)
             if not stmt_type:
-                continue
-
-            # Query stored target concepts (excluding 404/555)
-            try:
-                stored_cursor = concept_repo.collection.find({
-                    "cik": cik,
-                    "statement_type": stmt_type,
-                    "path": {"$not": _POLLUTED_PATH_RX},
-                    "abstract": {"$ne": True},
-                    "hide": {"$ne": True},
-                })
-                stored_targets = [
-                    c for c in stored_cursor
-                    if not is_polluted_path(c.get("path"))
-                    and c.get("path") not in (None, "", "404", "555")
-                ]
-                # Prioritize top-level primary statement line items over deep dimensional breakdown rows
-                stored_targets.sort(
-                    key=lambda c: (
-                        bool(c.get("dimension_concept")),
-                        len(str(c.get("path", "")).split(".")),
-                        str(c.get("path", "")),
-                        str(c.get("order_key", "")),
-                    )
-                )
-            except Exception as exc:
-                logger.warning("targeted_extract: could not query stored targets: %s", exc)
-                stored_targets = []
-
-            if not stored_targets:
                 continue
 
             # Check extracted concepts in bundle
@@ -127,7 +109,6 @@ def make_targeted_extract_node(
             for item in getattr(bundle, "concepts", None) or []:
                 if isinstance(item, dict) and item.get("concept"):
                     val = item.get("value")
-                    # Check if it has a non-empty numeric value
                     if val is not None and val != "":
                         extracted_concepts.add(str(item["concept"]))
             for item in getattr(bundle, "dimensional_concepts", None) or []:
@@ -135,6 +116,103 @@ def make_targeted_extract_node(
                     val = item.get("value") or (item.get("dimension_data") or {}).get("value")
                     if val is not None and val != "":
                         extracted_concepts.add(str(item["concept"]))
+
+            # 1a. Recover any concrete SEC presentation nodes that were dropped during transform/normalize
+            #     AND synchronize value signs & hierarchy parents with the human-visible HTML table.
+            from core.extractors.sec_presentation_extractor import canonical_statement_type
+            canon_st = canonical_statement_type(stmt_type)
+            stmt_pres = (sec_presentation.get("statements") or {}).get(canon_st) or {}
+            pres_by_concept = {
+                str(n.get("concept")): n
+                for n in (stmt_pres.get("nodes") or [])
+                if isinstance(n, dict) and n.get("concept")
+            }
+            for pres_node in stmt_pres.get("nodes") or []:
+                if not isinstance(pres_node, dict) or pres_node.get("abstract"):
+                    continue
+                p_concept = str(pres_node.get("concept") or "")
+                p_val = pres_node.get("value")
+                if p_concept and p_concept not in extracted_concepts and p_val is not None:
+                    if hasattr(bundle, "concepts") and isinstance(bundle.concepts, list):
+                        bundle.concepts.append({
+                            "concept": p_concept,
+                            "label": pres_node.get("label") or p_concept.split(":")[-1],
+                            "value": float(p_val),
+                            "period": pres_node.get("period") or _extract_bundle_period_str(bundle),
+                            "parent_concept": pres_node.get("html_parent_concept") or pres_node.get("parent_concept"),
+                            "reading_order": pres_node.get("html_reading_order") or pres_node.get("reading_order"),
+                            "source": "sec_presentation_recovery",
+                        })
+                        extracted_concepts.add(p_concept)
+
+            # Enforce exact human-visible HTML table sign and hierarchy on existing bundle concepts
+            for item in getattr(bundle, "concepts", None) or []:
+                if not isinstance(item, dict) or not item.get("concept"):
+                    continue
+                c_name = str(item["concept"])
+                pnode = pres_by_concept.get(c_name)
+                if not pnode:
+                    continue
+                # Sync HTML parent_concept and reading_order if missing on bundle item
+                html_parent = pnode.get("html_parent_concept") or pnode.get("parent_concept")
+                if html_parent and not item.get("parent_concept"):
+                    item["parent_concept"] = html_parent
+                r_order = pnode.get("html_reading_order") or pnode.get("reading_order")
+                if r_order is not None and item.get("reading_order") is None:
+                    item["reading_order"] = r_order
+
+                # Sync exact human-visible HTML display sign
+                exp_sign = pnode.get("html_display_sign") or pnode.get("expected_display_sign")
+                cur_val = item.get("value")
+                if isinstance(cur_val, (int, float)) and cur_val != 0 and exp_sign in (-1, 1):
+                    cur_sign = -1 if cur_val < 0 else 1
+                    if cur_sign != exp_sign:
+                        new_val = float(exp_sign) * abs(float(cur_val))
+                        item["value"] = new_val
+                        for v_entry in getattr(bundle, "values", None) or []:
+                            if isinstance(v_entry, dict) and v_entry.get("concept") == c_name:
+                                v_entry["value"] = new_val
+                        sign_fixes.append({
+                            "statement_type": stmt_type,
+                            "concept": c_name,
+                            "old_value": float(cur_val),
+                            "new_value": new_val,
+                            "required_sign": "negative" if exp_sign == -1 else "positive",
+                            "source": "sec_rendered_html_table",
+                        })
+
+            # 1b. Query stored target concepts (excluding 404/555)
+            stored_targets = []
+            if concept_repo is not None:
+                try:
+                    stored_cursor = concept_repo.collection.find({
+                        "cik": cik,
+                        "statement_type": stmt_type,
+                        "path": {"$not": _POLLUTED_PATH_RX},
+                        "abstract": {"$ne": True},
+                        "hide": {"$ne": True},
+                        "dimension_concept": {"$ne": True},
+                    })
+                    stored_targets = [
+                        c for c in stored_cursor
+                        if not is_polluted_path(c.get("path"))
+                        and not c.get("dimension_concept")
+                        and c.get("path") not in (None, "", "404", "555")
+                    ]
+                    stored_targets.sort(
+                        key=lambda c: (
+                            bool(c.get("dimension_concept")),
+                            len(str(c.get("path", "")).split(".")),
+                            str(c.get("path", "")),
+                            str(c.get("order_key", "")),
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning("targeted_extract: could not query stored targets: %s", exc)
+                    stored_targets = []
+
+            if not stored_targets:
+                continue
 
             # Find which stored targets have no value extracted
             missing = []
@@ -150,6 +228,8 @@ def make_targeted_extract_node(
         total_missing = sum(len(m) for m in missing_by_stmt.values())
         if total_missing == 0:
             logger.debug("targeted_extract: all targeted concepts present in XBRL extraction")
+            if sign_fixes != (state.get("sign_fixes") or []):
+                return {**state, "sec_presentation": sec_presentation, "sign_fixes": sign_fixes}
             return state
 
         report_call(
@@ -174,9 +254,20 @@ def make_targeted_extract_node(
             logger.info("targeted_extract: filing plain text empty or too short — skipping")
             return state
 
-        # 3. Build document navigation tools
+        # 3. Build document navigation tools + ADK built-in load_artifacts tool
+        from ..adk.builtin_tools import (
+            InMemoryArtifactService,
+            build_adk_load_artifacts_tool,
+            wrap_custom_function_tool,
+        )
         from ..tools.guidance_tools import build_mda_tools
-        tools = build_mda_tools(plain_text)
+
+        artifact_svc = InMemoryArtifactService()
+        artifact_svc.save_artifact("filing_plain_text_summary", plain_text[:8000])
+        if sec_presentation:
+            artifact_svc.save_artifact("sec_presentation", sec_presentation)
+        tools = [wrap_custom_function_tool(t) for t in build_mda_tools(plain_text)]
+        tools.append(build_adk_load_artifacts_tool(artifact_svc))
 
         period = build_detected_period(state.get("reporting_period"), form_type=form_type)
         period_label = format_period_label(period) if period else form_type
@@ -384,20 +475,27 @@ def make_targeted_extract_node(
                         except (ValueError, TypeError):
                             pass
 
+                stored_targets_inc = missing_by_stmt.get("income", [])
+                matched_opex = next(
+                    (
+                        t for t in stored_targets_inc
+                        if "operatingexpenses" in str(t.get("concept", "")).lower()
+                        or "operating expense" in str(t.get("label", "")).lower()
+                    ),
+                    None,
+                )
+
                 sum_opex = None
                 if "rd" in components and "sm" in components and "ga" in components:
                     sum_opex = components["rd"] + components["sm"] + components["ga"]
                 elif "rd" in components and "sga" in components:
                     sum_opex = components["rd"] + components["sga"]
-                elif "sga" in components:
+                elif "sm" in components and "ga" in components:
+                    sum_opex = components["sm"] + components["ga"]
+                elif "sga" in components and matched_opex is not None:
                     sum_opex = components["sga"]
 
-                if sum_opex is not None:
-                    stored_targets_inc = missing_by_stmt.get("income", [])
-                    matched_opex = next(
-                        (t for t in stored_targets_inc if t.get("path") == "004" or "operatingexpenses" in str(t.get("concept", "")).lower() or "operating expense" in str(t.get("label", "")).lower()),
-                        None
-                    )
+                if sum_opex is not None and matched_opex is not None:
                     target_tag = "us-gaap:OperatingExpenses"
                     target_label = "Total Operating Expenses"
                     target_path = "004"

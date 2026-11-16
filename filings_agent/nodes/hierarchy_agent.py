@@ -748,9 +748,19 @@ def _stored_rows_for(norm_service: Any, bundle: Any) -> tuple[list[dict], dict[s
     return stored, path_by_concept, occupied, identity_paths, identity_order_keys
 
 
-def _filing_rows_for(bundle: Any) -> list[dict]:
+def _filing_rows_for(bundle: Any, sec_presentation: Optional[dict] = None) -> list[dict]:
     concrete = list(getattr(bundle, "concepts", None) or [])
     abstracts = list(getattr(bundle, "abstract_concepts", None) or [])
+
+    # Lookup SEC presentation linkbase metadata if available
+    sec_nodes_by_concept: dict[str, dict] = {}
+    if isinstance(sec_presentation, dict):
+        from core.extractors.sec_presentation_extractor import canonical_statement_type
+        canon_st = canonical_statement_type(getattr(bundle, "statement_type", ""))
+        stmt_pres = (sec_presentation.get("statements") or {}).get(canon_st) or {}
+        for pnode in stmt_pres.get("nodes") or []:
+            if isinstance(pnode, dict) and pnode.get("concept"):
+                sec_nodes_by_concept[str(pnode["concept"])] = pnode
 
     # path -> concept, so each row's filing parent is visible to the model
     path_to_concept: dict[str, str] = {}
@@ -759,10 +769,19 @@ def _filing_rows_for(bundle: Any) -> list[dict]:
             path_to_concept[str(item["path"])] = item.get("concept", "")
 
     def _parent_of(item: dict) -> Optional[str]:
+        if "parent_concept" in item or "parent" in item:
+            explicit_p = item.get("parent_concept") or item.get("parent")
+            return str(explicit_p) if explicit_p else None
+        sec_node = sec_nodes_by_concept.get(str(item.get("concept") or ""))
+        if sec_node and ("parent_concept" in sec_node or "calc_parent_concept" in sec_node):
+            sp = sec_node.get("parent_concept") or sec_node.get("calc_parent_concept")
+            return str(sp) if sp else None
         path = str(item.get("path") or "")
-        if "." not in path:
-            return None
-        return path_to_concept.get(path.rsplit(".", 1)[0])
+        if "." in path:
+            p = path_to_concept.get(path.rsplit(".", 1)[0])
+            if p:
+                return p
+        return None
 
     incoming_periods: dict[str, list[Any]] = defaultdict(list)
     for value in getattr(bundle, "values", None) or []:
@@ -777,16 +796,27 @@ def _filing_rows_for(bundle: Any) -> list[dict]:
     fallback_period = getattr(bundle, "reporting_period", None)
 
     rows = []
-    for item in concrete + abstracts:
+    for idx, item in enumerate(concrete + abstracts):
         if isinstance(item, dict) and item.get("concept"):
+            sec_node = sec_nodes_by_concept.get(str(item["concept"])) or {}
+            html_parent = sec_node.get("html_parent_concept")
+            r_order = (
+                item.get("reading_order")
+                or sec_node.get("html_reading_order")
+                or sec_node.get("reading_order")
+                or (idx + 1)
+            )
             row = {
                 "concept": item["concept"],
-                "label": item.get("label"),
+                "label": item.get("label") or sec_node.get("label"),
                 "abstract": bool(item.get("abstract")),
                 "value": item.get("value"),
                 "path": item.get("path"),            # filing reference only
                 "order_key": item.get("order_key"),
-                "parent_concept": _parent_of(item),
+                "parent_concept": html_parent or _parent_of(item),
+                "sec_parent_concept": item.get("sec_parent_concept") or sec_node.get("sec_parent_concept"),
+                "calc_parent_concept": sec_node.get("calc_parent_concept"),
+                "reading_order": r_order,
                 "dimension_concept": False,
             }
             period = incoming_period_info.get(str(item["concept"]))
@@ -795,6 +825,8 @@ def _filing_rows_for(bundle: Any) -> list[dict]:
             if period[0] is not None:
                 row["_latest_period_rank"], row["latest_period"] = period
             rows.append(row)
+    # Sort main rows by human-visible HTML / SEC presentation top-down reading_order
+    rows.sort(key=lambda r: int(r.get("reading_order") or 999999))
     for dim in getattr(bundle, "dimensional_concepts", None) or []:
         if isinstance(dim, dict) and dim.get("concept"):
             rows.append({
@@ -852,6 +884,12 @@ def _infer_dim_parent_header(
     ]
     seg_low = (segment_type or "").strip().lower()
     if seg_low:
+        # Match against any stored custom header whose tokens overlap segment_type
+        seg_tokens = _concept_tokens(seg_low, seg_low)
+        for h in parent_headers:
+            h_low = h.lower()
+            if seg_low in h_low or (seg_tokens and (seg_tokens & _concept_tokens(h))):
+                return h
         if any(k in seg_low for k in ("prod", "serv")):
             for h in parent_headers:
                 if "prod" in h.lower() or "serv" in h.lower():
@@ -870,9 +908,10 @@ def _infer_dim_parent_header(
 
     if len(parent_headers) == 1:
         return parent_headers[0]
-    for s in parent_dims:
-        if s.get("parent_header"):
-            return str(s["parent_header"])
+    if len(parent_headers) == 0:
+        for s in parent_dims:
+            if s.get("parent_header"):
+                return str(s["parent_header"])
     return None
 
 
@@ -1037,6 +1076,123 @@ def _try_programmatic_incremental_hierarchy(
 
 
 
+_POLLUTED_EQUITY_ROLLFORWARD_CONCEPTS = {
+    "us-gaap:RetainedEarningsMember",
+    "RetainedEarningsMember",
+    "us-gaap:CommonStockMember",
+    "CommonStockMember",
+    "us-gaap:AdditionalPaidInCapitalMember",
+    "AdditionalPaidInCapitalMember",
+    "us-gaap:TreasuryStockCommonMember",
+    "TreasuryStockCommonMember",
+    "us-gaap:TreasuryStockPreferredMember",
+    "TreasuryStockPreferredMember",
+    "us-gaap:AccumulatedOtherComprehensiveIncomeMember",
+    "AccumulatedOtherComprehensiveIncomeMember",
+    "custom:EquityComponentSegmentation",
+}
+
+
+def _repair_corrupted_stored_hierarchy_if_needed(
+    norm_service: Any,
+    bundle: Any,
+    stored: list[dict],
+) -> bool:
+    """Detect and repair in-place any stored hierarchy corrupted by sibling-as-parent
+    paths (e.g. COGS/SG&A under Sales, PPE Net under PPE Gross) or leaked equity members.
+    Returns True if the stored DB rows were modified and should be reloaded.
+    """
+    if not stored:
+        return False
+    repo_resolver = getattr(norm_service, "_get_concept_repo_by_form_type", None)
+    if not callable(repo_resolver):
+        return False
+    form_type = getattr(bundle, "form_type", None) or "10-Q"
+    cik = str(getattr(bundle, "company_cik", "") or "")
+    stmt_type = str(getattr(bundle, "statement_type", "") or "")
+    try:
+        repo = repo_resolver(form_type)
+        coll = repo.collection
+    except Exception:
+        return False
+
+    modified_db = False
+
+    # 1. Remove leaked Statement of Stockholders' Equity roll-forward members
+    polluted_ids = [
+        r["_id"]
+        for r in stored
+        if r.get("_id") is not None and str(r.get("concept") or "") in _POLLUTED_EQUITY_ROLLFORWARD_CONCEPTS
+    ]
+    if polluted_ids and hasattr(coll, "delete_many"):
+        try:
+            coll.delete_many({"_id": {"$in": polluted_ids}})
+            modified_db = True
+        except Exception:
+            pass
+
+    # 2. Check if stored main rows violate accounting parent invariants
+    from ..tools.hierarchy_tools import _sanitize_proposed_rows
+
+    main_rows = [
+        r for r in stored
+        if not r.get("dimension_concept")
+        and r.get("concept")
+        and str(r.get("concept")) not in _POLLUTED_EQUITY_ROLLFORWARD_CONCEPTS
+    ]
+    if not main_rows:
+        return modified_db
+
+    # Sort by current path/order_key to preserve top-down document order
+    main_rows.sort(key=lambda r: (str(r.get("path") or ""), str(r.get("order_key") or "")))
+    probe_rows = [
+        {
+            "_id": r.get("_id"),
+            "concept": r["concept"],
+            "label": r.get("label"),
+            "parent": r.get("parent_concept") or r.get("parent"),
+            "order": idx + 1,
+            "abstract": bool(r.get("abstract", False)),
+            "_is_stored": False,
+        }
+        for idx, r in enumerate(main_rows)
+    ]
+    orig_parents = {r["concept"]: r["parent"] for r in probe_rows}
+    sanitized = _sanitize_proposed_rows(probe_rows, stmt_type)
+    new_parents = {r["concept"]: (r.get("parent") or r.get("parent_concept")) for r in sanitized}
+
+    if new_parents != orig_parents and hasattr(coll, "update_one"):
+        try:
+            mat_rows, _ = _materialize(sanitized, [], {})
+            for mr in mat_rows:
+                c_name = mr.get("concept")
+                new_p = mr.get("path")
+                new_ok = mr.get("order_key")
+                new_parent = mr.get("parent")
+                new_lvl = mr.get("level", 0)
+                if c_name and new_p and new_ok:
+                    coll.update_one(
+                        {"cik": cik, "statement_type": stmt_type, "concept": c_name, "dimension_concept": {"$ne": True}},
+                        {
+                            "$set": {
+                                "path": new_p,
+                                "order_key": new_ok,
+                                "parent_concept": new_parent,
+                                "level": new_lvl,
+                                "hierarchy_level": new_lvl,
+                            }
+                        },
+                    )
+            report_call(
+                f"  [hierarchy]  ⟳ self-healed stored {stmt_type} hierarchy in DB ({len(mat_rows)} row(s) re-aligned)"
+            )
+            modified_db = True
+        except Exception as exc:
+            logger.warning("stored hierarchy self-heal failed for %s/%s: %s", cik, stmt_type, exc)
+
+    return modified_db
+
+
 def make_hierarchy_agent_node(
     norm_service: Any,
     *,
@@ -1056,7 +1212,9 @@ def make_hierarchy_agent_node(
             stmt_t0 = time.perf_counter()
             stmt_type = getattr(bundle, "statement_type", "?")
             stored, stored_paths, occupied_paths, identity_paths, identity_order_keys = _stored_rows_for(norm_service, bundle)
-            filing_rows = _filing_rows_for(bundle)
+            if stored and _repair_corrupted_stored_hierarchy_if_needed(norm_service, bundle, stored):
+                stored, stored_paths, occupied_paths, identity_paths, identity_order_keys = _stored_rows_for(norm_service, bundle)
+            filing_rows = _filing_rows_for(bundle, sec_presentation=state.get("sec_presentation"))
             if not filing_rows and not stored:
                 continue
             if not stored:
@@ -1128,6 +1286,7 @@ def make_hierarchy_agent_node(
                     identity_paths=identity_paths,
                     identity_order_keys=identity_order_keys,
                     materialize=_materialize,
+                    sec_presentation=state.get("sec_presentation"),
                 )
                 tools_by_name = {t.name: t for t in tools}
 

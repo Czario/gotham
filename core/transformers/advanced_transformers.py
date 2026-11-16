@@ -377,12 +377,16 @@ class EnhancedFinancialDataTransformer:
                         calc_weight = summation_parents[0].get('weight')
                 
                 # Apply sign conventions
+                pref_role = item.get('preferred_label_role')
+                html_sign = item.get('html_display_sign') or item.get('display_sign')
                 corrected_value = SignConventionHandler.apply_sign_conventions(
                     value=standardized_value,
                     concept=item.get('concept', item.get('concept_name', '')),
                     statement_type=statement_type,
                     calc_weight=calc_weight,
-                    label=item.get('label', '')
+                    label=item.get('label', ''),
+                    preferred_label_role=pref_role,
+                    html_display_sign=html_sign,
                 )
                 
                 # Store both original and corrected values for transparency
@@ -390,6 +394,29 @@ class EnhancedFinancialDataTransformer:
                 transformed_item['value'] = corrected_value
                 if calc_weight is not None:
                     transformed_item['calc_weight'] = calc_weight
+
+        # Also apply sign conventions to dimensional_facts and comparative_facts so breakdowns
+        # and comparative columns match the human-visible HTML statement tables
+        if statement_type:
+            from core.transformers.sign_conventions import SignConventionHandler
+            c_name = item.get('concept', item.get('concept_name', ''))
+            pref_role = item.get('preferred_label_role')
+            html_sign = item.get('html_display_sign') or item.get('display_sign')
+            calc_weight = transformed_item.get('calc_weight')
+            for list_key in ('dimensional_facts', 'comparative_facts', 'comparative_dimensional_facts'):
+                sub_facts = transformed_item.get(list_key)
+                if isinstance(sub_facts, list):
+                    for sf in sub_facts:
+                        if isinstance(sf, dict) and sf.get('value') is not None:
+                            sf['value'] = SignConventionHandler.apply_sign_conventions(
+                                value=sf['value'],
+                                concept=sf.get('concept') or c_name,
+                                statement_type=statement_type,
+                                calc_weight=calc_weight,
+                                label=sf.get('label') or item.get('label', ''),
+                                preferred_label_role=pref_role,
+                                html_display_sign=sf.get('display_sign') or html_sign,
+                            )
         
         # Validate period dates if present
         period = item.get('period')

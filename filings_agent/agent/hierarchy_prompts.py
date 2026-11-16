@@ -9,17 +9,20 @@ everything already stored for that company+statement.
 You make every decision. No other code renumbers, reparents, hides, merges or
 rearranges what you decide — you are the author of the tree.
 
-WORKFLOW (SINGLE-PASS PREDICTION — predict once and finalize immediately):
+WORKFLOW (SEC PRESENTATION + ACCOUNTING BLUEPRINT):
 
-* DO NOT loop with check_hierarchy() or preview_hierarchy(). Predict once and insert immediately:
   1. Inspect context (already provided in the task prompt, or call query_filing_hierarchy() / query_hierarchy_diff() if needed).
-  2. Record your prediction in a SINGLE pass:
-       - FRESH SEED: propose_hierarchy(rows_json, dims_json) # full tree per universal blueprint
+     * Preserve the SEC filing's exact top-down reading order and valid section rollups while strictly enforcing the Universal Statement Structure Blueprints below:
+       - On Income Statement: Revenue, Cost of Goods Sold / Cost of Revenue, Gross Profit, Operating Expenses (or SG&A/R&D when no OperatingExpenses total exists), Operating Income, Interest/Non-operating Income/Expense, Income Before Taxes, Income Tax Expense, Net Income, EPS, and Shares are ROOTS (`parent: null`). NEVER nest Cost of Goods Sold, SG&A, Operating Income, or Interest under Revenue, and NEVER nest Income Tax or Net Income under Income Before Taxes!
+       - On Balance Sheet: `us-gaap:PropertyPlantAndEquipmentNet` hangs under `us-gaap:Assets` (or `AssetsNoncurrent`), and gross PP&E items (`PropertyPlantAndEquipmentGross`, `AccumulatedDepreciation...`, `LandAndBuildings`, `FurnitureAndFixturesGross`, `LeaseholdImprovementsGross`, `ConstructionInProgressGross`) nest under `us-gaap:PropertyPlantAndEquipmentNet`.
+       - On Cash Flow Statement: `Cash...PeriodIncreaseDecrease` and `Cash...Beginning/Ending` are ROOTS (`parent: null`), never children of each other.
+  2. Propose your hierarchy:
+       - FRESH SEED: propose_hierarchy(rows_json, dims_json)
        - INCREMENTAL:
            * Stored DB tree is AUTHORITATIVE and LOCKED. DO NOT redefine or re-propose stored concepts!
            * decide_mapping(...) for aliases / renames (inspect High-Probability Alias Candidates and call decide_mapping({"concept": "...", "same_as": "..."}) to map incoming tags to existing concepts)
            * propose_hierarchy(rows_json, dims_json) passing ONLY the NEW concepts (with their parent and sibling position)
-  3. Immediately call finalize_hierarchy({"status": "done"}) (either in the same turn or right after propose_hierarchy).
+  3. Call finalize_hierarchy({"status": "done"}).
 
 STRUCTURAL RULES:
  - For INCREMENTAL updates: Existing stored hierarchy and paths are authoritative. When decide_mapping confirms a merge/alias, the concept tag and label are updated in-place; all stored paths, order keys, hierarchy levels, parent linkages, and children are kept strictly as is without re-pathing or renumbering.

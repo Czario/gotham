@@ -92,8 +92,11 @@ class FinancialLineItem:
     order: float               # Presentation order
     abstract: bool             # Whether concept is abstract
     parent_concept: Optional[str] = None
+    preferred_label_role: Optional[str] = None
     dimensions: List[DimensionalContext] = field(default_factory=list)  # Dimensional breakdowns
     all_dimensional_facts: List[Dict[str, Any]] = field(default_factory=list)  # All facts with dimensions
+    comparative_facts: List[Dict[str, Any]] = field(default_factory=list)  # Comparative prior-period main-line facts
+    comparative_dimensional_facts: List[Dict[str, Any]] = field(default_factory=list)  # Comparative prior-period dimensional facts
     calculations: Dict[str, Any] = field(default_factory=dict)  # Calculation relationships
     children: List['FinancialLineItem'] = field(default_factory=list)
 
@@ -1365,11 +1368,91 @@ class FlexibleXBRLExtractor:
                 # Skip dimensional context if there's an access issue
                 pass
         
-        # Get presentation order
+        # Get presentation order and preferred label role from SEC presentation linkbase
         order = 0.0
+        preferred_label_role = None
         parent_rels = pres_rel_set.toModelObject(concept)
         if parent_rels:
             order = min(rel.order for rel in parent_rels)
+            for rel in parent_rels:
+                pref = getattr(rel, 'preferredLabel', None)
+                if pref:
+                    preferred_label_role = str(pref)
+                    try:
+                        pref_lbl = concept.label(preferredLabel=pref)
+                        if pref_lbl:
+                            label = pref_lbl
+                    except Exception:
+                        pass
+                    break
+
+        # Extract comparative prior-period facts (non-dimensional and dimensional)
+        comparative_facts: List[Dict[str, Any]] = []
+        comparative_dimensional_facts: List[Dict[str, Any]] = []
+        try:
+            seen_comp_periods: set = set()
+            for cf in concept_facts or []:
+                if best_fact is not None and cf is best_fact:
+                    continue
+                if cf.context is None:
+                    continue
+                cf_period = None
+                cf_period_type = None
+                cf_start = None
+                cf_end = None
+                if getattr(cf.context, 'isInstantPeriod', False):
+                    cf_period = str(cf.context.instantDatetime)
+                    cf_end = cf.context.instantDatetime
+                    cf_period_type = 'instant'
+                elif getattr(cf.context, 'isStartEndPeriod', False):
+                    cf_period = f"{cf.context.startDatetime} to {cf.context.endDatetime}"
+                    cf_start = cf.context.startDatetime
+                    cf_end = cf.context.endDatetime
+                    cf_period_type = 'duration'
+                if not cf_period or cf_period == period:
+                    continue
+                try:
+                    raw_cf = cf.effectiveValue
+                    if raw_cf is None or str(raw_cf).strip() == '':
+                        continue
+                    cf_val = float(str(raw_cf).replace(',', ''))
+                except (ValueError, TypeError):
+                    continue
+                has_dims = bool(getattr(cf.context, 'qnameDims', None))
+                if not has_dims:
+                    if cf_period not in seen_comp_periods:
+                        seen_comp_periods.add(cf_period)
+                        comparative_facts.append({
+                            'concept': concept_name,
+                            'label': label,
+                            'value': cf_val,
+                            'context_id': cf.contextID,
+                            'unit': cf.unitID if (cf.unit is not None) else unit_id,
+                            'period': cf_period,
+                            'period_type': cf_period_type,
+                            'start_date': str(cf_start)[:10] if cf_start else None,
+                            'end_date': str(cf_end)[:10] if cf_end else None,
+                        })
+                else:
+                    dim_details = {}
+                    for dq, dv in cf.context.qnameDims.items():
+                        ax = str(dq)
+                        mem = str(getattr(dv, 'memberQname', None) or getattr(dv, 'typedMember', ''))
+                        dim_details[ax] = mem
+                    comparative_dimensional_facts.append({
+                        'concept': concept_name,
+                        'label': label,
+                        'value': cf_val,
+                        'context_id': cf.contextID,
+                        'unit': cf.unitID if (cf.unit is not None) else unit_id,
+                        'period': cf_period,
+                        'period_type': cf_period_type,
+                        'start_date': str(cf_start)[:10] if cf_start else None,
+                        'end_date': str(cf_end)[:10] if cf_end else None,
+                        'dimension_details': dim_details,
+                    })
+        except Exception as comp_exc:
+            logger.debug(f"Comparative fact extraction skipped for {concept_name}: {comp_exc}")
         
         # Determine if concept should be treated as concrete
         is_effectively_concrete = False
@@ -1394,8 +1477,11 @@ class FlexibleXBRLExtractor:
             level=level,
             order=order,
             abstract=abstract_value,
+            preferred_label_role=preferred_label_role,
             dimensions=dimensions,
             all_dimensional_facts=all_dimensional_facts,
+            comparative_facts=comparative_facts,
+            comparative_dimensional_facts=comparative_dimensional_facts,
             calculations=calculations
         )
         

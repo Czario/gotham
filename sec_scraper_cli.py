@@ -2401,6 +2401,28 @@ class SECDataScraperApp:
                     sec_client=self.sec_client,
                 )
                 agent_state['reporting_period'] = reporting_period
+                try:
+                    from core.extractors.sec_presentation_extractor import build_sec_presentation_snapshot
+                    _html_text = statements_data.get('html_content')
+                    if not _html_text:
+                        _tkr = agent_state.get('ticker') or ''
+                        for _cand_html in (
+                            Path(f"/Users/aijaz/sec_html_filings/{_tkr}/{accession_number}.htm"),
+                            Path(f"/Users/aijaz/sec_html_filings/{cik}/{accession_number}.htm"),
+                        ):
+                            if _cand_html.is_file():
+                                try:
+                                    _html_text = _cand_html.read_text(encoding='utf-8', errors='ignore')
+                                    break
+                                except Exception:
+                                    pass
+                    agent_state['sec_presentation'] = build_sec_presentation_snapshot(
+                        extracted_xbrl=statements_data.get('arelle_data') or statements_data,
+                        statement_docs=[doc for _, doc in prepared_statements],
+                        html_text=_html_text,
+                    )
+                except Exception as _sec_pres_err:
+                    logger.debug(f"Could not build sec_presentation snapshot for {accession_number}: {_sec_pres_err}")
                 is_20f_amendment = (
                     str(form_type).upper() == '20-F/A'
                     and str(reporting_period.get('period_type') or '').lower() == 'annual'
@@ -2590,7 +2612,14 @@ class SECDataScraperApp:
                         'abstract': item.abstract,
                         'concept_name': item.concept_name,
                         'period': item.period,
-                        'dimensional_facts': item.all_dimensional_facts
+                        'dimensional_facts': item.all_dimensional_facts,
+                        'level': getattr(item, 'level', 0),
+                        'preferred_label_role': getattr(item, 'preferred_label_role', None),
+                        'parent_concept': getattr(item, 'parent_concept', None),
+                        'sec_parent_concept': getattr(item, 'sec_parent_concept', None),
+                        'reading_order': getattr(item, 'reading_order', None),
+                        'calculation_weight': getattr(item, 'calculation_weight', None),
+                        'balance_type': getattr(item, 'balance_type', None),
                     }
                     line_items.append(item_dict)
             return line_items
@@ -2615,7 +2644,14 @@ class SECDataScraperApp:
                     'abstract': item.abstract,
                     'concept_name': item.concept_name,
                     'period': item.period,
-                    'dimensional_facts': item.all_dimensional_facts
+                    'dimensional_facts': item.all_dimensional_facts,
+                    'level': getattr(item, 'level', 0),
+                    'preferred_label_role': getattr(item, 'preferred_label_role', None),
+                    'parent_concept': getattr(item, 'parent_concept', None),
+                    'sec_parent_concept': getattr(item, 'sec_parent_concept', None),
+                    'reading_order': getattr(item, 'reading_order', None),
+                    'calculation_weight': getattr(item, 'calculation_weight', None),
+                    'balance_type': getattr(item, 'balance_type', None),
                 }
                 line_items.append(item_dict)
                 

@@ -109,7 +109,9 @@ class SignConventionHandler:
         concept: str,
         statement_type: str,
         calc_weight: Optional[float] = None,
-        label: Optional[str] = None
+        label: Optional[str] = None,
+        preferred_label_role: Optional[str] = None,
+        html_display_sign: Optional[int] = None,
     ) -> Optional[float]:
         """
         Apply sign conventions to a financial value based on SEC presentation standards (Option A: Presentation Table).
@@ -120,12 +122,20 @@ class SignConventionHandler:
             statement_type: Type of statement ('income_statement', 'cash_flow', 'balance_sheet', etc.)
             calc_weight: Calculation weight from XBRL (typically 1.0 or -1.0)
             label: Human-readable label for the line item
+            preferred_label_role: XBRL presentation linkbase preferredLabel role (e.g. '.../negatedLabel')
+            html_display_sign: Exact human-visible sign (-1 or +1) parsed from the rendered SEC HTML table
             
         Returns:
             Adjusted value matching the SEC filing presentation table row.
         """
         if value is None or value == 0:
             return value
+
+        # 0. Exact human-visible HTML statement table sign takes highest priority when available
+        if html_display_sign in (-1, 1):
+            return float(html_display_sign) * abs(float(value))
+
+        is_negated_role = bool(preferred_label_role and "negated" in str(preferred_label_role).lower())
         
         # Determine statement type for context
         statement_type_lower = statement_type.lower() if statement_type else ''
@@ -143,6 +153,10 @@ class SignConventionHandler:
             #      Inventory increase of 1,084 is shown negative ((1,084)).
             if cls.is_cash_flow_operating_asset_change(concept):
                 return -float(value)
+
+            # 2b. XBRL negatedLabel role in _pre.xml explicitly instructs SEC renderer to invert raw XBRL sign
+            if is_negated_role:
+                return -float(value)
             
             # 3. Payments for other investing activities (shown in parens as outflow in filings)
             if 'paymentsforproceedsfromotherinvestingactivities' in local_lower:
@@ -156,12 +170,18 @@ class SignConventionHandler:
                     return abs(float(value))
                 return -abs(float(value))
 
+            # 5. If _cal.xml explicitly gives weight == -1.0 on a positive cash flow outflow item
+            if calc_weight == -1.0 and value > 0 and not any(k in local_lower for k in ('increasedecrease', 'netcash', 'netchange')):
+                return -abs(float(value))
+
             return cls._apply_cash_flow_conventions(value, concept, label)
         
         elif 'balance' in statement_type_lower or 'position' in statement_type_lower:
             return cls._apply_balance_sheet_conventions(value, concept, label)
         
         elif 'income' in statement_type_lower or 'operations' in statement_type_lower:
+            if is_negated_role:
+                return -float(value)
             return cls._apply_income_statement_conventions(value, concept, label, calc_weight)
         
         elif 'equity' in statement_type_lower or 'stockholder' in statement_type_lower:

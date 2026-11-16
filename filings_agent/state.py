@@ -42,6 +42,8 @@ class FilingAgentState(TypedDict):
 
     # ── P1 output: in-memory bundles (no DB writes yet) ────────────────────
     bundles: NotRequired[Optional[list]]
+    sec_presentation: NotRequired[Optional[dict]]
+    historical_backfill: NotRequired[Optional[dict]]
 
     # ── sign conventions (post-extraction) ─────────────────────────────────
     # In-memory sign corrections applied by the sign subagent before validation:
@@ -147,6 +149,7 @@ class CompanyAgentState(TypedDict):
     enable_reconciliation: NotRequired[Optional[bool]]
     deaccumulation: NotRequired[Optional[dict]]
     reconciliation: NotRequired[Optional[dict]]
+    stock_audit: NotRequired[Optional[dict]]
     report_finalization: NotRequired[Optional[dict]]
     error: NotRequired[Optional[str]]
 

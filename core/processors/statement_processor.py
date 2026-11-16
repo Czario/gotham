@@ -319,7 +319,65 @@ class EnhancedFinancialStatementProcessor:
         for _root in hierarchy if isinstance(hierarchy, list) else []:
             _collect_grouping_headers([_root], [])
 
-        def process_item(item, level=0):
+        _SECTION_TOTAL_CONCEPTS = {
+            "Assets",
+            "AssetsCurrent",
+            "AssetsNoncurrent",
+            "PropertyPlantAndEquipmentNet",
+            "Liabilities",
+            "LiabilitiesCurrent",
+            "LiabilitiesNoncurrent",
+            "StockholdersEquity",
+            "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+            "LiabilitiesAndStockholdersEquity",
+            "OperatingExpenses",
+            "NoninterestExpense",
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "SalesRevenueNet",
+            "CostOfRevenue",
+            "CostOfGoodsAndServicesSold",
+            "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInInvestingActivities",
+            "NetCashProvidedByUsedInFinancingActivities",
+        }
+
+        def _resolve_abstract_section_total(abs_item) -> Optional[str]:
+            """When an *Abstract section wrapper has a concrete total child (e.g.
+            OperatingExpensesAbstract -> OperatingExpenses, AssetsCurrentAbstract -> AssetsCurrent,
+            PropertyPlantAndEquipmentAbstract -> PropertyPlantAndEquipmentNet),
+            return that concrete total concept so sibling children hang under the SEC total."""
+            children = getattr(abs_item, 'children', None) or []
+            if not children:
+                return None
+            abs_local = str(getattr(abs_item, 'concept_name', '')).split(':')[-1]
+            if abs_local in (
+                'StatementOfFinancialPositionAbstract',
+                'IncomeStatementAbstract',
+                'StatementOfCashFlowsAbstract',
+                'StatementOfIncomeAndComprehensiveIncomeAbstract',
+            ):
+                return None
+            stem = abs_local[:-8] if abs_local.endswith('Abstract') else abs_local
+            # 1. Exact stem match against allowed section total concepts (prefer Net over Gross)
+            for ch in reversed(children):
+                ch_name = str(getattr(ch, 'concept_name', ''))
+                ch_local = ch_name.split(':')[-1]
+                if ch_local in _SECTION_TOTAL_CONCEPTS and getattr(ch, 'value', None) is not None:
+                    if stem and (ch_local == stem or ch_local == f"{stem}Net" or stem.startswith(ch_local)):
+                        return ch_name
+            # 2. Last child with totalLabel that is an allowed section total concept
+            for ch in reversed(children):
+                ch_name = str(getattr(ch, 'concept_name', ''))
+                ch_local = ch_name.split(':')[-1]
+                pref_role = str(getattr(ch, 'preferred_label_role', '') or '').lower()
+                if 'totallabel' in pref_role and ch_local in _SECTION_TOTAL_CONCEPTS and getattr(ch, 'value', None) is not None:
+                    return ch_name
+            return None
+
+        def process_item(item, level=0, effective_parent=None):
+            raw_parent = getattr(item, 'parent_concept', None)
+            resolved_parent = effective_parent if effective_parent != getattr(item, 'concept_name', None) else None
             # Convert FinancialLineItem to dictionary format
             fact_dict = {
                 'concept': item.concept_name,
@@ -328,11 +386,18 @@ class EnhancedFinancialStatementProcessor:
                 'context_id': item.context_id,
                 'unit': item.unit_id,
                 'period': item.period,
-                'level': item.level if hasattr(item, 'level') else level,
+                'level': level,
                 'order': item.order if hasattr(item, 'order') else 0,
                 'abstract': item.abstract if hasattr(item, 'abstract') else False,
-                'statement_type': statement_type
+                'statement_type': statement_type,
+                'parent_concept': resolved_parent,
+                'sec_parent_concept': raw_parent,
+                'preferred_label_role': getattr(item, 'preferred_label_role', None),
             }
+            if getattr(item, 'comparative_facts', None):
+                fact_dict['comparative_facts'] = list(item.comparative_facts)
+            if getattr(item, 'comparative_dimensional_facts', None):
+                fact_dict['comparative_dimensional_facts'] = list(item.comparative_dimensional_facts)
             
             # Add calculation relationships if available (CRITICAL for accurate sign conventions)
             if hasattr(item, 'calculations') and item.calculations:
@@ -425,15 +490,106 @@ class EnhancedFinancialStatementProcessor:
                 flat_data.append(fact_dict)
             
             # Process children recursively: when an abstract wrapper is omitted,
-            # children inherit the current level instead of being indented.
+            # children inherit the current level instead of being indented, and
+            # attach to the section's concrete total if one exists.
             if hasattr(item, 'children') and item.children:
-                child_level = level + 1 if should_include else level
-                for child in item.children:
-                    process_item(child, child_level)
+                if should_include:
+                    for child in item.children:
+                        process_item(child, level + 1, item.concept_name)
+                else:
+                    sec_total = _resolve_abstract_section_total(item)
+                    next_parent = sec_total or effective_parent
+                    for child in item.children:
+                        is_the_total = (sec_total is not None and getattr(child, 'concept_name', None) == sec_total)
+                        child_eff_parent = effective_parent if is_the_total else next_parent
+                        child_lvl = level if (is_the_total or next_parent == effective_parent) else level + 1
+                        process_item(child, child_lvl, child_eff_parent)
         
         # Process all items in hierarchy
         for item in hierarchy:
             process_item(item)
+
+        # Universal XBRL (_cal.xml + _pre.xml) parent & level resolution across US-GAAP, IFRS, and custom taxonomies
+        if flat_data:
+            by_concept = {d['concept']: d for d in flat_data if d.get('concept')}
+            st_lower = str(statement_type or '').lower()
+
+            for d in flat_data:
+                c_name = d.get('concept') or ''
+                calcs = d.get('calculations') or {}
+                sum_parents = calcs.get('summation_parents') or []
+                # Find the nearest calculation parent that is actually present in this statement
+                calc_p = None
+                calc_w = None
+                for sp in sum_parents:
+                    sp_c = sp.get('concept') if isinstance(sp, dict) else None
+                    if sp_c and sp_c != c_name and sp_c in by_concept:
+                        calc_p = sp_c
+                        calc_w = sp.get('weight', 1.0)
+                        break
+
+                if 'balance' in st_lower:
+                    # On Balance Sheets (US-GAAP & IFRS), _cal.xml summation_parent is the exact container parent
+                    if calc_p:
+                        d['parent_concept'] = calc_p
+                elif 'cash' in st_lower or 'flow' in st_lower:
+                    c_local = c_name.split(':')[-1]
+                    if c_local.startswith((
+                        'NetCashProvidedByUsedIn',
+                        'CashFlowsFromUsedIn',
+                        'CashCashEquivalentsRestrictedCash',
+                        'CashAndCashEquivalentsPeriodIncreaseDecrease',
+                        'IncreaseDecreaseInCash',
+                        'CashAndCashEquivalentsAtCarryingValue',
+                        'CashAndCashEquivalents',
+                        'EffectOfExchangeRateOnCash',
+                    )):
+                        d['parent_concept'] = None
+                    elif calc_p and calc_p.split(':')[-1].startswith(('NetCashProvidedByUsedIn', 'CashFlowsFromUsedIn')):
+                        d['parent_concept'] = calc_p
+                elif 'income' in st_lower:
+                    # On Income Statements, only pure additive section rollups (all children weight == +1.0
+                    # under the same non-root section) are parent-child; waterfall subtractions (weight == -1.0) are roots.
+                    if calc_p and calc_w == 1.0:
+                        p_doc = by_concept[calc_p]
+                        p_calcs = (p_doc.get('calculations') or {}).get('summation_children') or []
+                        in_stmt_children = [
+                            ch for ch in p_calcs
+                            if isinstance(ch, dict) and ch.get('concept') in by_concept
+                        ]
+                        all_positive = bool(in_stmt_children) and all(
+                            float(ch.get('weight', 1.0)) > 0 for ch in in_stmt_children
+                        )
+                        same_sec_section = (
+                            bool(d.get('sec_parent_concept'))
+                            and d.get('sec_parent_concept') == p_doc.get('sec_parent_concept')
+                        )
+                        p_local = calc_p.split(':')[-1]
+                        is_cost_plus_opex_total = p_local in ('CostsAndExpenses', 'TotalCostsAndExpenses')
+                        if all_positive and same_sec_section and not is_cost_plus_opex_total:
+                            d['parent_concept'] = calc_p
+                        else:
+                            d['parent_concept'] = None
+                    else:
+                        d['parent_concept'] = None
+
+            # Break any accidental parent cycles and recompute exact 0-based level from parent_concept chain
+            for d in flat_data:
+                seen = {d.get('concept')}
+                curr_p = d.get('parent_concept')
+                depth = 0
+                while curr_p and curr_p in by_concept:
+                    if curr_p in seen:
+                        d['parent_concept'] = None
+                        depth = 0
+                        break
+                    seen.add(curr_p)
+                    depth += 1
+                    curr_p = by_concept[curr_p].get('parent_concept')
+                if d.get('parent_concept') and d['parent_concept'] not in by_concept:
+                    d['parent_concept'] = None
+                    depth = 0
+                d['level'] = depth
         
         # Apply dimensional context filters to remove unwanted contexts (forecast, scenario, estimates)
         if flat_data and self.include_dimensions:

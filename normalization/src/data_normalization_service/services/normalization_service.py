@@ -3273,6 +3273,16 @@ class FinancialNormalizationService:
         # Labels come straight from the taxonomy linkbase and carry XBRL
         # presentation tags ("Rest Of World [Member]", "Rest of Asia Pacific
         # Segment [Member]").  Clean them before the row is written.
+        if not dimensional_concept_doc.label and concept:
+            import re as _re3
+            local_name = str(concept).split(':')[-1]
+            if local_name.endswith('Member'):
+                local_name = local_name[:-6]
+            dimensional_concept_doc.label = _re3.sub(
+                r'(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])',
+                ' ',
+                local_name,
+            ).strip()
         if dimensional_concept_doc.label:
             dimensional_concept_doc.label = clean_label(dimensional_concept_doc.label)
         

@@ -1,8 +1,8 @@
 """Filings-agent configuration.
 
-Adapted from the earning_agent ``config.py``.  Every value is sourced from the
-environment (``.env`` at the repo root) with safe defaults, so the agent can be
-imported without any agent-specific variables being set.
+Adapted from the earning_agent ``config.py``. Every value is sourced from the
+environment (``.env`` at the repo root), so the agent can be imported without
+any agent-specific variables being set.
 
 Provider variables (``LLM_PROVIDER`` and the per-provider blocks) exist for the
 ported ``filings_agent.llm`` factory.  The provider SDKs themselves are imported
@@ -28,18 +28,15 @@ LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
 
 # ── Ollama ─────────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 
 # ── DeepSeek ───────────────────────────────────────────────────────────────
 DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120"))
 
 # ── Groq (used only when LLM_PROVIDER=groq) ────────────────────────────────
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GROQ_REQUEST_TIMEOUT: float = float(os.getenv("GROQ_REQUEST_TIMEOUT", "60"))
 GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))
@@ -47,8 +44,20 @@ GROQ_TPM: int = int(os.getenv("GROQ_TPM", "12000"))
 
 # ── Google Gemini (used only when LLM_PROVIDER=gemini) ─────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_REQUEST_TIMEOUT: float = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "120"))
+MODEL_NAME: str = os.getenv("MODEL_NAME", "").strip()
+
+
+def get_model_name(provider: str) -> str:
+    """Return the explicitly configured model name for the selected provider."""
+    if provider not in {"deepseek", "groq", "gemini", "ollama"}:
+        raise ValueError(f"Unsupported LLM_PROVIDER {provider!r}")
+    if not MODEL_NAME:
+        raise ValueError(
+            "MODEL_NAME must be set in the project .env (or process environment) "
+            f"when LLM_PROVIDER={provider!r}"
+        )
+    return MODEL_NAME
 
 # ── Agent chat-model retries ───────────────────────────────────────────────
 # Retries for the tool-calling chat model used by the agent nodes (hierarchy

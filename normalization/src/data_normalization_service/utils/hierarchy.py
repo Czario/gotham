@@ -47,6 +47,66 @@ class HierarchyManager:
         # Clear caches for new processing
         self._path_counter.clear()
         self._order_usage.clear()
+
+        # If items carry explicit 'parent_concept' from XBRL (_cal.xml + _pre.xml) or HTML tables,
+        # resolve paths directly from the parent_concept graph so bottom-up SEC totals
+        # (where 'Total current assets' or 'Total assets' is printed below its children)
+        # receive their true parent path instead of attaching to a preceding sibling.
+        if any("parent_concept" in item for item in sorted_data if isinstance(item, dict)):
+            by_concept: dict[str, dict] = {}
+            for item in sorted_data:
+                c = item.get("concept")
+                if c and c not in by_concept:
+                    by_concept[c] = item
+
+            assigned_paths: dict[str, str] = {}
+            assigned_orders: dict[str, str] = {}
+            visiting: set[str] = set()
+
+            def _resolve_concept_path(c_name: str) -> str:
+                if c_name in assigned_paths:
+                    return assigned_paths[c_name]
+                if c_name in visiting or c_name not in by_concept:
+                    return ""
+                visiting.add(c_name)
+                node = by_concept[c_name]
+                p_name = node.get("parent_concept")
+                parent_path = ""
+                if p_name and p_name != c_name and p_name in by_concept:
+                    parent_path = _resolve_concept_path(p_name)
+                next_num = self._get_next_path_number(parent_path)
+                part = f"{next_num:03d}"
+                full_path = f"{parent_path}.{part}" if parent_path else part
+                assigned_paths[c_name] = full_path
+                assigned_orders[c_name] = self._generate_order_key(parent_path)
+                visiting.discard(c_name)
+                return full_path
+
+            for item in sorted_data:
+                c = item.get("concept")
+                if c:
+                    _resolve_concept_path(c)
+
+            result = []
+            for idx, item in enumerate(sorted_data):
+                c = item.get("concept")
+                path = assigned_paths.get(c, "") if c else ""
+                if not path:
+                    next_num = self._get_next_path_number("")
+                    path = f"{next_num:03d}"
+                parent_path = ".".join(path.split(".")[:-1]) if "." in path else ""
+                order_key = assigned_orders.get(c) or self._generate_order_key(parent_path)
+                enhanced_item = item.copy()
+                enhanced_item["path"] = path
+                enhanced_item["order_key"] = order_key
+                enhanced_item["has_parent"] = bool(parent_path)
+                enhanced_item["source_order"] = safe_get_int(item, "order")
+                enhanced_item["hierarchy_level"] = len(path.split(".")) - 1
+                enhanced_item["level"] = enhanced_item["hierarchy_level"]
+                enhanced_item["original_input_level"] = safe_get_int(item, "level")
+                enhanced_item["document_position"] = idx
+                result.append(enhanced_item)
+            return result
         
         # Build hierarchy preserving original document order
         # Two-pass approach: first analyze structure, then generate paths

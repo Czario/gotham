@@ -21,22 +21,19 @@ from typing import Any
 from filings_agent.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
-    DEEPSEEK_MODEL,
     DEEPSEEK_REQUEST_TIMEOUT,
     GEMINI_API_KEY,
-    GEMINI_MODEL,
     GEMINI_REQUEST_TIMEOUT,
     GROQ_API_KEY,
     GROQ_BASE_URL,
-    GROQ_MODEL,
     GROQ_REQUEST_TIMEOUT,
     GROQ_RPM,
     GROQ_TPM,
+    get_model_name,
     LLM_CACHE_DIR,
     LLM_CACHE_ENABLED,
     LLM_PROVIDER,
     OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
     OLLAMA_NUM_CTX,
 )
 
@@ -316,7 +313,6 @@ def build_llm(
     request_timeout: float | None = None,
     max_retries: int = 2,
     provider: str | None = None,
-    model: str | None = None,
 ) -> Any:
     """Build an LLM client for the configured provider.
 
@@ -342,13 +338,11 @@ def build_llm(
             ``"gemini"``). When given, takes precedence over the
             ``LLM_PROVIDER`` env var. Used by the extraction node to escalate
             to a cloud provider on retry attempts.
-        model: Explicit model override for the effective provider (e.g. the
-            section indexer routing to a fast model).  When None, the
-            provider's configured default model is used.
     """
     effective_provider = (provider or LLM_PROVIDER).strip().lower()
     max_retries = min(3, max(0, int(max_retries)))
     if effective_provider == "groq":
+        model_name = get_model_name(effective_provider)
         try:
             from langchain_openai import ChatOpenAI
         except ImportError as exc:  # pragma: no cover
@@ -359,7 +353,7 @@ def build_llm(
         if not GROQ_API_KEY:
             raise ValueError("LLM_PROVIDER=groq but GROQ_API_KEY is not set")
         kwargs: dict[str, Any] = {
-            "model": model or GROQ_MODEL,
+            "model": model_name,
             "temperature": 0,
             "api_key": GROQ_API_KEY,
             "base_url": GROQ_BASE_URL,
@@ -371,10 +365,11 @@ def build_llm(
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
         llm: Any = _GroqInvokeAdapter(ChatOpenAI(**kwargs))
         if LLM_CACHE_ENABLED:
-            llm = _CachedLLM(llm, f"groq:{GROQ_MODEL}", LLM_CACHE_DIR)
+            llm = _CachedLLM(llm, f"groq:{model_name}", LLM_CACHE_DIR)
         return llm
 
     if effective_provider == "deepseek":
+        model_name = get_model_name(effective_provider)
         try:
             from langchain_openai import ChatOpenAI
         except ImportError as exc:  # pragma: no cover
@@ -385,7 +380,7 @@ def build_llm(
         if not DEEPSEEK_API_KEY:
             raise ValueError("LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY is not set")
         kwargs = {
-            "model": model or DEEPSEEK_MODEL,
+            "model": model_name,
             "temperature": 0,
             "api_key": DEEPSEEK_API_KEY,
             "base_url": DEEPSEEK_BASE_URL,
@@ -396,10 +391,11 @@ def build_llm(
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
         llm = _OpenAIInvokeAdapter(ChatOpenAI(**kwargs))
         if LLM_CACHE_ENABLED:
-            llm = _CachedLLM(llm, f"deepseek:{DEEPSEEK_MODEL}", LLM_CACHE_DIR)
+            llm = _CachedLLM(llm, f"deepseek:{model_name}", LLM_CACHE_DIR)
         return llm
 
     if effective_provider == "gemini":
+        effective_model = get_model_name(effective_provider)
         try:
             from google import genai
             from google.genai import types
@@ -418,24 +414,24 @@ def build_llm(
             # google-genai expects the HTTP timeout in milliseconds.
             http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
         )
-        effective_model = model or GEMINI_MODEL
         config_kwargs: dict[str, Any] = {"temperature": 0}
         if json_schema is not None or format_json:
-            # gemini-2.5 supports native JSON mode. The schema (when present) is
-            # embedded in the prompt by the caller, mirroring the Groq adapter.
+            # The schema (when present) is embedded in the prompt by the caller,
+            # mirroring the Groq adapter.
             config_kwargs["response_mime_type"] = "application/json"
         gen_config = types.GenerateContentConfig(**config_kwargs)
         llm = _GeminiInvokeAdapter(client, effective_model, gen_config)
         if LLM_CACHE_ENABLED:
-            llm = _CachedLLM(llm, f"gemini:{GEMINI_MODEL}", LLM_CACHE_DIR)
+            llm = _CachedLLM(llm, f"gemini:{effective_model}", LLM_CACHE_DIR)
         return llm
 
     # Default: Ollama
+    model_name = get_model_name(effective_provider)
     from langchain_ollama import OllamaLLM
 
     kwargs = {
         "base_url": OLLAMA_BASE_URL,
-        "model": model or OLLAMA_MODEL,
+        "model": model_name,
         "temperature": 0,
         "num_ctx": OLLAMA_NUM_CTX,
     }
@@ -447,7 +443,7 @@ def build_llm(
         kwargs["client_kwargs"] = {"timeout": request_timeout}
     llm = OllamaLLM(**kwargs)
     if LLM_CACHE_ENABLED:
-        llm = _CachedLLM(llm, f"ollama:{OLLAMA_MODEL}", LLM_CACHE_DIR)
+        llm = _CachedLLM(llm, f"ollama:{model_name}", LLM_CACHE_DIR)
     return llm
 
 
@@ -500,6 +496,7 @@ def build_chat_llm(
         retries = min(int(getattr(config, "MAX_RETRY_LIMIT", 3)), max(0, int(max_retries)))
 
     if effective_provider in ("groq", "deepseek"):
+        model_name = get_model_name(effective_provider)
         try:
             from langchain_openai import ChatOpenAI
         except ImportError as exc:
@@ -510,7 +507,6 @@ def build_chat_llm(
         if effective_provider == "groq":
             if not GROQ_API_KEY:
                 raise ValueError("LLM_PROVIDER=groq but GROQ_API_KEY is not set")
-            model = GROQ_MODEL
             base_url = GROQ_BASE_URL
             api_key = GROQ_API_KEY
             timeout = (
@@ -520,7 +516,6 @@ def build_chat_llm(
         else:
             if not DEEPSEEK_API_KEY:
                 raise ValueError("LLM_PROVIDER=deepseek but DEEPSEEK_API_KEY is not set")
-            model = DEEPSEEK_MODEL
             base_url = DEEPSEEK_BASE_URL
             api_key = DEEPSEEK_API_KEY
             timeout = (
@@ -529,7 +524,7 @@ def build_chat_llm(
             )
 
         chat = ChatOpenAI(
-            model=model,
+            model=model_name,
             temperature=0,
             api_key=api_key,
             base_url=base_url,
@@ -537,7 +532,7 @@ def build_chat_llm(
             max_retries=retries,
         )
         if LLM_CACHE_ENABLED:
-            chat = _CachedLLM(chat, f"{effective_provider}:{model}", LLM_CACHE_DIR)
+            chat = _CachedLLM(chat, f"{effective_provider}:{model_name}", LLM_CACHE_DIR)
         return chat
 
     if effective_provider == "gemini":
@@ -549,14 +544,15 @@ def build_chat_llm(
         )
 
     # Ollama (default)
+    model_name = get_model_name(effective_provider)
     from langchain_ollama import ChatOllama
 
     chat = ChatOllama(
         base_url=OLLAMA_BASE_URL,
-        model=OLLAMA_MODEL,
+        model=model_name,
         temperature=0,
         num_ctx=OLLAMA_NUM_CTX,
     )
     if LLM_CACHE_ENABLED:
-        chat = _CachedLLM(chat, f"ollama:{OLLAMA_MODEL}", LLM_CACHE_DIR)
+        chat = _CachedLLM(chat, f"ollama:{model_name}", LLM_CACHE_DIR)
     return chat

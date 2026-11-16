@@ -46,6 +46,13 @@ def make_normalize_node(norm_service: Any) -> Callable[[dict], dict]:
             state.get("cik"),
             state.get("accession_number") or "",
         )
-        return {**state, "bundles": bundles, "status": "normalized"}
+        sec_pres = state.get("sec_presentation")
+        if not sec_pres and statement_docs:
+            try:
+                from core.extractors.sec_presentation_extractor import build_sec_presentation_snapshot
+                sec_pres = build_sec_presentation_snapshot(statement_docs=statement_docs)
+            except Exception:
+                sec_pres = None
+        return {**state, "bundles": bundles, "sec_presentation": sec_pres, "status": "normalized"}
 
     return normalize_bundle_node

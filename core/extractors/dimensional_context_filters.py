@@ -64,6 +64,21 @@ class DimensionalContextFilter:
         'InterestRateContractMember',
         'us-gaap:ReclassificationOutOfAccumulatedOtherComprehensiveIncomeMember',
         'ReclassificationOutOfAccumulatedOtherComprehensiveIncomeMember',
+
+        # Statement of Stockholders' Equity roll-forward column members:
+        # These duplicate concrete Balance Sheet equity rows and pollute Income/CashFlow NetIncomeLoss.
+        'us-gaap:RetainedEarningsMember',
+        'RetainedEarningsMember',
+        'us-gaap:CommonStockMember',
+        'CommonStockMember',
+        'us-gaap:AdditionalPaidInCapitalMember',
+        'AdditionalPaidInCapitalMember',
+        'us-gaap:TreasuryStockCommonMember',
+        'TreasuryStockCommonMember',
+        'us-gaap:TreasuryStockPreferredMember',
+        'TreasuryStockPreferredMember',
+        'us-gaap:AccumulatedOtherComprehensiveIncomeMember',
+        'AccumulatedOtherComprehensiveIncomeMember',
     }
     
     # Dimensional axes that often contain unwanted data
@@ -73,6 +88,7 @@ class DimensionalContextFilter:
         'us-gaap:ChangeInAccountingPrincipleAxis',  # Accounting principle changes
         'us-gaap:ErrorCorrectionAxis',  # Error corrections
         'us-gaap:RestatementAxis',  # Restatements
+        'us-gaap:StatementEquityComponentsAxis',  # Statement of Stockholders' Equity columns
     }
     
     # Keywords in member names that indicate unwanted contexts.

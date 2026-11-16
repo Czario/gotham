@@ -34,6 +34,10 @@ def fmt_row(row: dict) -> str:
         flags.append("dim")
     if row.get("parent_concept"):
         flags.append(f"parent={row['parent_concept']}")
+    if row.get("sec_parent_concept") and row.get("sec_parent_concept") != row.get("parent_concept"):
+        flags.append(f"sec_parent={row['sec_parent_concept']}")
+    if row.get("calc_parent_concept") and row.get("calc_parent_concept") != row.get("parent_concept"):
+        flags.append(f"calc_parent={row['calc_parent_concept']}")
     if row.get("parent_header"):
         flags.append(f"parent_header={row['parent_header']}")
     if row.get("segment_type"):
@@ -52,6 +56,201 @@ def fmt_row(row: dict) -> str:
 # Alias with underscore for backwards compatibility
 _fmt_row = fmt_row
 
+_INCOME_ROOT_LOCALS = {
+    "Revenues",
+    "SalesRevenueNet",
+    "SalesRevenueGoodsNet",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "RevenuesNetOfInterestExpense",
+    "InterestAndNoninterestRevenue",
+    "CostOfGoodsAndServicesSold",
+    "CostOfRevenue",
+    "CostOfGoodsSold",
+    "GrossProfit",
+    "OperatingExpenses",
+    "CostsAndExpenses",
+    "NoninterestExpense",
+    "OperatingIncomeLoss",
+    "NonoperatingIncomeExpense",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+    "IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+    "IncomeLossFromContinuingOperations",
+    "IncomeTaxExpenseBenefit",
+    "NetIncomeLoss",
+    "ProfitLoss",
+    "NetIncomeLossAvailableToCommonStockholdersBasic",
+    "ComprehensiveIncomeNetOfTax",
+    "EarningsPerShareBasic",
+    "EarningsPerShareDiluted",
+    "WeightedAverageNumberOfSharesOutstandingBasic",
+    "WeightedAverageNumberOfDilutedSharesOutstanding",
+}
+
+_OPEX_CHILD_LOCALS = {
+    "ResearchAndDevelopmentExpense",
+    "ResearchAndDevelopmentExpenseSoftwareExcludingAcquiredInProcessCost",
+    "SellingGeneralAndAdministrativeExpense",
+    "SellingAndMarketingExpense",
+    "SellingExpense",
+    "MarketingExpense",
+    "GeneralAndAdministrativeExpense",
+    "RestructuringCharges",
+    "RestructuringSettlementAndImpairmentProvisions",
+}
+
+_NONOP_CHILD_LOCALS = {
+    "InterestIncomeExpenseNet",
+    "InterestIncomeExpenseNonoperatingNet",
+    "InterestExpense",
+    "InterestExpenseNonoperating",
+    "InvestmentIncomeInterest",
+    "InterestIncomeOperating",
+    "OtherNonoperatingIncomeExpense",
+}
+
+
+def _sanitize_proposed_rows(
+    rows: list[dict],
+    statement_type: str,
+    filing_rows: Optional[list[dict]] = None,
+) -> list[dict]:
+    """Enforce accounting & XBRL (_cal.xml + _pre.xml) hierarchy invariants on proposed non-stored rows."""
+    if not rows:
+        return rows
+    st = str(statement_type or "").lower().replace("-", "_").replace(" ", "_")
+    row_by_c = {str(r.get("concept") or ""): r for r in rows if isinstance(r, dict) and r.get("concept")}
+    filing_by_c = {
+        str(fr.get("concept") or ""): fr
+        for fr in (filing_rows or [])
+        if isinstance(fr, dict) and fr.get("concept") and not fr.get("dimension_concept")
+    }
+    any_modified = False
+
+    # 0. Universal XBRL calculation-parent inversion guard (works for US-GAAP, IFRS ifrs-full:*, and custom tags):
+    # If the LLM placed Concept A under Concept B, but the filing's _cal.xml says Concept B sums into Concept A,
+    # swap them so the true calculation parent (A) is above its component (B).
+    for r in rows:
+        if r.get("_is_stored"):
+            continue
+        c_name = str(r.get("concept") or "")
+        cur_p = str(r.get("parent") or r.get("parent_concept") or "")
+        if not c_name or not cur_p or cur_p not in filing_by_c:
+            continue
+        parent_filing_row = filing_by_c[cur_p]
+        parent_true_calc_p = parent_filing_row.get("calc_parent_concept") or parent_filing_row.get("parent_concept")
+        if parent_true_calc_p == c_name:
+            my_filing_row = filing_by_c.get(c_name) or {}
+            true_upper_p = my_filing_row.get("parent_concept") or my_filing_row.get("calc_parent_concept")
+            if true_upper_p == cur_p:
+                true_upper_p = None
+            r["parent"] = true_upper_p if (true_upper_p and true_upper_p in row_by_c) else None
+            r.pop("parent_concept", None)
+            for other in rows:
+                if other.get("_is_stored") or other.get("concept") == c_name:
+                    continue
+                if other.get("concept") == cur_p or (other.get("parent") or other.get("parent_concept")) == cur_p:
+                    other["parent"] = c_name
+                    other.pop("parent_concept", None)
+            any_modified = True
+
+    if "income" in st:
+        opex_parent = next(
+            (
+                c for c in (
+                    "us-gaap:OperatingExpenses",
+                    "system:TotalOperatingExpenses",
+                    "us-gaap:NoninterestExpense",
+                    "us-gaap:CostsAndExpenses",
+                )
+                if c in row_by_c
+            ),
+            None,
+        )
+        nonop_parent = "us-gaap:NonoperatingIncomeExpense" if "us-gaap:NonoperatingIncomeExpense" in row_by_c else None
+
+        for r in rows:
+            if r.get("_is_stored"):
+                continue
+            c = str(r.get("concept") or "")
+            local = c.split(":")[-1]
+            cur_p = r.get("parent") or r.get("parent_concept")
+            cur_p_local = str(cur_p or "").split(":")[-1]
+
+            if local in _INCOME_ROOT_LOCALS and cur_p is not None:
+                r["parent"] = None
+                r.pop("parent_concept", None)
+                any_modified = True
+            elif local in _OPEX_CHILD_LOCALS:
+                if opex_parent and cur_p != opex_parent:
+                    r["parent"] = opex_parent
+                    r.pop("parent_concept", None)
+                    any_modified = True
+                elif not opex_parent and cur_p is not None and not str(cur_p).startswith("custom:"):
+                    r["parent"] = None
+                    r.pop("parent_concept", None)
+                    any_modified = True
+            elif local in _NONOP_CHILD_LOCALS:
+                if nonop_parent and cur_p != nonop_parent:
+                    r["parent"] = nonop_parent
+                    r.pop("parent_concept", None)
+                    any_modified = True
+                elif not nonop_parent and cur_p_local in _INCOME_ROOT_LOCALS:
+                    r["parent"] = None
+                    r.pop("parent_concept", None)
+                    any_modified = True
+
+    elif "balance" in st:
+        ppe_net = "us-gaap:PropertyPlantAndEquipmentNet"
+        ppe_gross = "us-gaap:PropertyPlantAndEquipmentGross"
+        if ppe_net in row_by_c and ppe_gross in row_by_c:
+            net_row = row_by_c[ppe_net]
+            if not net_row.get("_is_stored") and (net_row.get("parent") or net_row.get("parent_concept")) == ppe_gross:
+                assets_parent = "us-gaap:AssetsNoncurrent" if "us-gaap:AssetsNoncurrent" in row_by_c else "us-gaap:Assets"
+                net_row["parent"] = assets_parent if assets_parent in row_by_c else None
+                net_row.pop("parent_concept", None)
+                any_modified = True
+                for r in rows:
+                    if r.get("_is_stored") or r.get("concept") == ppe_net:
+                        continue
+                    if r.get("concept") == ppe_gross or (r.get("parent") or r.get("parent_concept")) == ppe_gross:
+                        r["parent"] = ppe_net
+                        r.pop("parent_concept", None)
+                        any_modified = True
+
+    elif "cash" in st or "flow" in st:
+        for r in rows:
+            if r.get("_is_stored"):
+                continue
+            c = str(r.get("concept") or "")
+            local = c.split(":")[-1]
+            cur_p = str(r.get("parent") or r.get("parent_concept") or "")
+            cur_p_local = cur_p.split(":")[-1]
+            if local.startswith((
+                "CashCashEquivalentsRestrictedCash",
+                "CashAndCashEquivalentsPeriodIncreaseDecrease",
+                "CashAndCashEquivalentsAtCarryingValue",
+                "EffectOfExchangeRateOnCash",
+            )) and cur_p:
+                r["parent"] = None
+                r.pop("parent_concept", None)
+                any_modified = True
+            elif c == "custom:SupplementalCashFlowInformation" and "PeriodIncreaseDecrease" in cur_p_local:
+                r["parent"] = None
+                r.pop("parent_concept", None)
+                any_modified = True
+
+    # If any parent was corrected on a fresh seed, re-sequence sibling orders in top-down order
+    if any_modified and not any(r.get("_is_stored") for r in rows):
+        sibling_counts: dict[Optional[str], int] = defaultdict(int)
+        for r in rows:
+            p = r.get("parent") or r.get("parent_concept")
+            sibling_counts[p] += 1
+            r["order"] = sibling_counts[p]
+
+    return rows
+
 
 def build_unified_hierarchy_tools(
     stored_rows: list[dict],
@@ -66,6 +265,7 @@ def build_unified_hierarchy_tools(
     identity_paths: dict | None = None,
     identity_order_keys: dict | None = None,
     materialize: Any = None,
+    sec_presentation: dict | None = None,
 ) -> list[Any]:
     """Build the hierarchy agent's toolset.
 
@@ -122,11 +322,23 @@ def build_unified_hierarchy_tools(
         """Show this filing's extracted line items and dimensional members."""
         main = [r for r in filing_rows if not r.get("dimension_concept")]
         dims = [r for r in filing_rows if r.get("dimension_concept")]
-        return (
+        out = (
             f"FILING LINE ITEMS {scope_banner} ({len(main)}):\n" + "\n".join(fmt_row(r) for r in main)
             + f"\n\nFILING DIMENSIONAL MEMBERS ({len(dims)}):\n"
             + "\n".join(fmt_row(r) for r in dims)
         )
+        if sec_presentation:
+            from core.extractors.sec_presentation_extractor import format_sec_presentation_tree
+            sec_str = format_sec_presentation_tree(sec_presentation, statement_type)
+            if not sec_str.startswith("No raw SEC"):
+                out += f"\n\n{sec_str}"
+        return out
+
+    @tool
+    def query_sec_presentation_tree() -> str:
+        """Show the exact SEC filing presentation linkbase (`_pre.xml`), calculation rollups (`_cal.xml`), and comparative periods."""
+        from core.extractors.sec_presentation_extractor import format_sec_presentation_tree
+        return format_sec_presentation_tree(sec_presentation, statement_type)
 
     @tool
     def query_hierarchy_diff() -> str:
@@ -513,6 +725,9 @@ def build_unified_hierarchy_tools(
                     item["_is_stored"] = False
                     merged.append(item)
             final_rows = merged
+
+        # Deterministic accounting hierarchy sanitization for unstored/fresh rows
+        final_rows = _sanitize_proposed_rows(final_rows, statement_type, filing_rows=filing_rows)
 
         # 2. Base dimensional members from stored
         stored_dims = []
@@ -1017,28 +1232,53 @@ def build_unified_hierarchy_tools(
             lines.append("\n✓ no duplicate paths or path/order_key collisions. If this tree is correct, call finalize_hierarchy().")
         return "\n".join(lines)
 
+    from ..adk.builtin_tools import (
+        InMemoryArtifactService,
+        build_adk_exit_loop_tool,
+        build_adk_load_artifacts_tool,
+        wrap_custom_function_tool,
+    )
+
+    artifact_service = InMemoryArtifactService()
+    if sec_presentation:
+        artifact_service.save_artifact("sec_presentation", sec_presentation)
+    artifact_service.save_artifact("filing_rows", filing_rows)
+    if stored_rows:
+        artifact_service.save_artifact("stored_rows", stored_rows)
+
+    adk_load_artifacts = build_adk_load_artifacts_tool(artifact_service)
+    adk_exit_loop = build_adk_exit_loop_tool(proposal)
+
     if not stored_rows:
-        return [
+        raw_tools = [
             query_stored_hierarchy,
             query_filing_hierarchy,
+            query_sec_presentation_tree,
             propose_hierarchy,
             move_row,
             remove_row,
             preview_hierarchy,
             check_hierarchy,
             lint_hierarchy,
+            adk_load_artifacts,
+            adk_exit_loop,
         ]
-    return [
-        query_stored_hierarchy,
-        query_hierarchy_diff,
-        decide_mapping,
-        propose_hierarchy,
-        move_row,
-        remove_row,
-        preview_hierarchy,
-        check_hierarchy,
-        lint_hierarchy,
-    ]
+    else:
+        raw_tools = [
+            query_stored_hierarchy,
+            query_hierarchy_diff,
+            query_sec_presentation_tree,
+            decide_mapping,
+            propose_hierarchy,
+            move_row,
+            remove_row,
+            preview_hierarchy,
+            check_hierarchy,
+            lint_hierarchy,
+            adk_load_artifacts,
+            adk_exit_loop,
+        ]
+    return [wrap_custom_function_tool(t) for t in raw_tools]
 
 
 PRIMARY_PREFIXES = (

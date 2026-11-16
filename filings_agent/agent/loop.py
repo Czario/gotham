@@ -38,6 +38,8 @@ _TOOL_RESULT_CAPS: dict[str, int] = {
     "query_stored_hierarchy": 60_000,
     "query_filing_hierarchy": 60_000,
     "query_hierarchy_diff": 60_000,
+    "query_sec_presentation_tree": 60_000,
+    "query_historical_gaps": 60_000,
     "preview_hierarchy": 60_000,
     "lint_hierarchy": 16_000,
 }
@@ -191,6 +193,9 @@ def run_agent_loop(
     recovery_regex: re.Pattern | None = None,
     chat_llm: Any = None,
     on_event: Callable[[dict], None] | None = None,
+    before_tool_callback: Callable[[str, dict[str, Any]], Any] | None = None,
+    after_tool_callback: Callable[[str, dict[str, Any], Any], Any] | None = None,
+    finalize_validator: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> dict[str, Any] | None:
     """Run the tool-calling agent loop.
 
@@ -326,7 +331,13 @@ def run_agent_loop(
 
             tool_messages: list[ToolMessage] = []
             step_had_non_resolving = False
-            for tc in tool_calls:
+            # Always execute action/inspection tools BEFORE the terminal finalize tool
+            # when the model emits multiple tool calls in a single turn.
+            ordered_tool_calls = sorted(
+                tool_calls,
+                key=lambda tc: 1 if tc.get("name", "") == finalize_name else 0,
+            )
+            for tc in ordered_tool_calls:
                 tool_name = tc.get("name", "")
                 tool_args = tc.get("args", {})
                 tool_call_id = tc.get("id", "")
@@ -369,34 +380,62 @@ def run_agent_loop(
                     if parsed is None:
                         step_had_non_resolving = True
                         report_call(f"  [tool]  ✗ {finalize_name} — could not parse result JSON")
+                        tool_messages.append(
+                            ToolMessage(
+                                content="Failed to parse result JSON. Ensure it is a valid JSON object.",
+                                tool_call_id=tool_call_id,
+                            )
+                        )
                     else:
-                        final_result = parsed
-                        report_call(f"  [tool]  ✓ {finalize_name} in {_fin_dur:.2f}s — status='done'")
-                        logger.info(
-                            "Agent finalize for %s: %d key(s)",
-                            ticker, len(final_result),
+                        validation_err = (
+                            finalize_validator(parsed)
+                            if callable(finalize_validator)
+                            else None
                         )
-                        _emit(
-                            on_event,
-                            {
-                                "event": "finalize",
-                                "step": step,
-                                "tool": finalize_name,
-                                "keys": list(final_result)[:50],
-                            },
+                        if validation_err:
+                            step_had_non_resolving = True
+                            report_call(
+                                f"  [tool]  ⚠ {finalize_name} rejected by verifier: {validation_err[:120]}"
+                            )
+                            tool_messages.append(
+                                ToolMessage(
+                                    content=f"Cannot finalize yet: {validation_err}",
+                                    tool_call_id=tool_call_id,
+                                )
+                            )
+                        else:
+                            final_result = parsed
+                            report_call(f"  [tool]  ✓ {finalize_name} in {_fin_dur:.2f}s — status='done'")
+                            logger.info(
+                                "Agent finalize for %s: %d key(s)",
+                                ticker, len(final_result),
+                            )
+                            _emit(
+                                on_event,
+                                {
+                                    "event": "finalize",
+                                    "step": step,
+                                    "tool": finalize_name,
+                                    "keys": list(final_result)[:50],
+                                },
+                            )
+                            tool_messages.append(
+                                ToolMessage(
+                                    content="Finalize received.",
+                                    tool_call_id=tool_call_id,
+                                )
+                            )
+                            messages.extend(tool_messages)
+                            break
+                    continue
+
+                if callable(before_tool_callback):
+                    cb_override = before_tool_callback(tool_name, tool_args)
+                    if cb_override is not None:
+                        tool_messages.append(
+                            ToolMessage(content=str(cb_override), tool_call_id=tool_call_id)
                         )
-                    tool_messages.append(
-                        ToolMessage(
-                            content=(
-                                "Finalize received."
-                                if parsed is not None
-                                else "Failed to parse result JSON. Ensure it is a valid JSON object."
-                            ),
-                            tool_call_id=tool_call_id,
-                        )
-                    )
-                    messages.extend(tool_messages)
-                    break
+                        continue
 
                 tool_fn = next((t for t in all_tools if t.name == tool_name), None)
                 if tool_fn is not None:
@@ -410,6 +449,11 @@ def run_agent_loop(
                 else:
                     _tool_dur = 0.0
                     result = f"Unknown tool: {tool_name}"
+
+                if callable(after_tool_callback):
+                    post_res = after_tool_callback(tool_name, tool_args, result)
+                    if post_res is not None:
+                        result = post_res
 
                 if _is_non_resolving_tool_result(tool_name, result):
                     step_had_non_resolving = True

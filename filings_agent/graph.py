@@ -1,36 +1,34 @@
-"""LangGraph workflow for the filings agent.
+"""Google ADK workflow for the filings agent.
 
-Architecture mirrors the earning_agent: a linear ``StateGraph`` whose nodes are
-pure ``(state) -> state`` functions wrapped by ``with_hooks`` (structured
-logging, timing, exception → ``status="failed"``) with conditional edges that
-short-circuit to ``END`` on ``failed`` / ``skipped``.
+Orchestrates the filing pipeline using Google ADK's ``ADKSequentialAgent``,
+``ADKStepAgent``, ``InMemorySessionService``, ``InMemoryArtifactService``,
+and ``InMemoryMemoryService``:
 
-Complete agentic pipeline:
-
-    fetch_filing → xbrl_extract → normalize_bundle → validate →
-    agent_review? → repair? → validate → hierarchy_agent → validate_final →
-    decide → persist → extract_guidance → save_guidance → END
+    fetch_filing → xbrl_extract → normalize_bundle → targeted_text_extract →
+    historical_backfill → validate → agent_review? → repair? →
+    hierarchy_agent → validate_final → decide → persist →
+    extract_guidance → save_guidance → END
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Callable
 
-from langgraph.graph import END, StateGraph
-
+from .adk import ADKGraphRunner, ADKSequentialAgent, ADKStepAgent
 from .hooks import with_hooks
 from .recovery import with_recovery
 from .nodes.decide import make_decide_node
 from .nodes.fetch_filing import make_fetch_filing_node
 from .nodes.guidance import make_guidance_extract_node, make_guidance_save_node
 from .nodes.hierarchy_agent import make_hierarchy_agent_node
+from .nodes.historical_backfill import make_historical_backfill_node
 from .nodes.normalize import make_normalize_node
 from .nodes.persist import make_persist_node
 from .nodes.repair import make_repair_node
 from .nodes.review import make_review_node
+from .nodes.targeted_extract import make_targeted_extract_node
 from .nodes.validate import make_validate_node
 from .nodes.xbrl_extract import make_xbrl_extract_node
-from .nodes.targeted_extract import make_targeted_extract_node
 from .state import FilingAgentState
 
 logger = logging.getLogger(__name__)
@@ -83,147 +81,8 @@ def build_filing_graph(
     financial_transformer: Any = None,
     sec_client: Any = None,
     db_collections: Any = None,
-):
-    """Build and compile the filings-agent workflow."""
-    graph = StateGraph(FilingAgentState)
-
-    # 1. Filing discovery and dedup node
-    graph.add_node(
-        "fetch_filing",
-        _wrap(
-            make_fetch_filing_node(sec_client=sec_client, db_collections=db_collections),
-            "fetch_filing_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 2. Agentic XBRL extraction node
-    graph.add_node(
-        "xbrl_extract",
-        _wrap(
-            make_xbrl_extract_node(
-                financial_processor=financial_processor,
-                financial_transformer=financial_transformer,
-            ),
-            "xbrl_extract_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 3. Normalization node
-    graph.add_node(
-        "normalize_bundle",
-        _wrap(make_normalize_node(norm_service), "normalize_bundle_node", decision_chat_llm),
-    )
-
-    # 3b. Targeted text extraction node (for placed concepts missing from XBRL)
-    graph.add_node(
-        "targeted_text_extract",
-        _wrap(
-            make_targeted_extract_node(norm_service, chat_llm=decision_chat_llm, on_event=on_event),
-            "targeted_text_extract_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 4. Deterministic multi-suite validation node
-    graph.add_node(
-        "validate",
-        _wrap(make_validate_node(report_store), "validate_node", decision_chat_llm),
-    )
-
-    # 5. Hierarchy agent node
-    graph.add_node(
-        "hierarchy_agent",
-        _wrap(
-            make_hierarchy_agent_node(
-                norm_service, chat_llm=decision_chat_llm, on_event=on_event
-            ),
-            "hierarchy_agent_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 6. ReAct review agent node
-    graph.add_node(
-        "agent_review",
-        _wrap(
-            make_review_node(chat_llm=review_chat_llm, on_event=on_event),
-            "agent_review_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 7. Correction gate repair node
-    graph.add_node(
-        "repair",
-        _wrap(make_repair_node(mode=repair_mode), "repair_node", decision_chat_llm),
-    )
-
-    # 8. Final validation node
-    graph.add_node(
-        "validate_final",
-        _wrap(make_validate_node(report_store), "validate_final_node", decision_chat_llm),
-    )
-
-    # 10. Final decision node
-    graph.add_node(
-        "decide",
-        _wrap(
-            make_decide_node(
-                chat_llm=decision_chat_llm,
-                on_event=on_event,
-                report_store=report_store,
-            ),
-            "decide_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 11. Database persist node
-    graph.add_node(
-        "persist",
-        _wrap(
-            make_persist_node(norm_service, enforce_allowed_types=enforce_allowed_types),
-            "persist_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 12. Guidance extraction node
-    graph.add_node(
-        "extract_guidance",
-        _wrap(
-            make_guidance_extract_node(
-                chat_llm=guidance_chat_llm,
-                mda_provider=mda_provider,
-                on_event=on_event,
-            ),
-            "extract_guidance_node",
-            decision_chat_llm,
-        ),
-    )
-
-    # 13. Guidance save node
-    graph.add_node(
-        "save_guidance",
-        _wrap(make_guidance_save_node(), "save_guidance_node", decision_chat_llm),
-    )
-
-    # Entry point is now fetch_filing
-    graph.set_entry_point("fetch_filing")
-
-    graph.add_conditional_edges(
-        "fetch_filing",
-        _route_after("xbrl_extract"),
-        {"xbrl_extract": "xbrl_extract", "__end__": END},
-    )
-
-    graph.add_conditional_edges(
-        "xbrl_extract",
-        _route_after("normalize_bundle"),
-        {"normalize_bundle": "normalize_bundle", "__end__": END},
-    )
+) -> ADKGraphRunner:
+    """Build and compile the Google ADK filings-agent workflow."""
 
     def _route_needs(state: dict) -> str:
         if state.get("status") in _SHORT_CIRCUIT:
@@ -232,47 +91,153 @@ def build_filing_graph(
             return "agent_review"
         return "hierarchy_agent"
 
-    graph.add_conditional_edges(
-        "normalize_bundle",
-        _route_after("targeted_text_extract"),
-        {"targeted_text_extract": "targeted_text_extract", "__end__": END},
-    )
-    graph.add_conditional_edges(
-        "targeted_text_extract",
-        _route_after("validate"),
-        {"validate": "validate", "__end__": END},
-    )
-    graph.add_conditional_edges(
-        "validate",
-        _route_needs,
-        {"agent_review": "agent_review", "hierarchy_agent": "hierarchy_agent", "__end__": END},
-    )
-    graph.add_edge("agent_review", "repair")
-    graph.add_edge("repair", "hierarchy_agent")
-    graph.add_conditional_edges(
-        "hierarchy_agent",
-        _route_after("validate_final"),
-        {"validate_final": "validate_final", "__end__": END},
-    )
-    graph.add_conditional_edges(
-        "validate_final",
-        _route_after("decide"),
-        {"decide": "decide", "__end__": END},
-    )
-    graph.add_conditional_edges(
-        "decide",
-        _route_after("persist"),
-        {"persist": "persist", "__end__": END},
-    )
-    graph.add_conditional_edges(
-        "persist",
-        _route_after_save,
-        {"extract_guidance": "extract_guidance", "__end__": END},
-    )
-    graph.add_edge("extract_guidance", "save_guidance")
-    graph.add_edge("save_guidance", END)
+    sub_agents = [
+        ADKStepAgent(
+            "fetch_filing",
+            _wrap(
+                make_fetch_filing_node(sec_client=sec_client, db_collections=db_collections),
+                "fetch_filing_node",
+                decision_chat_llm,
+            ),
+            description="Filing discovery and deduplication check.",
+        ),
+        ADKStepAgent(
+            "xbrl_extract",
+            _wrap(
+                make_xbrl_extract_node(
+                    financial_processor=financial_processor,
+                    financial_transformer=financial_transformer,
+                ),
+                "xbrl_extract_node",
+                decision_chat_llm,
+            ),
+            description="XBRL extraction and SEC presentation linkbase snapshot capture.",
+        ),
+        ADKStepAgent(
+            "normalize_bundle",
+            _wrap(make_normalize_node(norm_service), "normalize_bundle_node", decision_chat_llm),
+            description="Normalize extracted statement documents into in-memory bundles.",
+        ),
+        ADKStepAgent(
+            "targeted_text_extract",
+            _wrap(
+                make_targeted_extract_node(norm_service, chat_llm=decision_chat_llm, on_event=on_event),
+                "targeted_text_extract_node",
+                decision_chat_llm,
+            ),
+            description="Recover missing concepts from SEC presentation linkbase and filing text.",
+        ),
+        ADKStepAgent(
+            "historical_backfill",
+            _wrap(
+                make_historical_backfill_node(norm_service, chat_llm=decision_chat_llm, on_event=on_event),
+                "historical_backfill_node",
+                decision_chat_llm,
+            ),
+            description="Discover and stage missing comparative historical period facts and breakdowns.",
+        ),
+        ADKStepAgent(
+            "validate",
+            _wrap(make_validate_node(report_store), "validate_node", decision_chat_llm),
+            description="Run deterministic validation suite including SEC presentation diff.",
+        ),
+        ADKStepAgent(
+            "hierarchy_agent",
+            _wrap(
+                make_hierarchy_agent_node(
+                    norm_service, chat_llm=decision_chat_llm, on_event=on_event
+                ),
+                "hierarchy_agent_node",
+                decision_chat_llm,
+            ),
+            description="SEC-aligned ADK hierarchy agent.",
+        ),
+        ADKStepAgent(
+            "agent_review",
+            _wrap(
+                make_review_node(chat_llm=review_chat_llm, on_event=on_event),
+                "agent_review_node",
+                decision_chat_llm,
+            ),
+            description="ADK review agent for validation findings.",
+        ),
+        ADKStepAgent(
+            "repair",
+            _wrap(make_repair_node(mode=repair_mode), "repair_node", decision_chat_llm),
+            description="Provenance-gated repair execution.",
+        ),
+        ADKStepAgent(
+            "validate_final",
+            _wrap(make_validate_node(report_store), "validate_final_node", decision_chat_llm),
+            description="Final post-hierarchy and post-repair validation.",
+        ),
+        ADKStepAgent(
+            "decide",
+            _wrap(
+                make_decide_node(
+                    chat_llm=decision_chat_llm,
+                    on_event=on_event,
+                    report_store=report_store,
+                ),
+                "decide_node",
+                decision_chat_llm,
+            ),
+            description="Final write decision policy and optional LLM judge.",
+        ),
+        ADKStepAgent(
+            "persist",
+            _wrap(
+                make_persist_node(norm_service, enforce_allowed_types=enforce_allowed_types),
+                "persist_node",
+                decision_chat_llm,
+            ),
+            description="Database persistence for primary bundles and missing historical backfill.",
+        ),
+        ADKStepAgent(
+            "extract_guidance",
+            _wrap(
+                make_guidance_extract_node(
+                    chat_llm=guidance_chat_llm,
+                    mda_provider=mda_provider,
+                    on_event=on_event,
+                ),
+                "extract_guidance_node",
+                decision_chat_llm,
+            ),
+            description="MD&A forward-looking guidance extraction.",
+        ),
+        ADKStepAgent(
+            "save_guidance",
+            _wrap(make_guidance_save_node(), "save_guidance_node", decision_chat_llm),
+            description="Guidance persistence.",
+        ),
+    ]
 
-    return graph.compile()
+    edges = {
+        "fetch_filing": _route_after("xbrl_extract"),
+        "xbrl_extract": _route_after("normalize_bundle"),
+        "normalize_bundle": _route_after("targeted_text_extract"),
+        "targeted_text_extract": _route_after("historical_backfill"),
+        "historical_backfill": _route_after("validate"),
+        "validate": _route_needs,
+        "agent_review": "repair",
+        "repair": "hierarchy_agent",
+        "hierarchy_agent": _route_after("validate_final"),
+        "validate_final": _route_after("decide"),
+        "decide": _route_after("persist"),
+        "persist": _route_after_save,
+        "extract_guidance": "save_guidance",
+        "save_guidance": "__end__",
+    }
+
+    root_agent = ADKSequentialAgent(
+        "filing_pipeline_agent",
+        sub_agents,
+        description="Google ADK SEC filing extraction, audit, hierarchy, and persistence pipeline.",
+        entry_point="fetch_filing",
+        edges=edges,
+    )
+    return ADKGraphRunner(root_agent, app_name="filings_agent")
 
 
 # Convenience alias used by the CLI / entry point.

@@ -23,9 +23,16 @@ def make_xbrl_extract_node(
     """Build the xbrl_extract node for LangGraph."""
 
     def xbrl_extract_node(state: dict) -> dict:
-        # If statements are already provided on state, passthrough
+        # If statements are already provided on state, passthrough (and build sec_presentation if missing)
         if state.get("statement_docs"):
-            return {**state, "status": "extracted"}
+            sec_pres = state.get("sec_presentation")
+            if not sec_pres:
+                try:
+                    from core.extractors.sec_presentation_extractor import build_sec_presentation_snapshot
+                    sec_pres = build_sec_presentation_snapshot(statement_docs=state.get("statement_docs"))
+                except Exception:
+                    sec_pres = None
+            return {**state, "status": "extracted", "sec_presentation": sec_pres}
 
         cik = str(state.get("cik") or "")
         accession_number = state.get("accession_number")
@@ -56,6 +63,35 @@ def make_xbrl_extract_node(
         )
 
         statements = extracted.get("statements") or {}
+        if not statements:
+            # Fallback: if no XBRL is available for this filing, extract statements
+            # directly from the rendered SEC HTML filing tables if available.
+            html_text = state.get("html_text")
+            if not html_text:
+                try:
+                    import os
+                    from filings_agent.mda import find_local_html, read_html_file
+                    local_html = find_local_html(
+                        str(accession_number or ""),
+                        ticker=str(state.get("ticker") or ""),
+                        html_dir=os.getenv("SEC_HTML_DOWNLOAD_PATH"),
+                    )
+                    if local_html:
+                        html_text = read_html_file(local_html)
+                except Exception:
+                    html_text = None
+
+            if html_text:
+                from core.extractors.sec_presentation_extractor import parse_rendered_sec_html_tables
+                html_tables = parse_rendered_sec_html_tables(html_text)
+                if html_tables:
+                    logger.info(
+                        "xbrl_extract_node: no XBRL found for %s; recovered %d statement(s) from rendered SEC HTML",
+                        accession_number,
+                        len(html_tables),
+                    )
+                    statements = html_tables
+
         if not statements:
             logger.warning(
                 "xbrl_extract_node: no statements extracted for %s %s",
@@ -104,9 +140,20 @@ def make_xbrl_extract_node(
             for st_type, st_data in statements.items():
                 statement_docs.append({"statement_type": st_type, "data": st_data})
 
+        try:
+            from core.extractors.sec_presentation_extractor import build_sec_presentation_snapshot
+            sec_presentation = build_sec_presentation_snapshot(
+                extracted_xbrl=extracted,
+                statement_docs=statement_docs,
+            )
+        except Exception as pres_exc:
+            logger.debug("sec_presentation snapshot failed: %s", pres_exc)
+            sec_presentation = None
+
         return {
             **state,
             "statement_docs": statement_docs,
+            "sec_presentation": sec_presentation,
             "status": "extracted",
             "extraction_result": {"statement_count": len(statement_docs)},
         }
