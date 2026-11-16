@@ -29,7 +29,9 @@ def make_xbrl_extract_node(
             if not sec_pres:
                 try:
                     from core.extractors.sec_presentation_extractor import build_sec_presentation_snapshot
-                    sec_pres = build_sec_presentation_snapshot(statement_docs=state.get("statement_docs"))
+                    built = build_sec_presentation_snapshot(statement_docs=state.get("statement_docs"))
+                    if (built or {}).get("statements"):
+                        sec_pres = built
                 except Exception:
                     sec_pres = None
             return {**state, "status": "extracted", "sec_presentation": sec_pres}
@@ -82,15 +84,34 @@ def make_xbrl_extract_node(
                     html_text = None
 
             if html_text:
-                from core.extractors.sec_presentation_extractor import parse_rendered_sec_html_tables
-                html_tables = parse_rendered_sec_html_tables(html_text)
-                if html_tables:
-                    logger.info(
-                        "xbrl_extract_node: no XBRL found for %s; recovered %d statement(s) from rendered SEC HTML",
-                        accession_number,
-                        len(html_tables),
+                try:
+                    from filings_agent.nodes.html_extract_agent import extract_statements_from_html_agent
+                    agent_tables = extract_statements_from_html_agent(
+                        html_text=html_text,
+                        accession_number=str(accession_number or ""),
+                        ticker=str(state.get("ticker") or ""),
+                        reporting_period=extracted.get("reporting_period"),
                     )
-                    statements = html_tables
+                    if agent_tables:
+                        logger.info(
+                            "xbrl_extract_node: no XBRL found for %s; agent extracted %d statement(s) from HTML",
+                            accession_number,
+                            len(agent_tables),
+                        )
+                        statements = agent_tables
+                except Exception as exc:
+                    logger.warning("xbrl_extract_node: HTML extraction agent failed (%s); falling back to parser", exc)
+
+                if not statements:
+                    from core.extractors.sec_presentation_extractor import parse_rendered_sec_html_tables
+                    html_tables = parse_rendered_sec_html_tables(html_text)
+                    if html_tables:
+                        logger.info(
+                            "xbrl_extract_node: no XBRL found for %s; recovered %d statement(s) from rendered SEC HTML",
+                            accession_number,
+                            len(html_tables),
+                        )
+                        statements = html_tables
 
         if not statements:
             logger.warning(

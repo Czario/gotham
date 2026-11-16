@@ -33,7 +33,7 @@ def make_validate_node(report_store: Optional[Any] = None) -> Callable[[dict], d
             form_type=str(state.get("form_type") or ""),
             accession_number=state.get("accession_number"),
             sec_presentation=state.get("sec_presentation"),
-            include_cross_statement=True,
+            include_cross_statement=bool((state.get("sec_presentation") or {}).get("statements")),
         )
 
         # ``needs_decision`` is state-only metadata for the next graph route;

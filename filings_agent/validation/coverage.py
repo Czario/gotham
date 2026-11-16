@@ -13,11 +13,25 @@ MANDATORY_CONCEPTS = {
     "income": {
         "tags": {
             "Revenues",
+            "Revenue",
             "SalesRevenueNet",
             "SalesRevenueGoodsNet",
+            "SalesRevenueServicesNet",
             "RevenueFromContractWithCustomer",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "RevenueFromSaleOfGoods",
             "OperatingIncomeLoss",
+            "IncomeLossFromOperations",
         },
+        # Open semantic keywords (concept local name or label) so any new
+        # US-GAAP, IFRS, bank/insurer, or custom tag is accepted and passed
+        # to the ADK Hierarchy Agent instead of being blocked.
+        "keywords": (
+            "revenue", "sales", "turnover", "operatingincome", "operating income",
+            "operating profit", "netincome", "net income", "profitloss",
+            "interestincome", "interest income", "feeincome", "premium",
+        ),
         "description": "Revenue or Operating Income",
     },
     "balance": {
@@ -27,6 +41,7 @@ MANDATORY_CONCEPTS = {
             "StockholdersEquity",
             "LiabilitiesAndStockholdersEquity",
         },
+        "keywords": ("asset", "liabilit", "equity"),
         "description": "Assets or Liabilities",
     },
     "cash_flow": {
@@ -35,6 +50,7 @@ MANDATORY_CONCEPTS = {
             "NetCashProvidedByUsedInInvestingActivities",
             "NetCashProvidedByUsedInFinancingActivities",
         },
+        "keywords": ("operating", "investing", "financing", "cashflow", "cash flow"),
         "description": "Operating Cash Flow",
     },
 }
@@ -57,15 +73,26 @@ def check_coverage(bundle: Any) -> list[Finding]:
     if not rules:
         return []
 
+    raw_concepts = getattr(bundle, "concepts", None) or []
+    if not raw_concepts:
+        return []
+
     concepts_present = set()
-    for item in getattr(bundle, "concepts", None) or []:
+    searchable_text: list[str] = []
+    for item in raw_concepts:
         if isinstance(item, dict) and item.get("value") is not None:
             c = item.get("concept") or ""
             local_name = c.split(":")[-1]
             concepts_present.add(local_name)
+            searchable_text.append(local_name.lower())
+            if item.get("label"):
+                searchable_text.append(str(item["label"]).lower())
 
-    # Check if at least one mandatory tag is present
-    matched = rules["tags"] & concepts_present
+    # Check exact tags first, then open semantic keyword match on concept/label
+    matched = bool(rules["tags"] & concepts_present)
+    if not matched:
+        keywords = rules.get("keywords") or ()
+        matched = any(kw in txt for txt in searchable_text for kw in keywords)
     if not matched:
         return [
             Finding(

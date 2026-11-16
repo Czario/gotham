@@ -422,6 +422,14 @@ class FinancialNormalizationService:
             for _fact in _item.get('dimensional_facts') or []:
                 clean_labels_in_item(_fact)
 
+        try:
+            from core.processors.derived_concepts import enrich_statement_with_calculated_concepts
+            statement.financial_data = enrich_statement_with_calculated_concepts(
+                statement.financial_data, statement.statement_type
+            )
+        except Exception as _exc:
+            logger.debug("Derived concept enrichment skipped: %s", _exc)
+
         # PHASE 1 (pure): dimensional concepts + their source facts
         all_dimensional_concepts, dimension_data_map = self._extract_all_dimensional_concepts(
             statement.financial_data
@@ -771,6 +779,7 @@ class FinancialNormalizationService:
                         assigned_path=dim.get('path'),
                         assigned_order_key=dim.get('order_key'),
                         parent_header=dim.get('parent_header'),  # NEW: grouping header awareness
+                        alias_target=dim.get('_concept_target'),
                     )
                     dimensional_concept_mapping[(dim['parent_concept'], dim['concept'])] = dim_concept_id
                     if dim.get('container_concept'):
@@ -796,7 +805,7 @@ class FinancialNormalizationService:
                             filing=filing,
                             item=item,
                             value=value,
-                            is_calculated=False,
+                            is_calculated=bool(item.get('calculated', False)),
                             replace_existing=replace_existing,
                         )
                     except Exception as exc:  # noqa: BLE001 — skip the value, keep the row
@@ -1290,6 +1299,13 @@ class FinancialNormalizationService:
         loser = concept_repo.find_existing(
             cik, statement_type, from_concept, dimension_concept=False
         )
+        is_dim_promo = False
+        if not loser:
+            loser = concept_repo.find_existing(
+                cik, statement_type, from_concept, dimension_concept=True
+            )
+            if loser:
+                is_dim_promo = True
         if not loser:
             # Already promoted (or never existed): make sure the old tag still
             # resolves to the winner, then stop.  Idempotent retry path.
@@ -1300,7 +1316,7 @@ class FinancialNormalizationService:
             return receipt
 
         winner = concept_repo.find_existing(
-            cik, statement_type, to_concept, dimension_concept=False
+            cik, statement_type, to_concept, dimension_concept=is_dim_promo
         )
         winner_created = False
         if not winner:
@@ -1615,6 +1631,7 @@ class FinancialNormalizationService:
             path=item.get('path'),  # Preserve hierarchy path for correct placement
             order_key=item.get('order_key'),  # Preserve order for correct hierarchy position
             abstract=is_abstract,  # True for custom: grouping headers, False for all others
+            calculated=bool(item.get('calculated', False)),
             dimension=item.get('dimension', False),
             parent_concept=item.get('parent_concept'),
             parent_path=item.get('parent_path'),
@@ -2593,6 +2610,7 @@ class FinancialNormalizationService:
         assigned_path: Optional[str] = None,
         assigned_order_key: Optional[str] = None,
         parent_header: Optional[str] = None,
+        alias_target: Optional[str] = None,
     ) -> ObjectId:
         """
         Get existing dimensional concept or create new one using the appropriate repository based on form type.
@@ -2630,12 +2648,30 @@ class FinancialNormalizationService:
             dimension_data.get('dimensions'), dimension_data.get('dimension_details')
         )
         incoming_label = dimension_data.get('label')
-        existing = concept_repo.find_dimensional_existing(
-            company_cik, statement_type, segment_type, concept, concept_id,
-            dimension_signature=_signature,
-            parent_header=parent_header,
-            label=incoming_label,
-        )
+        existing = None
+        if alias_target:
+            alias_q: Dict[str, Any] = {
+                'cik': company_cik,
+                'statement_type': statement_type,
+                'dimension_concept': True,
+                '$or': [{'concept': alias_target}, {'aliases': alias_target}],
+            }
+            if concept_id:
+                alias_q['concept_id'] = concept_id
+            if parent_header:
+                alias_q['parent_header'] = parent_header
+            existing = concept_repo.collection.find_one(alias_q)
+            if not existing and concept_id:
+                alias_q.pop('parent_header', None)
+                existing = concept_repo.collection.find_one(alias_q)
+
+        if not existing:
+            existing = concept_repo.find_dimensional_existing(
+                company_cik, statement_type, segment_type, concept, concept_id,
+                dimension_signature=_signature,
+                parent_header=parent_header,
+                label=incoming_label,
+            )
         parent_concept_name = dimension_data.get('concept_name')
         semantic_candidates = []
         candidate_finder = getattr(
@@ -2701,18 +2737,29 @@ class FinancialNormalizationService:
                 logger.debug(f"Dimensional concept {concept} found with different segment_type: "
                            f"existing={existing.get('segment_type')}, determined={segment_type}. Using existing.")
             updates = {}
+            is_stored_winner_alias = bool(
+                alias_target
+                or concept in (existing.get('aliases') or [])
+            )
             if existing.get('concept') != concept:
-                updates['concept'] = concept
-                old_concept = existing.get('concept')
-                if old_concept:
+                if is_stored_winner_alias:
+                    # Stored concept is the newer surviving tag; record incoming older tag in aliases
                     concept_repo.collection.update_one(
                         {'_id': dimensional_concept_id},
-                        {'$addToSet': {'aliases': old_concept}}
+                        {'$addToSet': {'aliases': concept}}
                     )
-            # Update label when merging / reusing
+                else:
+                    updates['concept'] = concept
+                    old_concept = existing.get('concept')
+                    if old_concept:
+                        concept_repo.collection.update_one(
+                            {'_id': dimensional_concept_id},
+                            {'$addToSet': {'aliases': old_concept}}
+                        )
+            # Update label when merging / reusing (keep stored winner's label if incoming is older alias)
             cleaned_incoming_label = clean_label(dimension_data.get('label'))
             cleaned_existing_label = clean_label(existing.get('label'))
-            if cleaned_incoming_label and cleaned_incoming_label != existing.get('label'):
+            if not is_stored_winner_alias and cleaned_incoming_label and cleaned_incoming_label != existing.get('label'):
                 updates['label'] = cleaned_incoming_label
             elif cleaned_existing_label and cleaned_existing_label != existing.get('label'):
                 updates['label'] = cleaned_existing_label

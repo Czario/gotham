@@ -131,11 +131,15 @@ class SignConventionHandler:
         if value is None or value == 0:
             return value
 
-        # 0. Exact human-visible HTML statement table sign takes highest priority when available
+        # Single truth for sign:
+        # 1. Exact human-visible SEC HTML statement table sign (-1 for "(1,234)", +1 for "1,234")
         if html_display_sign in (-1, 1):
             return float(html_display_sign) * abs(float(value))
 
+        # 2. XBRL presentation linkbase negatedLabel role
         is_negated_role = bool(preferred_label_role and "negated" in str(preferred_label_role).lower())
+        if is_negated_role:
+            return -float(value)
         
         # Determine statement type for context
         statement_type_lower = statement_type.lower() if statement_type else ''

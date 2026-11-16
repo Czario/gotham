@@ -162,6 +162,120 @@ def _latest_period(values: Any) -> tuple[Optional[tuple[int, int, int]], Optiona
     return latest_rank, latest_label
 
 
+def build_parent_specific_segmentation_header(
+    parent_concept: Optional[str],
+    parent_label: Optional[str] = None,
+    segment_type_or_header: Optional[str] = None,
+) -> tuple[str, str]:
+    """Build a parent-specific ``(custom_concept, human_label)`` for a segmentation header.
+
+    Every parent line item (e.g. Revenue / Net Sales, Cost of Products Sold / Cost of Revenue,
+    SG&A, R&D, Goodwill, Stock-based compensation) receives a distinct ``custom:`` concept name
+    and a distinct human-readable label that starts with the parent's label so it is immediately
+    clear in the UI which line item is being segmented.
+    """
+    p_local = str(parent_concept or "").split(":")[-1]
+    p_low = p_local.lower()
+
+    if any(k in p_low for k in ("revenue", "salesrevenue", "revenues")):
+        p_prefix = "Revenue"
+    elif any(k in p_low for k in ("costofgoodsandservicessold", "costofrevenue", "costofgoods", "costofsales")):
+        p_prefix = "CostOfRevenue"
+    elif "sellinggeneralandadministrative" in p_low:
+        p_prefix = "SGA"
+    elif "researchanddevelopment" in p_low:
+        p_prefix = "RD"
+    elif "operatingexpenses" in p_low:
+        p_prefix = "OperatingExpenses"
+    elif "operatingincomeloss" in p_low:
+        p_prefix = "OperatingIncome"
+    elif "sharebasedcompensation" in p_low:
+        p_prefix = "ShareBasedCompensation"
+    elif "incomelossfromequitymethodinvestments" in p_low or "equitymethod" in p_low:
+        p_prefix = "EquityMethod"
+    elif "noncontrollinginterest" in p_low:
+        p_prefix = "NoncontrollingInterest"
+    elif "depreciation" in p_low:
+        p_prefix = "Depreciation"
+    elif "goodwill" in p_low:
+        p_prefix = "Goodwill"
+    elif "intangible" in p_low:
+        p_prefix = "IntangibleAssets"
+    elif "propertyplantandequipment" in p_low:
+        p_prefix = "PPE"
+    elif "inventory" in p_low:
+        p_prefix = "Inventory"
+    elif "accountsreceivable" in p_low:
+        p_prefix = "AccountsReceivable"
+    elif "cashandcashequivalents" in p_low:
+        p_prefix = "Cash"
+    elif "debt" in p_low:
+        p_prefix = "Debt"
+    elif p_local:
+        words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+", p_local)
+        p_prefix = "".join(w.capitalize() for w in words[:3]) or "LineItem"
+    else:
+        p_prefix = "LineItem"
+
+    raw_seg = str(segment_type_or_header or "").split(":")[-1].strip()
+    seg_low = raw_seg.lower()
+    if any(k in seg_low for k in ("prod", "serv")):
+        seg_tag = "ProductSegmentation"
+        seg_lbl = "Product Segmentation"
+    elif any(k in seg_low for k in ("geo", "country", "region")):
+        seg_tag = "GeographicSegmentation"
+        seg_lbl = "Geographic Segmentation"
+    elif "awardtype" in seg_low or "award_type" in seg_low:
+        seg_tag = "AwardTypeSegmentation"
+        seg_lbl = "Award Type Segmentation"
+    elif "incomestatementlocation" in seg_low:
+        seg_tag = "IncomeStatementLocationSegmentation"
+        seg_lbl = "Income Statement Location Segmentation"
+    elif "investment" in seg_low or "cash_securities" in seg_low:
+        seg_tag = "InvestmentSegmentation"
+        seg_lbl = "Investment Segmentation"
+    elif "fair_value" in seg_low or "fairvalue" in seg_low:
+        seg_tag = "FairValueSegmentation"
+        seg_lbl = "Fair Value Segmentation"
+    elif "derivative" in seg_low:
+        seg_tag = "DerivativeSegmentation"
+        seg_lbl = "Derivative Segmentation"
+    elif "relatedparty" in seg_low or "related_party" in seg_low:
+        seg_tag = "RelatedPartySegmentation"
+        seg_lbl = "Related Party Segmentation"
+    elif any(k in seg_low for k in ("seg", "bus", "oper", "consolidat")):
+        seg_tag = "SegmentSegmentation"
+        seg_lbl = "Segment Segmentation"
+    elif raw_seg:
+        words = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z][a-z]|\d|\W|$)|\d+", raw_seg)
+        filtered = [w for w in words if w.lower() not in ("custom", "segmentation", "segments", "breakdown")]
+        if filtered:
+            seg_tag = "".join(w.capitalize() for w in filtered) + "Segmentation"
+            seg_lbl = " ".join(w.capitalize() for w in filtered) + " Segmentation"
+        else:
+            seg_tag = "SegmentSegmentation"
+            seg_lbl = "Segment Segmentation"
+    else:
+        seg_tag = "SegmentSegmentation"
+        seg_lbl = "Segment Segmentation"
+
+    if seg_tag.lower().startswith(p_prefix.lower()):
+        custom_concept = f"custom:{seg_tag}"
+    else:
+        custom_concept = f"custom:{p_prefix}{seg_tag}"
+
+    clean_parent_lbl = (parent_label or "").strip().rstrip(":")
+    if not clean_parent_lbl:
+        clean_parent_lbl = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", p_prefix).strip()
+
+    if clean_parent_lbl.lower() in seg_lbl.lower():
+        human_label = seg_lbl
+    else:
+        human_label = f"{clean_parent_lbl} {seg_lbl}"
+
+    return custom_concept, human_label
+
+
 def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str],
                  occupied_paths: Optional[set] = None,
                  identity_paths: Optional[dict] = None,
@@ -252,11 +366,30 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
             deduped_rows.append(r)
     norm_rows = deduped_rows
 
-    # Map headers to their parents so members know their line item parent
+    # Map headers to their parents so members know their line item parent,
+    # and ensure every custom: segmentation header has a parent-specific label.
+    parent_label_by_concept: dict[str, str] = {
+        str(r["concept"]): str(r["label"]).strip()
+        for r in norm_rows
+        if r.get("concept") and r.get("label") and not str(r.get("concept")).startswith("custom:")
+    }
     header_parents: dict[str, str] = {}
     for r in norm_rows:
         if str(r.get("concept", "")).startswith("custom:") and r.get("parent"):
-            header_parents[str(r["concept"])] = str(r["parent"])
+            p_c = str(r["parent"])
+            header_parents[str(r["concept"])] = p_c
+            p_lbl = parent_label_by_concept.get(p_c)
+            if p_lbl:
+                curr_lbl = str(r.get("label") or "").strip()
+                # If label is missing or generic (doesn't mention the parent label/topic),
+                # build a parent-qualified label so Revenue vs Cost vs SG&A headers are distinct.
+                p_tokens = _concept_tokens(p_c, p_lbl)
+                lbl_tokens = _concept_tokens("", curr_lbl) if curr_lbl else set()
+                if not curr_lbl or not (p_tokens & lbl_tokens):
+                    _, qualified_lbl = build_parent_specific_segmentation_header(
+                        p_c, p_lbl, str(r["concept"])
+                    )
+                    r["label"] = qualified_lbl
 
     for d in norm_dims:
         p = d.get("parent")
@@ -810,6 +943,7 @@ def _filing_rows_for(bundle: Any, sec_presentation: Optional[dict] = None) -> li
                 "concept": item["concept"],
                 "label": item.get("label") or sec_node.get("label"),
                 "abstract": bool(item.get("abstract")),
+                "calculated": bool(item.get("calculated")),
                 "value": item.get("value"),
                 "path": item.get("path"),            # filing reference only
                 "order_key": item.get("order_key"),
@@ -829,13 +963,17 @@ def _filing_rows_for(bundle: Any, sec_presentation: Optional[dict] = None) -> li
     rows.sort(key=lambda r: int(r.get("reading_order") or 999999))
     for dim in getattr(bundle, "dimensional_concepts", None) or []:
         if isinstance(dim, dict) and dim.get("concept"):
-            rows.append({
+            dim_row = {
                 "concept": dim["concept"],
                 "label": dim.get("label"),
                 "parent_concept": dim.get("parent_concept"),
                 "segment_type": dim.get("segment_type"),
                 "dimension_concept": True,
-            })
+            }
+            dim_period = _latest_period([fallback_period])
+            if dim_period[0] is not None:
+                dim_row["_latest_period_rank"], dim_row["latest_period"] = dim_period
+            rows.append(dim_row)
     return rows
 
 
@@ -857,6 +995,36 @@ def _concept_tokens(concept: Optional[str], label: Optional[str] = None) -> set[
         p.lower() for p in parts
         if len(p) > 2 and p.lower() not in _CONCEPT_STOP_TOKENS
     }
+
+
+def _canonical_header_for_segment_type(segment_type: Optional[str]) -> Optional[str]:
+    """Deterministically map any XBRL axis / segment_type to a canonical custom grouping header."""
+    seg_low = (segment_type or "").strip().lower()
+    if not seg_low or seg_low in ("unknown", "dimensional"):
+        return None
+    if any(k in seg_low for k in ("prod", "serv")):
+        return "custom:ProductSegmentation"
+    if any(k in seg_low for k in ("geo", "country", "region")):
+        return "custom:GeographicSegmentation"
+    if any(k in seg_low for k in ("seg", "bus", "oper", "consolidat")):
+        return "custom:BusinessSegments"
+    if "awardtype" in seg_low or "award_type" in seg_low:
+        return "custom:AwardTypeSegmentation"
+    if "incomestatementlocation" in seg_low:
+        return "custom:IncomeStatementLocationSegmentation"
+    if "investment" in seg_low or "cash_securities" in seg_low:
+        return "custom:InvestmentSegmentation"
+    if "fair_value" in seg_low or "fairvalue" in seg_low:
+        return "custom:FairValueSegmentation"
+    if "derivative" in seg_low:
+        return "custom:DerivativeSegmentation"
+    words = re.findall(r"[A-Za-z0-9]+", seg_low)
+    if words:
+        pascal = "".join(w.capitalize() for w in words)
+        if not pascal.endswith("Segmentation") and not pascal.endswith("Segments"):
+            pascal += "Segmentation"
+        return f"custom:{pascal}"
+    return None
 
 
 def _infer_dim_parent_header(
@@ -890,21 +1058,9 @@ def _infer_dim_parent_header(
             h_low = h.lower()
             if seg_low in h_low or (seg_tokens and (seg_tokens & _concept_tokens(h))):
                 return h
-        if any(k in seg_low for k in ("prod", "serv")):
-            for h in parent_headers:
-                if "prod" in h.lower() or "serv" in h.lower():
-                    return h
-            return "custom:ProductSegmentation"
-        if any(k in seg_low for k in ("geo", "country", "region")):
-            for h in parent_headers:
-                if "geo" in h.lower() or "region" in h.lower() or "country" in h.lower():
-                    return h
-            return "custom:GeographicSegmentation"
-        if any(k in seg_low for k in ("seg", "bus", "oper")):
-            for h in parent_headers:
-                if "seg" in h.lower() or "bus" in h.lower():
-                    return h
-            return "custom:BusinessSegments"
+        canon_h = _canonical_header_for_segment_type(segment_type)
+        if canon_h:
+            return canon_h
 
     if len(parent_headers) == 1:
         return parent_headers[0]
@@ -915,19 +1071,129 @@ def _infer_dim_parent_header(
     return None
 
 
+def _try_programmatic_fresh_seed_hierarchy(
+    filing_rows: list[dict],
+    tools_by_name: dict[str, Any],
+    proposal: dict,
+) -> bool:
+    """Deterministically build the fresh-seed hierarchy directly from SEC _cal.xml + _pre.xml + HTML table.
+
+    Executes in 0.00s with 0 LLM calls. Passes all rows and dimensional breakdowns through
+    ``propose_hierarchy`` (which runs ``_sanitize_proposed_rows`` and ``_materialize``) and
+    verifies zero path collisions.
+    """
+    if not filing_rows or "propose_hierarchy" not in tools_by_name:
+        return False
+
+    import json as _json
+
+    main_rows = [
+        r for r in filing_rows
+        if not r.get("dimension_concept") and r.get("concept")
+    ]
+    dim_rows = [
+        r for r in filing_rows
+        if r.get("dimension_concept") and r.get("concept")
+    ]
+    if not main_rows:
+        return False
+
+    main_names = {str(r["concept"]) for r in main_rows}
+    sibling_counters: dict[Optional[str], int] = defaultdict(int)
+    auto_rows: list[dict[str, Any]] = []
+
+    for r in main_rows:
+        c_name = str(r["concept"])
+        raw_p = r.get("parent_concept") or r.get("calc_parent_concept")
+        parent: Optional[str] = str(raw_p) if (raw_p and str(raw_p) in main_names and str(raw_p) != c_name) else None
+        sibling_counters[parent] += 1
+        auto_rows.append({
+            "concept": c_name,
+            "parent": parent,
+            "abstract": bool(r.get("abstract")),
+            "label": r.get("label"),
+            "order": sibling_counters[parent],
+        })
+
+    dim_counters: dict[tuple[str, Optional[str]], int] = defaultdict(int)
+    auto_dims: list[dict[str, Any]] = []
+    for d in dim_rows:
+        c_name = str(d["concept"])
+        pc = d.get("parent_concept")
+        if not pc or str(pc) not in main_names:
+            return False
+        pc_str = str(pc)
+        ph = _canonical_header_for_segment_type(d.get("segment_type"))
+        dim_counters[(pc_str, ph)] += 1
+        dim_entry: dict[str, Any] = {
+            "concept": c_name,
+            "parent_concept": pc_str,
+            "order": dim_counters[(pc_str, ph)],
+        }
+        if ph:
+            dim_entry["parent_header"] = ph
+        if d.get("segment_type"):
+            dim_entry["segment_type"] = d["segment_type"]
+        if d.get("label"):
+            dim_entry["label"] = d["label"]
+        auto_dims.append(dim_entry)
+
+    try:
+        prop_res = tools_by_name["propose_hierarchy"].invoke({
+            "rows_json": _json.dumps(auto_rows),
+            "dims_json": _json.dumps(auto_dims),
+        })
+        if not isinstance(prop_res, str) or not prop_res.startswith("OK"):
+            proposal.clear()
+            proposal.update({"merges": {}, "rows": [], "dims": []})
+            return False
+        preview = proposal.get("_preview") or {}
+        p_rows = preview.get("rows") or []
+        p_dims = preview.get("dims") or []
+        if not p_rows:
+            proposal.clear()
+            proposal.update({"merges": {}, "rows": [], "dims": []})
+            return False
+
+        path_counts: dict[str, int] = defaultdict(int)
+        for item in list(p_rows) + list(p_dims):
+            p = str(item.get("path") or "")
+            if p and p != "555":
+                path_counts[p] += 1
+        if any(cnt > 1 for cnt in path_counts.values()):
+            proposal.clear()
+            proposal.update({"merges": {}, "rows": [], "dims": []})
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("programmatic fresh seed hierarchy failed: %s", exc)
+
+    proposal.clear()
+    proposal.update({"merges": {}, "rows": [], "dims": []})
+    return False
+
+
+def _norm_label_for_alias(lbl: Optional[str]) -> str:
+    if not lbl:
+        return ""
+    return re.sub(r"[^a-z0-9]+", " ", str(lbl).lower()).strip()
+
+
 def _try_programmatic_incremental_hierarchy(
     stored: list[dict],
     filing_rows: list[dict],
     new_concepts: set[str],
     tools_by_name: dict[str, Any],
     proposal: dict,
+    *,
+    allow_extended_deterministic: bool = False,
 ) -> bool:
     """Attempt deterministic incremental hierarchy placement without calling the LLM.
 
-    Returns ``True`` only when all new concepts (dimensional members and/or
-    unambiguous child line items with known stored parents and no alias/rename
-    candidates) are placed and pass ``check_hierarchy`` with zero warnings.
-    Otherwise resets ``proposal`` and returns ``False`` so the LLM agent takes over.
+    Returns ``True`` only when all new concepts (dimensional members, deterministic
+    canonical/label aliases, and unambiguous line items) are placed cleanly with
+    zero path collisions. Otherwise resets ``proposal`` and returns ``False`` so
+    the ADK Hierarchy Agent LLM takes over.
     """
     if not stored or not new_concepts:
         return False
@@ -935,6 +1201,10 @@ def _try_programmatic_incremental_hierarchy(
         return False
 
     import json as _json
+    try:
+        from data_normalization_service.utils.concept_aliases import canonical_concept as _canon_concept
+    except Exception:
+        _canon_concept = lambda x: x  # noqa: E731
 
     stored_main = {
         str(s["concept"]): s
@@ -957,45 +1227,109 @@ def _try_programmatic_incremental_hierarchy(
         if r.get("dimension_concept") and r.get("concept") in new_concepts
     ]
 
-    # 1. Validate new main concepts (if any): must have known stored parent and no alias candidate
+    # 1. Validate new main concepts (if any): check deterministic alias match first, then placement
     stored_absent = [
         s for c, s in stored_main.items()
         if c not in filing_main_names and not s.get("abstract")
     ]
     auto_rows: list[dict] = []
-    sibling_counters: dict[str, int] = defaultdict(int)
+    alias_map: dict[str, str] = {}
+    sibling_counters: dict[Optional[str], int] = defaultdict(int)
     for s in stored:
-        if not s.get("dimension_concept") and s.get("parent_concept"):
-            sibling_counters[str(s["parent_concept"])] += 1
+        if not s.get("dimension_concept"):
+            p_key = str(s["parent_concept"]) if s.get("parent_concept") else None
+            sibling_counters[p_key] += 1
+
+    known_main_parents = set(stored_main.keys())
+    if allow_extended_deterministic:
+        known_main_parents |= {str(r["concept"]) for r in new_main if r.get("concept")}
 
     for r in new_main:
         concept = str(r["concept"])
-        parent = r.get("parent_concept")
-        # Require a known stored parent (never guess root-level placement or missing parents)
-        if not parent or str(parent) not in stored_main:
-            return False
-        parent_str = str(parent)
-        # Check for potential alias/rename against absent stored concepts
+        raw_parent = r.get("parent_concept")
+        parent = alias_map.get(str(raw_parent), str(raw_parent)) if raw_parent else None
+
+        # 1a. Deterministic alias resolution (canonical_concept or exact label match under same parent)
+        if allow_extended_deterministic and "decide_mapping" in tools_by_name:
+            r_canon = _canon_concept(concept)
+            r_lbl = _norm_label_for_alias(r.get("label"))
+            matched_abs = None
+            for abs_row in stored_absent:
+                abs_c = str(abs_row.get("concept") or "")
+                abs_p = str(abs_row.get("parent_concept")) if abs_row.get("parent_concept") else None
+                if abs_p != parent:
+                    continue
+                abs_canon = _canon_concept(abs_c)
+                abs_lbl = _norm_label_for_alias(abs_row.get("label"))
+                is_canon_match = bool(r_canon and r_canon == abs_canon and (r_canon != concept or abs_canon != abs_c))
+                is_exact_label_match = bool(len(r_lbl) >= 4 and r_lbl == abs_lbl)
+                if is_canon_match or is_exact_label_match:
+                    matched_abs = abs_row
+                    break
+            if matched_abs is not None:
+                target_c = str(matched_abs["concept"])
+                map_res = tools_by_name["decide_mapping"].invoke({
+                    "concept_json": _json.dumps({
+                        "concept": concept,
+                        "same_as": target_c,
+                        "reason": "deterministic SEC table alias match",
+                    })
+                })
+                if isinstance(map_res, str) and map_res.startswith("OK"):
+                    stored_absent = [a for a in stored_absent if a.get("concept") != target_c]
+                    alias_map[concept] = target_c
+                    known_main_parents.add(concept)
+                    continue
+
+        # 1b. Require a known stored parent unless allow_extended_deterministic permits root placement
+        if parent is not None:
+            if parent not in known_main_parents:
+                proposal.clear()
+                proposal.update({"merges": {}, "rows": [], "dims": []})
+                return False
+        else:
+            if not allow_extended_deterministic:
+                proposal.clear()
+                proposal.update({"merges": {}, "rows": [], "dims": []})
+                return False
+
+        # 1c. Check for ambiguous alias/rename against remaining absent stored concepts
         r_tokens = _concept_tokens(concept, r.get("label"))
         for abs_row in stored_absent:
             abs_tokens = _concept_tokens(abs_row.get("concept"), abs_row.get("label"))
             overlap = r_tokens & abs_tokens
-            if abs_row.get("parent_concept") == parent_str and overlap:
+            abs_p = str(abs_row.get("parent_concept")) if abs_row.get("parent_concept") else None
+            if abs_p == parent and overlap:
+                proposal.clear()
+                proposal.update({"merges": {}, "rows": [], "dims": []})
                 return False
             if len(overlap) >= 2:
+                proposal.clear()
+                proposal.update({"merges": {}, "rows": [], "dims": []})
                 return False
 
-        sibling_counters[parent_str] += 1
+        sibling_counters[parent] += 1
         auto_rows.append({
             "concept": concept,
-            "parent": parent_str,
+            "parent": parent,
             "abstract": bool(r.get("abstract")),
             "label": r.get("label"),
-            "order": sibling_counters[parent_str],
+            "order": sibling_counters[parent],
         })
 
     # 2. Validate and build new dimensional members
-    known_parents = set(stored_main.keys()) | {r["concept"] for r in auto_rows}
+    known_parents = set(stored_main.keys()) | {r["concept"] for r in auto_rows} | set(alias_map.keys())
+    filing_dim_pairs = {
+        (str(r.get("parent_concept") or ""), str(r["concept"]))
+        for r in filing_rows
+        if r.get("dimension_concept") and r.get("concept")
+    }
+    stored_absent_dims = [
+        s for s in stored
+        if s.get("dimension_concept")
+        and s.get("concept")
+        and (str(s.get("parent_concept") or ""), str(s["concept"])) not in filing_dim_pairs
+    ]
     dim_counters: dict[tuple[str, Optional[str]], int] = defaultdict(int)
     for s in stored:
         if s.get("dimension_concept") and s.get("parent_concept"):
@@ -1004,10 +1338,24 @@ def _try_programmatic_incremental_hierarchy(
     auto_dims: list[dict] = []
     for d in new_dims:
         concept = str(d["concept"])
-        pc = d.get("parent_concept")
-        if not pc or str(pc) not in known_parents:
+        raw_pc = d.get("parent_concept")
+        if not raw_pc or str(raw_pc) not in known_parents:
+            proposal.clear()
+            proposal.update({"merges": {}, "rows": [], "dims": []})
             return False
-        pc_str = str(pc)
+        pc_str = alias_map.get(str(raw_pc), str(raw_pc))
+
+        # Check for potential dimensional alias/rename against absent stored dims under the same parent
+        d_tokens = _concept_tokens(concept, d.get("label"))
+        for abs_dim in stored_absent_dims:
+            if str(abs_dim.get("parent_concept") or "") != pc_str:
+                continue
+            abs_tokens = _concept_tokens(abs_dim.get("concept"), abs_dim.get("label"))
+            if d_tokens & abs_tokens:
+                proposal.clear()
+                proposal.update({"merges": {}, "rows": [], "dims": []})
+                return False
+
         ph = _infer_dim_parent_header(pc_str, d.get("segment_type"), stored)
         dim_counters[(pc_str, ph)] += 1
         dim_entry: dict[str, Any] = {
@@ -1131,65 +1479,6 @@ def _repair_corrupted_stored_hierarchy_if_needed(
         except Exception:
             pass
 
-    # 2. Check if stored main rows violate accounting parent invariants
-    from ..tools.hierarchy_tools import _sanitize_proposed_rows
-
-    main_rows = [
-        r for r in stored
-        if not r.get("dimension_concept")
-        and r.get("concept")
-        and str(r.get("concept")) not in _POLLUTED_EQUITY_ROLLFORWARD_CONCEPTS
-    ]
-    if not main_rows:
-        return modified_db
-
-    # Sort by current path/order_key to preserve top-down document order
-    main_rows.sort(key=lambda r: (str(r.get("path") or ""), str(r.get("order_key") or "")))
-    probe_rows = [
-        {
-            "_id": r.get("_id"),
-            "concept": r["concept"],
-            "label": r.get("label"),
-            "parent": r.get("parent_concept") or r.get("parent"),
-            "order": idx + 1,
-            "abstract": bool(r.get("abstract", False)),
-            "_is_stored": False,
-        }
-        for idx, r in enumerate(main_rows)
-    ]
-    orig_parents = {r["concept"]: r["parent"] for r in probe_rows}
-    sanitized = _sanitize_proposed_rows(probe_rows, stmt_type)
-    new_parents = {r["concept"]: (r.get("parent") or r.get("parent_concept")) for r in sanitized}
-
-    if new_parents != orig_parents and hasattr(coll, "update_one"):
-        try:
-            mat_rows, _ = _materialize(sanitized, [], {})
-            for mr in mat_rows:
-                c_name = mr.get("concept")
-                new_p = mr.get("path")
-                new_ok = mr.get("order_key")
-                new_parent = mr.get("parent")
-                new_lvl = mr.get("level", 0)
-                if c_name and new_p and new_ok:
-                    coll.update_one(
-                        {"cik": cik, "statement_type": stmt_type, "concept": c_name, "dimension_concept": {"$ne": True}},
-                        {
-                            "$set": {
-                                "path": new_p,
-                                "order_key": new_ok,
-                                "parent_concept": new_parent,
-                                "level": new_lvl,
-                                "hierarchy_level": new_lvl,
-                            }
-                        },
-                    )
-            report_call(
-                f"  [hierarchy]  ⟳ self-healed stored {stmt_type} hierarchy in DB ({len(mat_rows)} row(s) re-aligned)"
-            )
-            modified_db = True
-        except Exception as exc:
-            logger.warning("stored hierarchy self-heal failed for %s/%s: %s", cik, stmt_type, exc)
-
     return modified_db
 
 
@@ -1241,8 +1530,9 @@ def make_hierarchy_agent_node(
                 # No LLM and no encoding: the stored rows already carry their
                 # agent-approved path/order_key/parent, so reuse them as-is.
                 stmt_dur = time.perf_counter() - stmt_t0
-                report_call(
-                    f"  [hierarchy]  • {stmt_type}: ⚡ fast-path (0 new concepts — reusing stored hierarchy)  {stmt_dur:.2f}s"
+                logger.info(
+                    "[hierarchy] %s: fast-path (0 new concepts) %.2fs",
+                    stmt_type, stmt_dur,
                 )
                 report_detail(f"{stmt_type}: fast-path")
                 proposal["_preview"] = {
@@ -1288,33 +1578,23 @@ def make_hierarchy_agent_node(
                     materialize=_materialize,
                     sec_presentation=state.get("sec_presentation"),
                 )
+                from ..tools.html_table_tools import build_html_table_tools
+                html_tools = build_html_table_tools(
+                    html_text=state.get("html_text"),
+                    accession_number=state.get("accession_number") or getattr(bundle, "accession_number", None),
+                    ticker=state.get("ticker"),
+                )
+                tools = list(tools) + list(html_tools)
                 tools_by_name = {t.name: t for t in tools}
 
-                # Programmatic incremental fast-path: resolve unambiguous new dims /
-                # child line items without calling the LLM.
-                resolved_programmatically = (
-                    bool(stored)
-                    and _try_programmatic_incremental_hierarchy(
-                        stored, filing_rows, new_concepts, tools_by_name, proposal
-                    )
-                )
-                if resolved_programmatically:
-                    stmt_dur = time.perf_counter() - stmt_t0
-                    report_call(
-                        f"  [hierarchy]  • {stmt_type}: ⚡ programmatic incremental fast-path "
-                        f"({len(new_concepts)} new concept(s) placed cleanly)  {stmt_dur:.2f}s"
-                    )
-                    report_detail(f"{stmt_type}: programmatic incremental")
-                else:
-                    # Agent takeover: fresh seed or ambiguous incremental concepts.
+                # Always run the ADK Hierarchy Agent when there are new concepts
+                # (0-new-concept statements already took the fast-path above).
+                if True:
+                    # Agent takeover: fresh seed or incremental concepts.
                     if not stored:
-                        report_call(
-                            f"  [hierarchy]  • {stmt_type}: fresh seed (0 stored) → running hierarchy agent"
-                        )
+                        logger.info("[hierarchy] %s: fresh seed -> agent", stmt_type)
                     else:
-                        report_call(
-                            f"  [hierarchy]  • {stmt_type}: {len(new_concepts)} new concept(s) detected ({len(stored)} stored) → running hierarchy agent"
-                        )
+                        logger.info("[hierarchy] %s: +%d new (%d stored) -> agent", stmt_type, len(new_concepts), len(stored))
                     report_detail(f"{stmt_type}: running agent...")
 
                     if not stored:
@@ -1328,8 +1608,9 @@ def make_hierarchy_agent_node(
                             f"for CIK {getattr(bundle, 'company_cik', '?')} ({getattr(bundle, 'form_type', '?')}). "
                             f"No existing hierarchy is stored in DB.\n\n"
                             f"{context_dump}\n\n"
-                            f"Predict ONCE: call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint, "
-                            f"and immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
+                            f"Predict ONCE: call propose_hierarchy(rows_json, dims_json) using the universal statement blueprint "
+                            f"(you may also call list_html_tables / read_html_table to verify the SEC .htm statement table if needed), "
+                            f"and immediately call finalize_hierarchy({{\"status\": \"done\"}})."
                         )
                     else:
                         context_dump = (
@@ -1345,9 +1626,9 @@ def make_hierarchy_agent_node(
                             f"{context_dump}\n\n"
                             f"Predict ONCE:\n"
                             f"1. Check the 'High-Probability Alias Candidates' above: if any new concept is an alias/synonym of a stored concept (representing the same economic line item), call decide_mapping({{\"concept\": \"<incoming>\", \"same_as\": \"<stored>\"}});\n"
-                            f"2. For genuinely new concepts to insert, call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
-                            f"with their parent and sibling position (all stored concepts and their order keys are preserved automatically);\n"
-                            f"3. Immediately call finalize_hierarchy({{\"status\": \"done\"}}). Do NOT loop or call preview_hierarchy/check_hierarchy."
+                            f"2. For genuinely new concepts to insert, call list_html_tables / read_html_table first to verify their exact row position, parent, and sign in the SEC .htm statement table, then call propose_hierarchy(rows_json, dims_json) passing ONLY the new concept(s) "
+                            f"with their parent and exact sibling position (all stored concepts and their order keys are preserved automatically);\n"
+                            f"3. Immediately call finalize_hierarchy({{\"status\": \"done\"}})."
                         )
                     try:
                         _ = run_agent_loop(
@@ -1358,7 +1639,7 @@ def make_hierarchy_agent_node(
                             finalize_name="finalize_hierarchy",
                             finalize_description="Call when the full hierarchy is decided. Pass {\"status\": \"done\"}.",
                             chat_llm=chat_llm,
-                            max_steps=3,
+                            max_steps=5,
                             on_event=on_event,
                         )
                     except Exception as exc:  # noqa: BLE001
@@ -1593,8 +1874,9 @@ def make_hierarchy_agent_node(
             bundle._agent_updates = existing_updates
             if not (stored and not new_concepts):
                 stmt_dur = time.perf_counter() - stmt_t0
-                report_call(
-                    f"  [hierarchy]  ✓ {stmt_type} hierarchy resolved in {stmt_dur:.1f}s ({len(rows)} rows, {len(existing_updates)} re-pathed)"
+                logger.info(
+                    "[hierarchy] %s resolved in %.1fs (%d rows, %d re-pathed)",
+                    stmt_type, stmt_dur, len(rows), len(existing_updates),
                 )
                 report_detail(f"{stmt_type}: done")
 
@@ -1609,8 +1891,9 @@ def make_hierarchy_agent_node(
                 for b in bundles
             ),
         }
-        report_call(
-            f"  [hierarchy]  ✓ {reasoned_about} statement(s) processed ({total_updates} stored row update(s))"
+        logger.info(
+            "[hierarchy] %d statement(s) processed (%d stored row update(s))",
+            reasoned_about, total_updates,
         )
         return {**state, "hierarchy_plan": plan, "concept_promotions": all_promotions, "status": "hierarchy_agent_done"}
 

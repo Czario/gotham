@@ -106,7 +106,8 @@ def check_sec_presentation_diff(
             exp_sign = node.get("html_display_sign") or node.get("expected_display_sign")
             if isinstance(b_val, (int, float)) and b_val != 0 and exp_sign in (-1, 1):
                 b_sign = -1 if b_val < 0 else 1
-                if b_sign != exp_sign:
+                lbl_low = str(node.get("label") or "").strip().lower()
+                if b_sign != exp_sign and not (b_sign == -1 and exp_sign == 1 and lbl_low.startswith("less")):
                     findings.append(
                         Finding(
                             "sec_presentation_sign_mismatch",

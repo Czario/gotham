@@ -685,13 +685,17 @@ def test_reproposal_does_not_resurrect_a_removed_row():
     }
 
 
-def test_programmatic_incremental_fast_path_places_new_dims_without_llm(monkeypatch):
-    """When only new dimensional members appear under an existing stored line item,
-    hierarchy_agent_node resolves them programmatically with 0 LLM calls."""
+def test_incremental_new_dims_route_to_agent_with_html_tools(monkeypatch):
+    """When new dimensional members appear, hierarchy_agent_node routes them to the
+    ADK Hierarchy Agent with HTML table inspection tools available."""
     from filings_agent.nodes import hierarchy_agent
 
-    called = []
-    monkeypatch.setattr(hierarchy_agent, "run_agent_loop", lambda *a, **k: called.append(1))
+    seen_tools = []
+    def _fake_loop(system, task, tools, **kwargs):
+        seen_tools.extend(t.name for t in tools)
+        return {"status": "done"}
+
+    monkeypatch.setattr(hierarchy_agent, "run_agent_loop", _fake_loop)
 
     stored = [
         {"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001",
@@ -702,8 +706,6 @@ def test_programmatic_incremental_fast_path_places_new_dims_without_llm(monkeypa
         dims=[
             {"concept": "country:US", "label": "United States",
              "parent_concept": "us-gaap:Revenues", "segment_type": "geographic"},
-            {"concept": "aapl:IPhoneMember", "label": "iPhone",
-             "parent_concept": "us-gaap:Revenues", "segment_type": "product"},
         ],
     )
     node = make_hierarchy_agent_node(_Service(stored))
@@ -711,12 +713,9 @@ def test_programmatic_incremental_fast_path_places_new_dims_without_llm(monkeypa
                 "bundles": [bundle]})
 
     assert out["status"] == "hierarchy_agent_done"
-    assert called == []  # 0 LLM calls!
-    dims_by_concept = {d["concept"]: d for d in bundle.dimensional_concepts}
-    assert dims_by_concept["country:US"]["_hierarchy_resolved"] is True
-    assert dims_by_concept["country:US"]["parent_header"] == "custom:GeographicSegmentation"
-    assert dims_by_concept["aapl:IPhoneMember"]["_hierarchy_resolved"] is True
-    assert dims_by_concept["aapl:IPhoneMember"]["parent_header"] == "custom:ProductSegmentation"
+    assert "list_html_tables" in seen_tools
+    assert "read_html_table" in seen_tools
+    assert "search_html_text" in seen_tools
 
 
 def test_programmatic_incremental_fast_path_hands_over_to_llm_on_alias_candidate(monkeypatch):

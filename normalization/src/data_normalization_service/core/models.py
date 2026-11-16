@@ -36,6 +36,7 @@ class ConceptDocument:
     # Hidden rows stay in the tree (and keep their values) but consumers filter
     # them out — used to retire segment/legacy-era rows from a statement view.
     hide: bool = False
+    calculated: bool = False
     dimension: bool = False
     # New flag to indicate if this is a dimensional concept
     dimension_concept: bool = False
@@ -81,6 +82,7 @@ class ConceptDocument:
             "order_key": self.order_key,
             "abstract": self.abstract,
             "hide": self.hide,
+            "calculated": self.calculated,
             "dimension": self.dimension,
             "dimension_concept": self.dimension_concept
         }

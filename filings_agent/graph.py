@@ -1,13 +1,12 @@
-"""Google ADK workflow for the filings agent.
+"""Google ADK workflow for the filings agent (Streamlined Deterministic SEC-First Architecture).
 
 Orchestrates the filing pipeline using Google ADK's ``ADKSequentialAgent``,
 ``ADKStepAgent``, ``InMemorySessionService``, ``InMemoryArtifactService``,
 and ``InMemoryMemoryService``:
 
-    fetch_filing → xbrl_extract → normalize_bundle → targeted_text_extract →
-    historical_backfill → validate → agent_review? → repair? →
-    hierarchy_agent → validate_final → decide → persist →
-    extract_guidance → save_guidance → END
+    fetch_filing → xbrl_extract → normalize_bundle → historical_backfill →
+    hierarchy_agent → validate → (repair / agent_review if needed) →
+    decide → persist → (guidance if configured) → END
 """
 from __future__ import annotations
 
@@ -26,7 +25,6 @@ from .nodes.normalize import make_normalize_node
 from .nodes.persist import make_persist_node
 from .nodes.repair import make_repair_node
 from .nodes.review import make_review_node
-from .nodes.targeted_extract import make_targeted_extract_node
 from .nodes.validate import make_validate_node
 from .nodes.xbrl_extract import make_xbrl_extract_node
 from .state import FilingAgentState
@@ -59,13 +57,6 @@ def _route_after(next_node: str) -> Callable[[dict], str]:
     return _route
 
 
-def _route_after_save(state: dict) -> str:
-    """Run the guidance nodes only after a successful save (mirrors 8-K agent)."""
-    if state.get("status") == "saved":
-        return "extract_guidance"
-    return "__end__"
-
-
 def build_filing_graph(
     norm_service: Any,
     *,
@@ -82,7 +73,7 @@ def build_filing_graph(
     sec_client: Any = None,
     db_collections: Any = None,
 ) -> ADKGraphRunner:
-    """Build and compile the Google ADK filings-agent workflow."""
+    """Build and compile the streamlined Google ADK filings-agent workflow."""
 
     def _route_needs(state: dict) -> str:
         if state.get("status") in _SHORT_CIRCUIT:
@@ -90,6 +81,11 @@ def build_filing_graph(
         if any(bool(f.get("needs_decision")) for f in (state.get("findings") or [])):
             return "agent_review"
         return "hierarchy_agent"
+
+    def _route_after_save(state: dict) -> str:
+        if state.get("status") == "saved":
+            return "extract_guidance"
+        return "__end__"
 
     sub_agents = [
         ADKStepAgent(
@@ -111,21 +107,12 @@ def build_filing_graph(
                 "xbrl_extract_node",
                 decision_chat_llm,
             ),
-            description="XBRL extraction and SEC presentation linkbase snapshot capture.",
+            description="XBRL extraction and SEC presentation linkbase + HTML snapshot capture.",
         ),
         ADKStepAgent(
             "normalize_bundle",
             _wrap(make_normalize_node(norm_service), "normalize_bundle_node", decision_chat_llm),
             description="Normalize extracted statement documents into in-memory bundles.",
-        ),
-        ADKStepAgent(
-            "targeted_text_extract",
-            _wrap(
-                make_targeted_extract_node(norm_service, chat_llm=decision_chat_llm, on_event=on_event),
-                "targeted_text_extract_node",
-                decision_chat_llm,
-            ),
-            description="Recover missing concepts from SEC presentation linkbase and filing text.",
         ),
         ADKStepAgent(
             "historical_backfill",
@@ -137,11 +124,6 @@ def build_filing_graph(
             description="Discover and stage missing comparative historical period facts and breakdowns.",
         ),
         ADKStepAgent(
-            "validate",
-            _wrap(make_validate_node(report_store), "validate_node", decision_chat_llm),
-            description="Run deterministic validation suite including SEC presentation diff.",
-        ),
-        ADKStepAgent(
             "hierarchy_agent",
             _wrap(
                 make_hierarchy_agent_node(
@@ -150,7 +132,12 @@ def build_filing_graph(
                 "hierarchy_agent_node",
                 decision_chat_llm,
             ),
-            description="SEC-aligned ADK hierarchy agent.",
+            description="Deterministic SEC-first hierarchy compiler with ADK LLM fallback for ambiguous aliases.",
+        ),
+        ADKStepAgent(
+            "validate",
+            _wrap(make_validate_node(report_store), "validate_node", decision_chat_llm),
+            description="Run deterministic validation suite including SEC presentation diff.",
         ),
         ADKStepAgent(
             "agent_review",
@@ -159,7 +146,7 @@ def build_filing_graph(
                 "agent_review_node",
                 decision_chat_llm,
             ),
-            description="ADK review agent for validation findings.",
+            description="ADK review agent for validation findings requiring a decision.",
         ),
         ADKStepAgent(
             "repair",
@@ -169,7 +156,7 @@ def build_filing_graph(
         ADKStepAgent(
             "validate_final",
             _wrap(make_validate_node(report_store), "validate_final_node", decision_chat_llm),
-            description="Final post-hierarchy and post-repair validation.",
+            description="Post-repair validation.",
         ),
         ADKStepAgent(
             "decide",
@@ -182,7 +169,7 @@ def build_filing_graph(
                 "decide_node",
                 decision_chat_llm,
             ),
-            description="Final write decision policy and optional LLM judge.",
+            description="Final write decision policy.",
         ),
         ADKStepAgent(
             "persist",
@@ -216,8 +203,7 @@ def build_filing_graph(
     edges = {
         "fetch_filing": _route_after("xbrl_extract"),
         "xbrl_extract": _route_after("normalize_bundle"),
-        "normalize_bundle": _route_after("targeted_text_extract"),
-        "targeted_text_extract": _route_after("historical_backfill"),
+        "normalize_bundle": _route_after("historical_backfill"),
         "historical_backfill": _route_after("validate"),
         "validate": _route_needs,
         "agent_review": "repair",
@@ -233,7 +219,7 @@ def build_filing_graph(
     root_agent = ADKSequentialAgent(
         "filing_pipeline_agent",
         sub_agents,
-        description="Google ADK SEC filing extraction, audit, hierarchy, and persistence pipeline.",
+        description="Google ADK SEC filing extraction, hierarchy, validation, and persistence pipeline.",
         entry_point="fetch_filing",
         edges=edges,
     )

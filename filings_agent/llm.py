@@ -21,7 +21,9 @@ from typing import Any
 from filings_agent.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
+    DEEPSEEK_REASONING_EFFORT,
     DEEPSEEK_REQUEST_TIMEOUT,
+    DEEPSEEK_THINKING,
     GEMINI_API_KEY,
     GEMINI_REQUEST_TIMEOUT,
     GROQ_API_KEY,
@@ -306,6 +308,16 @@ class _GeminiInvokeAdapter:
         return text if isinstance(text, str) else str(text)
 
 
+def _deepseek_thinking_kwargs() -> dict[str, Any]:
+    """Return DeepSeek thinking / reasoning_effort kwargs from env config."""
+    out: dict[str, Any] = {}
+    if DEEPSEEK_THINKING in ("enabled", "disabled"):
+        out["extra_body"] = {"thinking": {"type": DEEPSEEK_THINKING}}
+    if DEEPSEEK_THINKING != "disabled" and DEEPSEEK_REASONING_EFFORT:
+        out["reasoning_effort"] = DEEPSEEK_REASONING_EFFORT
+    return out
+
+
 def build_llm(
     *,
     format_json: bool = False,
@@ -386,6 +398,7 @@ def build_llm(
             "base_url": DEEPSEEK_BASE_URL,
             "timeout": request_timeout if request_timeout is not None else DEEPSEEK_REQUEST_TIMEOUT,
             "max_retries": max_retries,
+            **_deepseek_thinking_kwargs(),
         }
         if json_schema is not None or format_json:
             kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
@@ -523,14 +536,17 @@ def build_chat_llm(
                 else DEEPSEEK_REQUEST_TIMEOUT
             )
 
-        chat = ChatOpenAI(
-            model=model_name,
-            temperature=0,
-            api_key=api_key,
-            base_url=base_url,
-            timeout=timeout,
-            max_retries=retries,
-        )
+        chat_kwargs: dict[str, Any] = {
+            "model": model_name,
+            "temperature": 0,
+            "api_key": api_key,
+            "base_url": base_url,
+            "timeout": timeout,
+            "max_retries": retries,
+        }
+        if effective_provider == "deepseek":
+            chat_kwargs.update(_deepseek_thinking_kwargs())
+        chat = ChatOpenAI(**chat_kwargs)
         if LLM_CACHE_ENABLED:
             chat = _CachedLLM(chat, f"{effective_provider}:{model_name}", LLM_CACHE_DIR)
         return chat

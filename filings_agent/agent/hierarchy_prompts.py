@@ -30,6 +30,8 @@ STRUCTURAL RULES:
  - every (path, order_key) pair must be unique within its kind
  - every parent_concept / parent_header you reference must exist as a row
  - NEVER create whole-statement wrapper headers (custom:*ActivitiesSection, custom:*Consolidation*, custom:*Statement*, custom:*CashFlow*). The real section totals (us-gaap:NetCashProvidedByUsedInOperatingActivities, us-gaap:NetCashProvidedByUsedInInvestingActivities, us-gaap:NetCashProvidedByUsedInFinancingActivities) are the ROOTS.
+ - NEVER create or use a parent/subtotal header for a single child: if a section only has 1 line item (e.g. SG&A alone without R&D, or 1 non-current item), keep that single item at root/parent level without wrapping it in a single-child header.
+ - On Income Statement, NEVER nest CostOfGoodsAndServicesSold / CostOfRevenue under CostsAndExpenses; keep Cost of Goods Sold at root level.
  - every custom: grouping header must hang under a real line item (parent != null)
  - the same grouping header name must NOT appear under several parents
  - if 3 or more dimensional members share a parent, group them under ONE header
@@ -62,7 +64,7 @@ UNIVERSAL STATEMENT STRUCTURE BLUEPRINTS (Modeled on Google, Microsoft, Amazon, 
       - 2: Total Cost of Revenues / Cost of Goods Sold (us-gaap:CostOfRevenue or us-gaap:CostOfGoodsAndServicesSold)
            * Sub-lines if present: Cost of Automotive/Hardware/Cloud/Services/Energy
       - 3: Gross Profit (us-gaap:GrossProfit)
-      - 4: Operating Expenses (us-gaap:OperatingExpenses or CostsAndExpenses)
+      - 4: Operating Expenses (us-gaap:OperatingExpenses — ONLY when 2+ OpEx items exist)
            -> Children (parent: OperatingExpenses):
               * Research and Development (us-gaap:ResearchAndDevelopmentExpense)
               * Selling, General & Administrative (us-gaap:SellingGeneralAndAdministrativeExpense or SellingAndMarketing / GeneralAndAdministrative)
@@ -146,16 +148,24 @@ DECISION RULES
 * OperatingExpenses / NoninterestExpense is a ROOT — never a child of GrossProfit. R&D, SG&A, and marketing nest under OperatingExpenses.
 * EPS and Share count lines are ROOTS — never children of NetIncomeLoss.
 * CASH FLOW OPERATING ADJUSTMENTS: All adjustments (D&A, stock comp, working capital changes) must have parent "us-gaap:NetCashProvidedByUsedInOperatingActivities".
-* DIMENSIONAL GROUPING HEADERS:
-  - MANDATORY GROUPING RULE: Whenever 3 or more dimensional breakdown members share the same parent line item, you MUST group them under a custom grouping header (e.g. custom:ProductSegmentation or custom:GeographicSegmentation). NEVER leave dim members flat without a parent_header when 3 or more share the same parent!
-  - When line items (Revenue, Cost of Revenue, Operating Income) have multiple dimensional breakdown segments (products, geographies, business segments):
-    1. IN rows_json: Explicitly propose the empty grouping concepts with their parent line item:
-       {"concept": "custom:ProductSegmentation", "label": "Product Segmentation", "parent": "<parent_line>", "order": 1, "abstract": true}
-       {"concept": "custom:GeographicSegmentation", "label": "Geographic Segmentation", "parent": "<parent_line>", "order": 2, "abstract": true}
-       NEVER propose custom grouping headers with parent: null! They must have a valid parent line item.
-    2. IN dims_json: Assign each member to its grouping header:
-       {"concept": "<member>", "label": "...", "parent_concept": "<parent_line>", "parent_header": "custom:ProductSegmentation", "order": 1}
-       For MATCHED members that already have a parent_header, you MUST preserve it in your dims_json!
+* DIMENSIONAL GROUPING HEADERS (PARENT-SPECIFIC NAMING & LABELING):
+  - MANDATORY GROUPING RULE: Whenever ANY parent line item has dimensional breakdown members (product, geographic, business segment, award type, etc.), you MUST group them under a parent-specific custom grouping header. NEVER leave dimensional breakdown members flat without a parent_header!
+  - PARENT-SPECIFIC CONCEPT & LABEL RULE: Every segmentation header MUST have a DIFFERENT concept name and a DIFFERENT human-readable label according to its parent line item so it is immediately understandable what line item is being segmented (e.g. Revenue vs Cost of Revenue vs SG&A vs Goodwill):
+    1. IN rows_json: Explicitly propose parent-specific grouping concepts with their parent line item and parent-qualified label:
+       - Under Revenue / Net Sales:
+         {"concept": "custom:RevenueSegmentSegmentation", "label": "<Parent Label> Segment Segmentation", "parent": "<revenue_concept>", "order": 1, "abstract": true}
+         {"concept": "custom:RevenueProductSegmentation", "label": "<Parent Label> Product Segmentation", "parent": "<revenue_concept>", "order": 2, "abstract": true}
+         {"concept": "custom:RevenueGeographicSegmentation", "label": "<Parent Label> Geographic Segmentation", "parent": "<revenue_concept>", "order": 3, "abstract": true}
+       - Under Cost of Goods Sold / Cost of Revenue:
+         {"concept": "custom:CostOfRevenueSegmentSegmentation", "label": "<Parent Label> Segment Segmentation", "parent": "<cost_concept>", "order": 1, "abstract": true}
+         {"concept": "custom:CostOfRevenueProductSegmentation", "label": "<Parent Label> Product Segmentation", "parent": "<cost_concept>", "order": 2, "abstract": true}
+       - Under SG&A / R&D / Goodwill / Share-Based Compensation / Other Parents:
+         {"concept": "custom:SGASegmentSegmentation", "label": "Selling, General, and Administrative Segment Segmentation", "parent": "<sga_concept>", "order": 1, "abstract": true}
+         {"concept": "custom:GoodwillSegmentSegmentation", "label": "Goodwill Segment Segmentation", "parent": "<goodwill_concept>", "order": 1, "abstract": true}
+       NEVER use generic labels like "Segment Segmentation" or "Product Segmentation" without the parent line item's name! NEVER propose custom grouping headers with parent: null!
+    2. IN dims_json: Assign each member to its parent-specific grouping header:
+       {"concept": "<member>", "label": "...", "parent_concept": "<parent_line>", "parent_header": "custom:RevenueProductSegmentation", "order": 1}
+       For MATCHED members that already have a stored parent_header in DB, you MUST preserve their stored parent_header in your dims_json!
 * Do not hide any concepts. All concepts must be placed correctly in the hierarchy.
 
 LINT & SUBMISSION WORKFLOW

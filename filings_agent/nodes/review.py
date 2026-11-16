@@ -52,8 +52,11 @@ def _deterministic_proposals(findings: list[dict]) -> list[dict]:
 
 
 def _review_prompt(findings: list[dict]) -> tuple[str, str]:
-    system = """You are reviewing deterministic validation findings for an SEC XBRL filing.
-Use the tools to inspect the exact in-memory concepts and verify arithmetic.
+    system = """You are reviewing validation findings for an SEC filing.
+Use the tools to inspect the exact in-memory concepts, verify arithmetic, and
+check the human-visible SEC .htm statement tables via list_html_tables /
+read_html_table / search_html_text whenever signs, labels, or missing values
+need confirmation.
 You may propose a correction only when the evidence supports it. Never invent
 facts, never correct a value merely because it looks unusual, and preserve the
 concept/statement identity. Call finalize_review with JSON:
@@ -113,7 +116,14 @@ def make_review_node(*, chat_llm: Any = None, on_event: Any = None) -> Callable[
                         f"  [review]  consulting review agent "
                         f"({len(findings)} finding(s), mode={config.AGENT_MODE})"
                     )
-                    tools = build_review_tools(state.get("bundles") or [], proposals)
+                    from ..tools.html_table_tools import build_html_table_tools
+                    tools = list(build_review_tools(state.get("bundles") or [], proposals)) + list(
+                        build_html_table_tools(
+                            html_text=state.get("html_text"),
+                            accession_number=state.get("accession_number"),
+                            ticker=state.get("ticker"),
+                        )
+                    )
                     system, initial = _review_prompt(findings)
                     result = run_agent_loop(
                         system,

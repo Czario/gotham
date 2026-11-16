@@ -93,6 +93,7 @@ class FinancialLineItem:
     abstract: bool             # Whether concept is abstract
     parent_concept: Optional[str] = None
     preferred_label_role: Optional[str] = None
+    html_display_sign: Optional[int] = None
     dimensions: List[DimensionalContext] = field(default_factory=list)  # Dimensional breakdowns
     all_dimensional_facts: List[Dict[str, Any]] = field(default_factory=list)  # All facts with dimensions
     comparative_facts: List[Dict[str, Any]] = field(default_factory=list)  # Comparative prior-period main-line facts
@@ -1368,6 +1369,43 @@ class FlexibleXBRLExtractor:
                 # Skip dimensional context if there's an access issue
                 pass
         
+        # Extract exact human-visible HTML cell display sign from Inline XBRL <td> when available
+        html_display_sign: Optional[int] = None
+        if best_fact is not None and value is not None and value != 0:
+            try:
+                tag_local = str(getattr(best_fact, 'tag', '')).split('}')[-1].lower()
+                if tag_local == 'nonfraction' and hasattr(best_fact, 'getparent'):
+                    curr_el = best_fact.getparent()
+                    td_el = None
+                    for _ in range(5):
+                        if curr_el is None:
+                            break
+                        el_name = str(getattr(curr_el, 'tag', '')).split('}')[-1].lower()
+                        if el_name in ('td', 'th'):
+                            td_el = curr_el
+                            break
+                        curr_el = curr_el.getparent() if hasattr(curr_el, 'getparent') else None
+                    target_el = td_el if td_el is not None else best_fact.getparent()
+                    if target_el is not None and hasattr(target_el, 'itertext'):
+                        # Also check adjacent sibling td (some filings put '(' in next/prev td, or inside target_el)
+                        cell_text = "".join(target_el.itertext()).strip()
+                        if td_el is not None and hasattr(td_el, 'getnext'):
+                            nxt_td = td_el.getnext()
+                            if nxt_td is not None and hasattr(nxt_td, 'itertext'):
+                                nxt_txt = "".join(nxt_td.itertext()).strip()
+                                if nxt_txt == ")":
+                                    cell_text = f"{cell_text})"
+                        cleaned_cell = re.sub(r"[\s\$€£¥\xa0]", "", cell_text)
+                        if (
+                            (cleaned_cell.startswith("(") and cleaned_cell.endswith(")"))
+                            or cleaned_cell.startswith(("-", "−", "–"))
+                        ):
+                            html_display_sign = -1
+                        elif any(ch.isdigit() for ch in cleaned_cell):
+                            html_display_sign = 1
+            except Exception:
+                pass
+
         # Get presentation order and preferred label role from SEC presentation linkbase
         order = 0.0
         preferred_label_role = None
@@ -1478,6 +1516,7 @@ class FlexibleXBRLExtractor:
             order=order,
             abstract=abstract_value,
             preferred_label_role=preferred_label_role,
+            html_display_sign=html_display_sign,
             dimensions=dimensions,
             all_dimensional_facts=all_dimensional_facts,
             comparative_facts=comparative_facts,
@@ -3411,8 +3450,12 @@ class FlexibleXBRLExtractor:
                 order=item.order,
                 abstract=item.abstract,
                 parent_concept=item.parent_concept,
+                preferred_label_role=item.preferred_label_role,
+                html_display_sign=item.html_display_sign,
                 dimensions=[],
                 all_dimensional_facts=[],
+                comparative_facts=list(getattr(item, 'comparative_facts', None) or []),
+                comparative_dimensional_facts=list(getattr(item, 'comparative_dimensional_facts', None) or []),
                 calculations=item.calculations
             )
             

@@ -202,6 +202,17 @@ def _sanitize_proposed_rows(
                     any_modified = True
 
     elif "balance" in st:
+        liab_root = "us-gaap:Liabilities" if "us-gaap:Liabilities" in row_by_c else (
+            "ifrs-full:Liabilities" if "ifrs-full:Liabilities" in row_by_c else None
+        )
+        if liab_root:
+            for child_c in ("us-gaap:LiabilitiesCurrent", "ifrs-full:CurrentLiabilities",
+                            "us-gaap:LiabilitiesNoncurrent", "ifrs-full:NoncurrentLiabilities"):
+                if child_c in row_by_c and not row_by_c[child_c].get("_is_stored"):
+                    if (row_by_c[child_c].get("parent") or row_by_c[child_c].get("parent_concept")) != liab_root:
+                        row_by_c[child_c]["parent"] = liab_root
+                        row_by_c[child_c].pop("parent_concept", None)
+                        any_modified = True
         ppe_net = "us-gaap:PropertyPlantAndEquipmentNet"
         ppe_gross = "us-gaap:PropertyPlantAndEquipmentGross"
         if ppe_net in row_by_c and ppe_gross in row_by_c:
@@ -320,12 +331,25 @@ def build_unified_hierarchy_tools(
     @tool
     def query_filing_hierarchy() -> str:
         """Show this filing's extracted line items and dimensional members."""
+        from filings_agent.nodes.hierarchy_agent import build_parent_specific_segmentation_header
+
         main = [r for r in filing_rows if not r.get("dimension_concept")]
         dims = [r for r in filing_rows if r.get("dimension_concept")]
+        main_lbl_by_c = {str(r.get("concept") or ""): str(r.get("label") or "") for r in main}
+
+        def fmt_dim(d: dict) -> str:
+            base = fmt_row(d)
+            pc = str(d.get("parent_concept") or "")
+            seg = d.get("segment_type")
+            if pc:
+                sug_c, sug_lbl = build_parent_specific_segmentation_header(pc, main_lbl_by_c.get(pc), seg)
+                return f"{base}  [suggested parent_header={sug_c!r} label={sug_lbl!r}]"
+            return base
+
         out = (
             f"FILING LINE ITEMS {scope_banner} ({len(main)}):\n" + "\n".join(fmt_row(r) for r in main)
             + f"\n\nFILING DIMENSIONAL MEMBERS ({len(dims)}):\n"
-            + "\n".join(fmt_row(r) for r in dims)
+            + "\n".join(fmt_dim(r) for r in dims)
         )
         if sec_presentation:
             from core.extractors.sec_presentation_extractor import format_sec_presentation_tree
@@ -468,6 +492,28 @@ def build_unified_hierarchy_tools(
                 c = str(r.get("concept", ""))
                 lbl = r.get("label") or ""
                 parent_c = r.get("parent_concept") or r.get("parent")
+                d_tokens = _concept_tokens(c, lbl)
+                dim_cands = []
+                for sd in stored_dims_sorted:
+                    if (sd.get("parent_concept") or sd.get("parent")) != parent_c:
+                        continue
+                    sd_c = str(sd.get("concept", ""))
+                    sd_lbl = sd.get("label") or ""
+                    sd_tokens = _concept_tokens(sd_c, sd_lbl)
+                    overlap = d_tokens & sd_tokens
+                    exact_lbl = bool(lbl and sd_lbl and lbl.strip().lower() == sd_lbl.strip().lower())
+                    is_absent = sd in stored_absent
+                    score = len(overlap) + (5 if exact_lbl else 0) + (2 if is_absent else 0)
+                    if score >= 1 and (overlap or exact_lbl):
+                        reasons = []
+                        if exact_lbl:
+                            reasons.append("exact label match")
+                        if overlap:
+                            reasons.append(f"shared keywords: {list(overlap)[:3]}")
+                        if is_absent:
+                            reasons.append("absent in this filing")
+                        dim_cands.append((score, f"{sd_c} ({', '.join(reasons)})"))
+                dim_cands.sort(key=lambda x: x[0], reverse=True)
                 extra = []
                 if parent_c:
                     stored_p = stored_main_map.get(parent_c)
@@ -485,6 +531,8 @@ def build_unified_hierarchy_tools(
                     ]
                     if dim_siblings:
                         extra.append(f"existing member siblings ({len(dim_siblings)}): {[ds.get('concept') for ds in dim_siblings[:4]]}")
+                if dim_cands:
+                    extra.append(f"High-Probability Alias Candidates to merge via decide_mapping: {[dc[1] for dc in dim_cands[:3]]}")
                 extra_str = f"\n      ({'; '.join(extra)})" if extra else ""
                 lines.append(f"  * [NEW DIM MEMBER] {c} (\"{lbl}\"){extra_str}")
                 lines.append("")
@@ -535,6 +583,15 @@ def build_unified_hierarchy_tools(
                 return (
                     f"Error: '{same_as}' is not a stored concept. Choose null or one "
                     f"of the stored names (query_stored_hierarchy / query_hierarchy_diff)."
+                )
+            c_loc = concept.split(":")[-1]
+            s_loc = same_as.split(":")[-1]
+            if (c_loc in ("CostsAndExpenses", "TotalCostsAndExpenses") and s_loc in ("OperatingExpenses", "TotalOperatingExpenses")) or (
+                s_loc in ("CostsAndExpenses", "TotalCostsAndExpenses") and c_loc in ("OperatingExpenses", "TotalOperatingExpenses")
+            ):
+                return (
+                    f"Error: '{concept}' (total costs + operating expenses) is NOT equivalent to "
+                    f"'{same_as}' (operating expenses only). Keep them separate or pass same_as=null."
                 )
         if keep_tag not in ("stored", "incoming"):
             return "Error: keep_tag must be 'stored' or 'incoming'."
@@ -642,6 +699,9 @@ def build_unified_hierarchy_tools(
         for raw in parsed_dims:
             if not isinstance(raw, dict):
                 continue
+            raw_c = raw.get("concept") or raw.get("member")
+            if raw_c in incoming_aliases:
+                continue
             dim = dict(raw)
             for key in ("parent", "parent_concept"):
                 if dim.get(key) in incoming_aliases:
@@ -726,9 +786,6 @@ def build_unified_hierarchy_tools(
                     merged.append(item)
             final_rows = merged
 
-        # Deterministic accounting hierarchy sanitization for unstored/fresh rows
-        final_rows = _sanitize_proposed_rows(final_rows, statement_type, filing_rows=filing_rows)
-
         # 2. Base dimensional members from stored
         stored_dims = []
         for s in stored_rows:
@@ -743,6 +800,8 @@ def build_unified_hierarchy_tools(
             if orig_concept in merge_renames:
                 new_concept, new_label = merge_renames[orig_concept]
                 new_label = new_label or s.get("label")
+            elif orig_concept in merged_away:
+                continue
             if orig_parent and str(orig_parent) in merge_renames:
                 new_parent = merge_renames[str(orig_parent)][0]
 
@@ -819,6 +878,62 @@ def build_unified_hierarchy_tools(
             return f"Invalid JSON in dims: {exc}"
         if not isinstance(parsed_dims, list):
             return "Error: dims_json must be a JSON array."
+
+        # Enforce parent-specific segmentation header concept names and labels when
+        # running on SEC filings (or when generic 'custom:SegmentSegmentation' is proposed)
+        from filings_agent.nodes.hierarchy_agent import build_parent_specific_segmentation_header
+
+        filing_main_lbl = {
+            str(fr.get("concept") or ""): str(fr.get("label") or "")
+            for fr in filing_rows
+            if isinstance(fr, dict) and fr.get("concept") and not fr.get("dimension_concept")
+        }
+        filing_dim_seg = {
+            (str(fr.get("parent_concept") or ""), str(fr.get("concept") or "")): fr.get("segment_type")
+            for fr in filing_rows
+            if isinstance(fr, dict) and fr.get("concept") and fr.get("dimension_concept")
+        }
+        stored_header_pairs = {
+            (str(sr.get("parent_concept") or sr.get("parent") or ""), str(sr.get("concept") or ""))
+            for sr in stored_rows
+            if isinstance(sr, dict) and str(sr.get("concept") or "").startswith("custom:")
+        }
+        header_rename_map: dict[tuple[str, str], tuple[str, str]] = {}
+        for r in parsed_rows:
+            if not isinstance(r, dict):
+                continue
+            c = str(r.get("concept") or "")
+            p = str(r.get("parent") or r.get("parent_concept") or "")
+            if c.startswith("custom:") and p and (p, c) not in stored_header_pairs:
+                p_lbl = filing_main_lbl.get(p) or ""
+                if sec_presentation is not None or c in (
+                    "custom:SegmentSegmentation",
+                    "custom:CostSegmentSegmentation",
+                    "custom:SGASegmentSegmentation",
+                ):
+                    new_c, new_lbl = build_parent_specific_segmentation_header(p, p_lbl, c)
+                    header_rename_map[(p, c)] = (new_c, new_lbl)
+                    r["concept"] = new_c
+                    r["label"] = new_lbl
+                elif p_lbl:
+                    _, new_lbl = build_parent_specific_segmentation_header(p, p_lbl, c)
+                    r["label"] = new_lbl
+
+        for d in parsed_dims:
+            if not isinstance(d, dict):
+                continue
+            dc = str(d.get("concept") or d.get("member") or "")
+            pc = str(d.get("parent_concept") or d.get("parent") or "")
+            ph = str(d.get("parent_header") or "")
+            if pc and ph and (pc, ph) in header_rename_map:
+                d["parent_header"] = header_rename_map[(pc, ph)][0]
+            elif pc and ph and ph.startswith("custom:") and (pc, ph) not in stored_header_pairs and sec_presentation is not None:
+                new_c, _ = build_parent_specific_segmentation_header(pc, filing_main_lbl.get(pc), ph)
+                d["parent_header"] = new_c
+            elif pc and not ph and sec_presentation is not None:
+                seg_t = d.get("segment_type") or filing_dim_seg.get((pc, dc))
+                new_c, new_lbl = build_parent_specific_segmentation_header(pc, filing_main_lbl.get(pc), seg_t)
+                d["parent_header"] = new_c
 
         # Accumulate rows across calls (revision-safe).  An explicit removal
         # (remove_row) is honoured here too: re-proposing the same row must not

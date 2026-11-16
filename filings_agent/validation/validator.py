@@ -47,7 +47,7 @@ def validate_bundles(
         for name, check in CHECKS:
             findings.extend(check(bundle))
             checks_run[name] += 1
-        if sec_presentation is not None:
+        if sec_presentation and sec_presentation.get("statements"):
             findings.extend(check_sec_presentation_diff(bundle, sec_presentation))
             findings.extend(check_coverage(bundle))
 

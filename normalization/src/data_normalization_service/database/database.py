@@ -354,6 +354,26 @@ class ConceptRepository:
             if res:
                 return res
 
+        # Alias match under same parent + parent_header: when a member tag is in ``aliases``,
+        # its ``dimension_signature`` embeds the old/new member QName and therefore differs
+        # from the primary concept's ``dimension_signature``. Match by ``aliases`` without
+        # requiring ``dimension_signature`` equality.
+        alias_query: Dict[str, Any] = {
+            "cik": company_cik,
+            "statement_type": statement_type,
+            "aliases": concept,
+            "dimension_concept": True,
+        }
+        if parent_concept_id:
+            alias_query["concept_id"] = parent_concept_id
+        if parent_header:
+            alias_query["parent_header"] = parent_header
+        else:
+            alias_query["parent_header"] = {"$in": [None, ""]}
+        alias_res = self.collection.find_one(alias_query)
+        if alias_res:
+            return alias_res
+
         # Semantic label fallback under same parent: if incoming concept tag changed
         # (e.g. meta:FamilyOfAppsMember -> us-gaap:AdvertisingMember), match the existing
         # placed row with the same cleaned label so it is updated in place.

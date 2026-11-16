@@ -34,6 +34,8 @@ OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120"))
+DEEPSEEK_THINKING: str = os.getenv("DEEPSEEK_THINKING", "").strip().lower()
+DEEPSEEK_REASONING_EFFORT: str = os.getenv("DEEPSEEK_REASONING_EFFORT", "").strip().lower()
 
 # ── Groq (used only when LLM_PROVIDER=groq) ────────────────────────────────
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")

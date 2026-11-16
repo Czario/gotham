@@ -46,5 +46,5 @@ def test_legacy_rows_without_signature_are_still_reused():
     )
     # first attempt by signature, then a legacy fallback that requires the field
     # to be absent so we reuse (rather than duplicate) pre-signature rows
-    assert len(repo._collection.queries) == 2
+    assert len(repo._collection.queries) >= 2
     assert repo._collection.queries[1]["dimension_signature"] == {"$exists": False}

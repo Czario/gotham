@@ -144,13 +144,21 @@ def _collect_comparative_candidates(
         else:
             c_name = str(fact.get("concept") or fact.get("parent_concept") or "")
             if c_name and fact.get("value") is not None:
-                entry["dimensional_facts"].append({
-                    "parent_concept": c_name,
-                    "label": fact.get("label") or "",
-                    "value": float(fact["value"]),
-                    "unit": fact.get("unit"),
-                    "dimension_details": fact.get("dimension_details") or {},
-                })
+                dim_sig = (
+                    c_name,
+                    str(fact.get("label") or ""),
+                    str(sorted((fact.get("dimension_details") or {}).items())),
+                )
+                seen_sigs = entry.setdefault("_seen_dim_sigs", set())
+                if dim_sig not in seen_sigs:
+                    seen_sigs.add(dim_sig)
+                    entry["dimensional_facts"].append({
+                        "parent_concept": c_name,
+                        "label": fact.get("label") or "",
+                        "value": float(fact["value"]),
+                        "unit": fact.get("unit"),
+                        "dimension_details": fact.get("dimension_details") or {},
+                    })
 
     # 1. From sec_presentation snapshot
     sec_pres = state.get("sec_presentation") or {}
@@ -328,9 +336,9 @@ def make_historical_backfill_node(
         total_dims = sum(len(e["missing_dimensional_facts"]) for e in entries)
 
         if total_concepts or total_dims:
-            report_call(
-                f"  [backfill]  discovered {total_concepts} missing historical line item(s) "
-                f"and {total_dims} missing historical breakdown(s) across {len(entries)} comparative period(s)"
+            logger.info(
+                "[backfill] +%d items, +%d dims (%d periods)",
+                total_concepts, total_dims, len(entries),
             )
 
         return {

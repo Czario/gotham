@@ -658,8 +658,13 @@ class SECDataScraperApp:
         """
         stmt_type = statement_doc.get('statement_type', '')
         if stmt_type.lower() not in ('cashflow', 'cash_flow', 'cashflow',
-                                      'income', 'income_statements'):
-            return  # Balance sheets are skipped — point-in-time, no deaccumulation needed
+                                      'income', 'income_statements', 'balancesheet', 'balance_sheet'):
+            return
+        if stmt_type.lower() in ('balancesheet', 'balance_sheet'):
+            self._auto_calculate_q4_if_ready(cik, {
+                'reporting_period': statement_doc.get('reporting_period', {}),
+            })
+            return
         entry = {
             '_id': statement_doc.get('_id'),
             'cik': cik,
@@ -677,8 +682,31 @@ class SECDataScraperApp:
         ).upper()
         if stmt_type.lower() in ('cashflow', 'cash_flow') and form_type == '10-Q':
             self._deaccumulate_quarterly_cashflow_immediately(cik, entry)
+            self._auto_calculate_q4_if_ready(cik, entry)
             return
         self._quarterly_accumulator.setdefault(cik, []).append(entry)
+        self._auto_calculate_q4_if_ready(cik, entry)
+
+    def _auto_calculate_q4_if_ready(self, cik: str, entry: dict) -> None:
+        """Auto-calculate Q4 values when annual + required Q1–Q3 periods exist."""
+        rp = entry.get('reporting_period') or {}
+        fy = rp.get('fiscal_year')
+        if not isinstance(fy, int):
+            return
+        norm_svc = getattr(self, '_norm_service', None)
+        db_conn = getattr(norm_svc, 'db_connection', None) if norm_svc is not None else None
+        target_db = getattr(db_conn, 'target_db', None) if db_conn is not None else None
+        if target_db is None:
+            return
+        try:
+            from core.processors.q4_calculator import auto_calculate_q4_for_fiscal_year
+            written = auto_calculate_q4_for_fiscal_year(target_db, cik, fy)
+            if written:
+                from filings_agent.hooks import report_call
+                summary = ", ".join(f"{k}={v}" for k, v in written.items())
+                report_call(f"  [auto-q4]  ✓ FY{fy} Q4 calculated ({summary})")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Auto Q4 calculation skipped for {cik} FY{fy}: {exc}")
 
     def _deaccumulate_quarterly_cashflow_immediately(self, cik: str, entry: dict) -> None:
         """Immediately deaccumulate a persisted 10-Q cash flow statement into 3-month figures."""
@@ -1525,6 +1553,51 @@ class SECDataScraperApp:
         collections = (self._cv_annual_col, self._cv_quarterly_col)
         target_stmt = getattr(self, 'target_statement', None)
 
+        def _normalize_stmt_set(raw_types) -> set[str]:
+            norm = set()
+            for st in raw_types or ():
+                s = str(st or '').strip().lower()
+                if s in ('income', 'income_statement', 'income_statements'):
+                    norm.add('income')
+                elif s in ('balancesheet', 'balance_sheet', 'balance_sheets'):
+                    norm.add('balancesheet')
+                elif s in ('cashflow', 'cash_flow', 'cash_flows'):
+                    norm.add('cashflow')
+            return norm
+
+        def _check_complete(query_filter: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            if target_stmt:
+                for collection in collections:
+                    existing = collection.find_one(query_filter, projection={'_id': 1})
+                    if existing:
+                        return existing
+                return None
+
+            present: set[str] = set()
+            for collection in collections:
+                try:
+                    present.update(_normalize_stmt_set(collection.distinct('statement_type', query_filter)))
+                except Exception:
+                    # Fallback if fake/mock collection in tests lacks distinct()
+                    existing = collection.find_one(query_filter, projection={'_id': 1, 'statement_type': 1})
+                    if existing:
+                        if existing.get('statement_type'):
+                            present.update(_normalize_stmt_set([existing.get('statement_type')]))
+                        else:
+                            return existing
+            required = {'income', 'balancesheet', 'cashflow'}
+            if required.issubset(present):
+                return {'statement_types': sorted(present)}
+            if present:
+                missing = sorted(required - present)
+                logger.info(
+                    "Filing %s has partial statements (%s); missing %s — will not skip",
+                    accession_number or filing.get('reportDate') or cik,
+                    sorted(present),
+                    missing,
+                )
+            return None
+
         if accession_number:
             accession_filter = {
                 'cik': cik,
@@ -1535,10 +1608,9 @@ class SECDataScraperApp:
             }
             if target_stmt:
                 accession_filter['statement_type'] = target_stmt
-            for collection in collections:
-                existing = collection.find_one(accession_filter, projection={'_id': 1})
-                if existing:
-                    return existing
+            found = _check_complete(accession_filter)
+            if found:
+                return found
 
         period_filter: Dict[str, Any] = {'cik': cik}
         if target_stmt:
@@ -1587,11 +1659,7 @@ class SECDataScraperApp:
         if len(period_filter) <= min_keys:
             return None
 
-        for collection in collections:
-            existing = collection.find_one(period_filter, projection={'_id': 1})
-            if existing:
-                return existing
-        return None
+        return _check_complete(period_filter)
 
     def _build_reload_filter(self, cik: str, filing: Dict, form_type: str) -> Optional[Dict[str, Any]]:
         """Build the database filter used before saving a reloaded filing.
@@ -2386,7 +2454,7 @@ class SECDataScraperApp:
                 # scraper method anymore.
                 from filings_agent.state import new_state
 
-                self.progress.set_status("agent validating / repairing")
+                self.progress.set_status("running filing agent...")
                 filing_date = filing_info.get('filingDate', filing_info.get('reportDate'))
                 agent_state = new_state(
                     cik=cik,
@@ -2482,7 +2550,12 @@ class SECDataScraperApp:
                         self._accumulate_for_quarterly(cik, st_doc, filing_doc_for_norm)
 
                 agent_state['post_write_hook'] = _on_post_write
-                final_state = self._build_filing_agent_graph().invoke(agent_state)
+                from filings_agent.hooks import set_detail_callback
+                set_detail_callback(self.progress.set_status)
+                try:
+                    final_state = self._build_filing_agent_graph().invoke(agent_state)
+                finally:
+                    set_detail_callback(None)
 
                 if final_state.get('status') != 'saved':
                     from filings_agent.validation.findings import (
@@ -2615,6 +2688,7 @@ class SECDataScraperApp:
                         'dimensional_facts': item.all_dimensional_facts,
                         'level': getattr(item, 'level', 0),
                         'preferred_label_role': getattr(item, 'preferred_label_role', None),
+                        'html_display_sign': getattr(item, 'html_display_sign', None),
                         'parent_concept': getattr(item, 'parent_concept', None),
                         'sec_parent_concept': getattr(item, 'sec_parent_concept', None),
                         'reading_order': getattr(item, 'reading_order', None),
@@ -2647,6 +2721,7 @@ class SECDataScraperApp:
                     'dimensional_facts': item.all_dimensional_facts,
                     'level': getattr(item, 'level', 0),
                     'preferred_label_role': getattr(item, 'preferred_label_role', None),
+                    'html_display_sign': getattr(item, 'html_display_sign', None),
                     'parent_concept': getattr(item, 'parent_concept', None),
                     'sec_parent_concept': getattr(item, 'sec_parent_concept', None),
                     'reading_order': getattr(item, 'reading_order', None),
@@ -3181,6 +3256,10 @@ def main(argv: Optional[Sequence[str]] = None):
         '--no-reconciliation', action='store_true',
         help='Disable the post-processing gap-fill step that back-fills missing '
              'periods from SEC companyfacts (enabled by default).')
+    proc.add_argument(
+        '--fix-hierarchy', '--fix-hi', action='store_true', dest='fix_hierarchy',
+        help='Fix stored hierarchy in place for the selected companies/statement '
+             'using the ADK Hierarchy Agent + SEC .htm tables without re-scraping values.')
 
     # --- HTML download options --------------------------------------------
     html = parser.add_argument_group('HTML filing downloads')
@@ -3220,7 +3299,19 @@ def main(argv: Optional[Sequence[str]] = None):
     else:
         # Clean mode: suppress logger console output; progress bars carry all UI
         from utilities.helpers.logger_config import LoggerConfig
-        LoggerConfig.setup_logging(level='WARNING', console_output=False)
+        LoggerConfig.setup_logging(level='INFO', console_output=False)
+
+    # Always write full detailed logs for every run into gotham/logs/
+    _run_logs_dir = Path('/Users/aijaz/TrueGrids/all_projects/gotham/logs')
+    _run_logs_dir.mkdir(parents=True, exist_ok=True)
+    _run_log_file = _run_logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    _file_handler = logging.FileHandler(_run_log_file, encoding='utf-8')
+    _file_handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
+    _file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    logging.getLogger().addHandler(_file_handler)
 
     # Build the Rich progress manager (verbose=True disables live bars)
     progress = ProgressManager(verbose=is_verbose, parallel=False)
@@ -3556,6 +3647,24 @@ def main(argv: Optional[Sequence[str]] = None):
         if not app.setup_database():
             print("Failed to setup database")
             sys.exit(1)
+
+        if args.fix_hierarchy:
+            from pymongo import MongoClient
+            from filings_agent.nodes.fix_hierarchy import fix_company_statement_hierarchy
+            target_db = MongoClient(app._reconciliation_db_uri)[app._reconciliation_db_name]
+            stmts = [target_statement] if target_statement else ['income', 'balancesheet', 'cashflow']
+            print(f"\n🔧 Fixing stored hierarchies for {len(companies)} company(ies)...")
+            for cik in companies:
+                ticker = progress.cik_labels.get(cik) or app.sec_client.get_ticker_from_cik(cik) or cik
+                for cadence in ('quarterly', 'annual'):
+                    for st in stmts:
+                        res = fix_company_statement_hierarchy(
+                            target_db, cik, ticker, cadence, st,
+                            html_dir=html_download_path or os.getenv('SEC_HTML_DOWNLOAD_PATH'),
+                        )
+                        if not res.get('skipped'):
+                            print(f"  ✓ {ticker} ({cadence}/{st}): {res.get('updated', 0)} updated, {res.get('merged', 0)} merged")
+            sys.exit(0)
         
         # Process companies
         results = app.process_multiple_companies(companies, resume=True)

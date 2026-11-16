@@ -238,7 +238,11 @@ def run_complete_stock_audit(
         ("quarterly", "normalized_concepts_quarterly", "concepts_quarterly", "concept_values_quarterly"),
     ):
         try:
-            c_docs = list(target_db[c_coll_name].find({"cik": {"$in": [padded_cik, padded_cik.lstrip("0")]}}))
+            c_docs = []
+            try:
+                c_docs = list(target_db[c_coll_name].find({"cik": {"$in": [padded_cik, padded_cik.lstrip("0")]}}))
+            except Exception:
+                c_docs = []
             if not c_docs:
                 c_docs = list(target_db[legacy_c_coll_name].find({"cik": {"$in": [padded_cik, padded_cik.lstrip("0")]}}))
             v_docs = list(target_db[v_coll_name].find({"cik": {"$in": [padded_cik, padded_cik.lstrip("0")]}}))

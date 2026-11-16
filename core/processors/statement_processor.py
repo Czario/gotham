@@ -393,6 +393,7 @@ class EnhancedFinancialStatementProcessor:
                 'parent_concept': resolved_parent,
                 'sec_parent_concept': raw_parent,
                 'preferred_label_role': getattr(item, 'preferred_label_role', None),
+                'html_display_sign': getattr(item, 'html_display_sign', None),
             }
             if getattr(item, 'comparative_facts', None):
                 fact_dict['comparative_facts'] = list(item.comparative_facts)
@@ -573,6 +574,95 @@ class EnhancedFinancialStatementProcessor:
                     else:
                         d['parent_concept'] = None
 
+            # Positional section-total fallback for Balance Sheet & Cash Flow when _cal.xml omits an arc
+            idx_by_concept = {d['concept']: idx for idx, d in enumerate(flat_data) if d.get('concept')}
+            if 'balance' in st_lower:
+                assets_root = next(
+                    (c for c in ('us-gaap:Assets', 'ifrs-full:Assets') if c in idx_by_concept),
+                    None,
+                )
+                lse_root = next(
+                    (
+                        c for c in (
+                            'us-gaap:LiabilitiesAndStockholdersEquity',
+                            'ifrs-full:EquityAndLiabilities',
+                        )
+                        if c in idx_by_concept
+                    ),
+                    None,
+                )
+                assets_idx = idx_by_concept.get(assets_root, -1) if assets_root else -1
+                lse_idx = idx_by_concept.get(lse_root, -1) if lse_root else -1
+                for idx, d in enumerate(flat_data):
+                    c_name = d.get('concept') or ''
+                    if c_name in (assets_root, lse_root) or d.get('parent_concept'):
+                        continue
+                    if assets_root and idx < assets_idx:
+                        d['parent_concept'] = assets_root
+                    elif lse_root and idx > assets_idx and idx < lse_idx:
+                        d['parent_concept'] = lse_root
+            elif 'cash' in st_lower or 'flow' in st_lower:
+                op_root = next(
+                    (
+                        c for c in idx_by_concept
+                        if c.split(':')[-1] in (
+                            'NetCashProvidedByUsedInOperatingActivities',
+                            'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+                            'CashFlowsFromUsedInOperatingActivities',
+                        )
+                    ),
+                    None,
+                )
+                inv_root = next(
+                    (
+                        c for c in idx_by_concept
+                        if c.split(':')[-1] in (
+                            'NetCashProvidedByUsedInInvestingActivities',
+                            'NetCashProvidedByUsedInInvestingActivitiesContinuingOperations',
+                            'CashFlowsFromUsedInInvestingActivities',
+                        )
+                    ),
+                    None,
+                )
+                fin_root = next(
+                    (
+                        c for c in idx_by_concept
+                        if c.split(':')[-1] in (
+                            'NetCashProvidedByUsedInFinancingActivities',
+                            'NetCashProvidedByUsedInFinancingActivitiesContinuingOperations',
+                            'CashFlowsFromUsedInFinancingActivities',
+                        )
+                    ),
+                    None,
+                )
+                op_idx = idx_by_concept.get(op_root, -1) if op_root else -1
+                inv_idx = idx_by_concept.get(inv_root, -1) if inv_root else -1
+                fin_idx = idx_by_concept.get(fin_root, -1) if fin_root else -1
+                for idx, d in enumerate(flat_data):
+                    c_name = d.get('concept') or ''
+                    c_local = c_name.split(':')[-1]
+                    if d.get('parent_concept') or c_name in (op_root, inv_root, fin_root):
+                        continue
+                    if c_local.startswith((
+                        'NetCashProvidedByUsedIn',
+                        'CashFlowsFromUsedIn',
+                        'CashCashEquivalentsRestrictedCash',
+                        'CashAndCashEquivalentsPeriodIncreaseDecrease',
+                        'IncreaseDecreaseInCash',
+                        'CashAndCashEquivalentsAtCarryingValue',
+                        'CashAndCashEquivalents',
+                        'EffectOfExchangeRateOnCash',
+                        'InterestPaid',
+                        'IncomeTaxesPaid',
+                    )):
+                        continue
+                    if op_root and 0 <= idx < op_idx:
+                        d['parent_concept'] = op_root
+                    elif inv_root and op_idx < idx < inv_idx:
+                        d['parent_concept'] = inv_root
+                    elif fin_root and inv_idx < idx < fin_idx:
+                        d['parent_concept'] = fin_root
+
             # Break any accidental parent cycles and recompute exact 0-based level from parent_concept chain
             for d in flat_data:
                 seen = {d.get('concept')}
@@ -599,7 +689,10 @@ class EnhancedFinancialStatementProcessor:
             total_after = sum(len(item.get('dimensional_facts', [])) for item in flat_data)
             if total_before != total_after:
                 logger.debug(f"Context filters: {total_before} dimensional facts → {total_after} kept ({total_before - total_after} removed)")
-        
+
+        from core.processors.derived_concepts import enrich_statement_with_calculated_concepts
+        flat_data = enrich_statement_with_calculated_concepts(flat_data, statement_type)
+
         return flat_data
 
     def _filter_current_period_facts(self, dimensional_facts: List[Dict], filing_form_type: Optional[str] = None, 

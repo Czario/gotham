@@ -274,7 +274,6 @@ def run_agent_loop(
     try:
         for step in steps:
             provider_str = LLM_PROVIDER or "llm"
-            report_call(f"  [llm]  calling {provider_str}...")
             report_detail(f"calling {provider_str}...")
             _emit(on_event, {"event": "llm_step", "step": step, "provider": LLM_PROVIDER})
 
@@ -289,7 +288,7 @@ def run_agent_loop(
                     "Agent LLM call failed for %s — %s",
                     ticker, detail, exc_info=True,
                 )
-                report_call(f"  [llm]  ✗ provider error: {detail[:800]}")
+                report_call(f"    ✗ {provider_str} error: {detail[:300]}")
                 _emit(
                     on_event,
                     {"event": "provider_error", "step": step, "detail": detail[:800]},
@@ -297,10 +296,6 @@ def run_agent_loop(
                 raise AgentProviderError(
                     f"LLM provider failed at agent call: {detail}"
                 ) from exc
-
-            report_call(
-                f"  [timing]  llm took {_elapsed:.1f}s  ({provider_str})"
-            )
 
             messages.append(response)
 
@@ -356,13 +351,8 @@ def run_agent_loop(
                     ticker, tool_name, str(tool_args)[:120],
                 )
                 if tool_name == finalize_name:
-                    report_call(f"  [tool]  {finalize_name}()")
                     report_detail("finalizing...")
                 else:
-                    args_brief = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
-                    if len(args_brief) > 110:
-                        args_brief = args_brief[:110] + "…"
-                    report_call(f"  [tool]  {tool_name}({args_brief})")
                     report_detail(f"tool: {tool_name}")
                 _emit(
                     on_event,
@@ -405,7 +395,6 @@ def run_agent_loop(
                             )
                         else:
                             final_result = parsed
-                            report_call(f"  [tool]  ✓ {finalize_name} in {_fin_dur:.2f}s — status='done'")
                             logger.info(
                                 "Agent finalize for %s: %d key(s)",
                                 ticker, len(final_result),
@@ -459,7 +448,7 @@ def run_agent_loop(
                     step_had_non_resolving = True
 
                 tool_summary = _summarize_tool_result(tool_name, result, _tool_dur)
-                report_call(f"  [tool]  {tool_summary}")
+                logger.info("Agent tool result for %s → %s (%.1fs)", ticker, tool_summary, _elapsed)
 
                 if isinstance(result, str):
                     cap = _TOOL_RESULT_CAPS.get(tool_name, _DEFAULT_TOOL_RESULT_CAP)
