@@ -100,6 +100,31 @@ def make_decide_node(
         policy = policy_decision(bundles, findings, strict_accuracy=strict)
         decision = policy
 
+        unresolved_stmts = set(
+            (state.get("hierarchy_plan") or {}).get("unresolved_statements") or []
+        )
+        if unresolved_stmts:
+            from filings_agent.decision import ACTION_SKIP, ACTION_WRITE_PARTIAL
+
+            new_permitted = [s for s in decision.permitted if s not in unresolved_stmts]
+            new_statements = [s for s in decision.statements if s not in unresolved_stmts]
+            new_blocked = list(dict.fromkeys(list(decision.blocked) + sorted(unresolved_stmts)))
+            new_action = (
+                ACTION_SKIP
+                if not new_statements
+                else (ACTION_WRITE_PARTIAL if new_blocked else decision.action)
+            )
+            decision = WriteDecision(
+                action=new_action,
+                statements=new_statements,
+                permitted=new_permitted,
+                blocked=new_blocked,
+                drop_concepts=decision.drop_concepts,
+                decided_by=decision.decided_by,
+                reason=f"{decision.reason} (blocked unresolved hierarchy: {sorted(unresolved_stmts)})",
+            )
+            policy = decision
+
         if needs_agent_decision(policy, enabled=config.AGENT_DECISION_ENABLED):
             try:
                 from filings_agent.hooks import report_call

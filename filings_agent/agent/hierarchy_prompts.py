@@ -11,7 +11,8 @@ rearranges what you decide — you are the author of the tree.
 
 WORKFLOW (SEC PRESENTATION + ACCOUNTING BLUEPRINT):
 
-  1. Inspect context (already provided in the task prompt, or call query_filing_hierarchy() / query_hierarchy_diff() if needed).
+  1. Inspect context (the diff + SEC presentation tree are already in the prompt).
+     * When you need to verify where a new line item or dimensional segment member belongs in the filing, call `find_html_table_by_value(value="<numeric_value>")` using its exact numeric value (do NOT guess by searching member names across 60 tables). Read the matching table's header/column title and surrounding rows.
      * Preserve the SEC filing's exact top-down reading order and valid section rollups while strictly enforcing the Universal Statement Structure Blueprints below:
        - On Income Statement: Revenue, Cost of Goods Sold / Cost of Revenue, Gross Profit, Operating Expenses (or SG&A/R&D when no OperatingExpenses total exists), Operating Income, Interest/Non-operating Income/Expense, Income Before Taxes, Income Tax Expense, Net Income, EPS, and Shares are ROOTS (`parent: null`). NEVER nest Cost of Goods Sold, SG&A, Operating Income, or Interest under Revenue, and NEVER nest Income Tax or Net Income under Income Before Taxes!
        - On Balance Sheet: `us-gaap:PropertyPlantAndEquipmentNet` hangs under `us-gaap:Assets` (or `AssetsNoncurrent`), and gross PP&E items (`PropertyPlantAndEquipmentGross`, `AccumulatedDepreciation...`, `LandAndBuildings`, `FurnitureAndFixturesGross`, `LeaseholdImprovementsGross`, `ConstructionInProgressGross`) nest under `us-gaap:PropertyPlantAndEquipmentNet`.
@@ -169,9 +170,8 @@ DECISION RULES
 * Do not hide any concepts. All concepts must be placed correctly in the hierarchy.
 
 LINT & SUBMISSION WORKFLOW
-1. propose_hierarchy(rows_json, dims_json) / move_row / remove_row record your decisions.
-2. check_hierarchy() runs the FULL structural critic — always read it.
-3. Fix every finding (move_row / remove_row / propose_hierarchy) and re-run check_hierarchy() until it returns OK.
-4. Once check_hierarchy() is clean, immediately call finalize_hierarchy({"status": "done"}). Do NOT write lengthy notes or text explanations.
+1. propose_hierarchy(rows_json, dims_json) / move_row / remove_row materialize AND automatically run the full structural check inline.
+2. If the response reports `FINDINGS:`, fix them with move_row() / remove_row() / propose_hierarchy().
+3. Once it returns `OK`, immediately call finalize_hierarchy({"status": "done"}). Do NOT write lengthy notes or text explanations.
 """
 

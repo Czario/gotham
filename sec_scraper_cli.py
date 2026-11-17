@@ -546,6 +546,7 @@ class SECDataScraperApp:
         latest: bool = False,
         html_download_path: Optional[str] = None,
         enable_reconciliation: bool = True,
+        no_new_concept: bool = False,
         progress: Optional["ProgressManager"] = None,
     ):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
@@ -557,6 +558,7 @@ class SECDataScraperApp:
         self.end_year = end_year
         self.enable_dimensions = enable_dimensions
         self.enable_reconciliation = enable_reconciliation
+        self.no_new_concept = bool(no_new_concept)
         self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
         # Per-company state (sequential-only — no threading needed)
         self.current_company_data = None
@@ -2360,6 +2362,7 @@ class SECDataScraperApp:
                             cik=str(cik or ''),
                             form_type=filing_info.get('form') or filing_info.get('formType'),
                             norm_service=getattr(self, '_norm_service', None),
+                            no_new_concept=self.no_new_concept,
                         )
                         if _agent_stmts:
                             statements_data = {
@@ -2508,6 +2511,7 @@ class SECDataScraperApp:
                     company_doc=company_doc,
                     filing_date=filing_date,
                     sec_client=self.sec_client,
+                    no_new_concept=self.no_new_concept,
                 )
                 agent_state['reporting_period'] = reporting_period
                 try:
@@ -3302,6 +3306,11 @@ def main(argv: Optional[Sequence[str]] = None):
         '--fix-hierarchy', '--fix-hi', action='store_true', dest='fix_hierarchy',
         help='Fix stored hierarchy in place for the selected companies/statement '
              'using the ADK Hierarchy Agent + SEC .htm tables without re-scraping values.')
+    proc.add_argument(
+        '--no-new-concept', action='store_true', dest='no_new_concept',
+        help='Keep the stored hierarchy untouched: allow mapping incoming tags to '
+             'existing stored concepts, and skip genuinely new concepts so values '
+             'are only inserted into existing hierarchy concepts.')
 
     # --- HTML download options --------------------------------------------
     html = parser.add_argument_group('HTML filing downloads')
@@ -3471,6 +3480,7 @@ def main(argv: Optional[Sequence[str]] = None):
                 latest=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
                 enable_reconciliation=not args.no_reconciliation,
+                no_new_concept=args.no_new_concept,
                 progress=progress,
             )
             
@@ -3629,6 +3639,8 @@ def main(argv: Optional[Sequence[str]] = None):
                 print("Dimensions processing DISABLED")
             else:
                 print("Dimensions processing ENABLED - will capture segment, product, and geographic data")
+            if args.no_new_concept:
+                print("NO-NEW-CONCEPT MODE ENABLED - keeping stored hierarchy untouched (mapping only; skipping new concepts)")
             if html_download_path:
                 print(f"HTML downloading ENABLED - saving to {html_download_path}")
             elif args.no_download_html_filings:
@@ -3683,6 +3695,7 @@ def main(argv: Optional[Sequence[str]] = None):
             latest=args.latest,
             html_download_path=html_download_path,
             enable_reconciliation=not args.no_reconciliation,
+            no_new_concept=args.no_new_concept,
             progress=progress,
         )
 

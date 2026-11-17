@@ -608,6 +608,7 @@ class FinancialNormalizationService:
         *,
         enforce_allowed_types: bool = True,
         replace_existing: bool = False,
+        allow_new_concepts: bool = True,
     ) -> bool:
         """WRITES: persist an approved bundle to the target database.
 
@@ -708,7 +709,11 @@ class FinancialNormalizationService:
                 item["abstract"] = False
             try:
                 concept_id = self._get_or_create_concept(
-                    statement.company_cik, statement.statement_type, item, filing.form_type
+                    statement.company_cik,
+                    statement.statement_type,
+                    item,
+                    filing.form_type,
+                    allow_create=allow_new_concepts,
                 )
             except Exception as exc:  # noqa: BLE001 — one bad row must not lose the statement
                 logger.error(
@@ -732,30 +737,31 @@ class FinancialNormalizationService:
             for item in promoted_concepts
             if item.get('concept') and item.get('path')
         }
-        for item, concept_id in zip(promoted_concepts, promoted_ids):
-            parent = item.get('parent_concept')
-            if not concept_id or not parent:
-                continue
-            parent_id = concept_mapping.get(parent)
-            if parent_id is None:
-                continue
-            try:
-                concept_repo.collection.update_one(
-                    {'_id': concept_id},
-                    {'$set': {
-                        'parent_concept': parent,
-                        'parent_concept_id': parent_id,
-                        'parent_path': path_by_concept.get(parent),
-                    }},
-                )
-            except Exception as exc:  # noqa: BLE001 — dangling link is reported, not fatal
-                logger.warning(
-                    "persist: could not link parent for %r -> %r: %s",
-                    item.get('concept'), parent, exc,
-                )
-                self.last_write_failures.append(
-                    {"concept": item.get('concept'), "stage": "parent_link", "error": str(exc)}
-                )
+        if allow_new_concepts:
+            for item, concept_id in zip(promoted_concepts, promoted_ids):
+                parent = item.get('parent_concept')
+                if not concept_id or not parent:
+                    continue
+                parent_id = concept_mapping.get(parent)
+                if parent_id is None:
+                    continue
+                try:
+                    concept_repo.collection.update_one(
+                        {'_id': concept_id},
+                        {'$set': {
+                            'parent_concept': parent,
+                            'parent_concept_id': parent_id,
+                            'parent_path': path_by_concept.get(parent),
+                        }},
+                    )
+                except Exception as exc:  # noqa: BLE001 — dangling link is reported, not fatal
+                    logger.warning(
+                        "persist: could not link parent for %r -> %r: %s",
+                        item.get('concept'), parent, exc,
+                    )
+                    self.last_write_failures.append(
+                        {"concept": item.get('concept'), "stage": "parent_link", "error": str(exc)}
+                    )
 
         logger.info(f"Promotion: promoted {len(promoted_concepts)} concept(s) (abstract wrappers skipped)")
 
@@ -780,10 +786,12 @@ class FinancialNormalizationService:
                         assigned_order_key=dim.get('order_key'),
                         parent_header=dim.get('parent_header'),  # NEW: grouping header awareness
                         alias_target=dim.get('_concept_target'),
+                        allow_create=allow_new_concepts,
                     )
-                    dimensional_concept_mapping[(dim['parent_concept'], dim['concept'])] = dim_concept_id
-                    if dim.get('container_concept'):
-                        dimensional_concept_mapping[(dim['container_concept'], dim['concept'])] = dim_concept_id
+                    if dim_concept_id:
+                        dimensional_concept_mapping[(dim['parent_concept'], dim['concept'])] = dim_concept_id
+                        if dim.get('container_concept'):
+                            dimensional_concept_mapping[(dim['container_concept'], dim['concept'])] = dim_concept_id
                 except Exception as e:
                     logger.warning(f"Error creating dimensional concept {dim['concept']}: {e}")
 
@@ -793,7 +801,8 @@ class FinancialNormalizationService:
                 continue
             concept_id = concept_mapping.get(item['concept'])
             if not concept_id:
-                logger.warning(f"Concept ID not found for: {item['concept']}")
+                if allow_new_concepts:
+                    logger.warning(f"Concept ID not found for: {item['concept']}")
                 continue
             time_period_values = self._extract_time_period_values(item)
             for _, value in time_period_values.items():
@@ -825,6 +834,8 @@ class FinancialNormalizationService:
                         item=item,
                         dimensional_concept_mapping=dimensional_concept_mapping,
                         replace_existing=replace_existing,
+                        allow_new_concepts=allow_new_concepts,
+                        concept_mapping=concept_mapping,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.error(
@@ -1043,7 +1054,14 @@ class FinancialNormalizationService:
             logger.warning(f"Filing not found for id: {filing_id}")
         return filing
 
-    def _get_or_create_concept(self, cik: str, statement_type: str, item: dict, form_type: str = '10-K') -> ObjectId:
+    def _get_or_create_concept(
+        self,
+        cik: str,
+        statement_type: str,
+        item: dict,
+        form_type: str = '10-K',
+        allow_create: bool = True,
+    ) -> Optional[ObjectId]:
         """
         Get existing concept or create new one using the appropriate repository based on form type.
         Always prioritizes existing concepts to avoid duplicates and maintain consistency.
@@ -1100,8 +1118,14 @@ class FinancialNormalizationService:
                 )
                 self.concept_cache[(concept_key, form_type, parent_scope)] = concept_id
                 return concept_id
-            # Target concept is gone (deleted/migrated): fall through and treat
-            # the incoming concept normally below.
+            # Target concept is gone (deleted/migrated): fall through unless
+            # new-concept creation is disabled.
+            if not allow_create:
+                logger.debug(
+                    f"no-new-concept: alias target '{alias_target}' not found for "
+                    f"{cik} {statement_type}; skipping '{item['concept']}'"
+                )
+                return None
             logger.warning(
                 f"Alias target '{alias_target}' not found for {cik} {statement_type} "
                 f"— creating '{item['concept']}' as its own concept"
@@ -1163,6 +1187,10 @@ class FinancialNormalizationService:
         if existing:
             concept_id = existing['_id']
             incoming_concept = item.get('concept')
+            if not allow_create:
+                # Freeze stored hierarchy completely when --no-new-concept is active.
+                self.concept_cache[cache_key] = concept_id
+                return concept_id
             if adopted_legacy_header:
                 # The hierarchy agent approved the new placement. Repair the
                 # legacy row in place; the later parent-link phase fills in the
@@ -1215,6 +1243,22 @@ class FinancialNormalizationService:
                 if incoming_concept and incoming_concept != existing_concept:
                     update_fields["concept"] = incoming_concept
 
+                # Completely ignore 404/555 concepts: never modify their path/order_key/hide.
+                if is_polluted_path(existing.get('path')):
+                    self.concept_cache[cache_key] = concept_id
+                    return concept_id
+
+                # Fill missing path/order_key only if existing had NONE (unplaced).
+                inc_path = item.get('path')
+                if inc_path and not is_polluted_path(inc_path) and not existing.get('path'):
+                    update_fields["path"] = inc_path
+                    update_fields["hierarchy_level"] = len(str(inc_path).split('.')) - 1
+                    update_fields["level"] = update_fields["hierarchy_level"]
+                    if item.get('order_key') and not existing.get('order_key'):
+                        update_fields["order_key"] = item['order_key']
+                    if item.get('parent_concept') and not existing.get('parent_concept'):
+                        update_fields["parent_concept"] = item['parent_concept']
+
                 update_op: Dict[str, Any] = {"$set": update_fields}
                 if aliases_to_add:
                     update_op["$addToSet"] = {"aliases": {"$each": sorted(list(aliases_to_add))}}
@@ -1222,6 +1266,12 @@ class FinancialNormalizationService:
                 concept_repo.collection.update_one({'_id': concept_id}, update_op)
             logger.debug(f"Reusing existing concept: {incoming_concept} (ID: {concept_id}) - updated in-place")
         else:
+            if not allow_create:
+                logger.debug(
+                    f"no-new-concept: skipping unstored concept {item['concept']} "
+                    f"for {cik} {statement_type}"
+                )
+                return None
             # Only create new concept if it doesn't exist
             logger.debug(f"Creating new concept: {item['concept']}")
             concept_id = self._create_concept(cik, statement_type, item, form_type)
@@ -2470,6 +2520,8 @@ class FinancialNormalizationService:
         self, concept_id: ObjectId, statement, filing, item: dict,
         dimensional_concept_mapping: Dict[tuple, ObjectId],
         replace_existing: bool = False,
+        allow_new_concepts: bool = True,
+        concept_mapping: Optional[Dict[str, ObjectId]] = None,
     ) -> None:
         """Process dimensional values using pre-created dimensional concepts."""
         if 'dimensional_facts' not in item:
@@ -2520,8 +2572,9 @@ class FinancialNormalizationService:
                 )
                 
                 # Dynamic fallback: ensure all segmentation data across all companies is captured
-                if not dimensional_concept_id:
-                    parent_id = concept_mapping.get(true_parent) or concept_mapping.get(item['concept']) or concept_id
+                if not dimensional_concept_id and allow_new_concepts:
+                    cmap = concept_mapping or {}
+                    parent_id = cmap.get(true_parent) or cmap.get(item['concept']) or concept_id
                     if parent_id:
                         try:
                             dimensional_concept_id = self._get_or_create_dimensional_concept(
@@ -2530,9 +2583,11 @@ class FinancialNormalizationService:
                                 statement_type=statement.statement_type,
                                 dimension_data=dimension_data,
                                 form_type=filing.form_type,
+                                allow_create=allow_new_concepts,
                             )
-                            dimensional_concept_mapping[(item['concept'], concept)] = dimensional_concept_id
-                            dimensional_concept_mapping[(true_parent, concept)] = dimensional_concept_id
+                            if dimensional_concept_id:
+                                dimensional_concept_mapping[(item['concept'], concept)] = dimensional_concept_id
+                                dimensional_concept_mapping[(true_parent, concept)] = dimensional_concept_id
                         except Exception as e:
                             logger.warning(f"Error dynamically creating dimensional concept {concept} for {item['concept']}: {e}")
                 
@@ -2611,7 +2666,8 @@ class FinancialNormalizationService:
         assigned_order_key: Optional[str] = None,
         parent_header: Optional[str] = None,
         alias_target: Optional[str] = None,
-    ) -> ObjectId:
+        allow_create: bool = True,
+    ) -> Optional[ObjectId]:
         """
         Get existing dimensional concept or create new one using the appropriate repository based on form type.
         Always prioritizes existing concepts to avoid duplicates.
@@ -2720,7 +2776,7 @@ class FinancialNormalizationService:
                 and row.get('path') in (None, "", "404", "555", existing.get('path'))
                 and clean_label(row.get('label')) == clean_label(existing.get('label'))
             ]
-            if duplicates:
+            if duplicates and allow_create:
                 self._coalesce_dimensional_concept_rows(
                     concept_repo,
                     self._get_value_repo_by_form_type(form_type),
@@ -2731,6 +2787,10 @@ class FinancialNormalizationService:
 
         if existing:
             dimensional_concept_id = existing['_id']
+            if not allow_create:
+                # Freeze stored dimensional concept completely when --no-new-concept is active.
+                self.concept_cache[cache_key] = dimensional_concept_id
+                return dimensional_concept_id
             logger.debug(f"Reusing existing dimensional concept: {concept} (ID: {dimensional_concept_id})")
             # If found, update the segment_type if it was determined differently this time
             if existing.get('segment_type') != segment_type:
@@ -2764,9 +2824,13 @@ class FinancialNormalizationService:
             elif cleaned_existing_label and cleaned_existing_label != existing.get('label'):
                 updates['label'] = cleaned_existing_label
 
+            # Completely ignore 404/555 dimensional concepts: never change path/order_key/hide.
+            if is_polluted_path(existing.get('path')):
+                return existing['_id']
+
             # When merging or reusing any concept, KEEP existing path and order_key AS IS!
-            # Only set path/order_key if existing had NONE (unplaced legacy concept)
-            if not existing.get('path') and assigned_path:
+            # Only set path/order_key if existing had NONE (unplaced legacy concept).
+            if not existing.get('path') and assigned_path and not is_polluted_path(assigned_path):
                 updates['path'] = assigned_path
                 updates['hierarchy_level'] = len(assigned_path.split('.')) - 1
                 updates['level'] = updates['hierarchy_level']
@@ -2809,6 +2873,12 @@ class FinancialNormalizationService:
             if updates:
                 concept_repo.collection.update_one({'_id': dimensional_concept_id}, {'$set': updates})
         else:
+            if not allow_create:
+                logger.debug(
+                    f"no-new-concept: skipping unstored dimensional concept {concept} "
+                    f"for {company_cik} {statement_type}"
+                )
+                return None
             # Only create new dimensional concept if it doesn't exist
             logger.debug(f"Creating new dimensional concept: {concept}")
             dimensional_concept_id = self._create_dimensional_concept(

@@ -123,8 +123,9 @@ def build_html_table_tools(
     accession_number: Optional[str] = None,
     ticker: Optional[str] = None,
     html_dir: Optional[str] = None,
+    include_text_search: bool = True,
 ) -> list[StructuredTool]:
-    """Build ``list_html_tables``, ``read_html_table``, and ``search_html_text`` tools."""
+    """Build SEC HTML inspection tools (table-by-value, list, read, optional text search)."""
     cache: dict[str, Any] = {"loaded": False, "tables": [], "lines": []}
 
     def _ensure_loaded() -> bool:
@@ -247,7 +248,128 @@ def build_html_table_tools(
             return f"No matches for {query!r} in HTML filing."
         return f"Matches for {query!r} ({len(hits)} shown):\n" + "\n---\n".join(hits)
 
-    return [
+    def _value_search_tokens(raw_val: Any) -> list[tuple[str, int]]:
+        """Build formatted numeric string variants (token, priority) at scales 1, 1e3, 1e6."""
+        try:
+            s = str(raw_val).strip().replace(",", "").replace("$", "")
+            if s.startswith("(") and s.endswith(")"):
+                s = "-" + s[1:-1].strip()
+            num = abs(float(s))
+        except (TypeError, ValueError):
+            tok = str(raw_val or "").strip()
+            return [(tok, 0)] if tok else []
+        if num == 0:
+            return [("0", 0)]
+        tokens: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for scale, prio in ((1.0, 3), (1_000.0, 3), (1_000_000.0, 3)):
+            scaled = num / scale
+            if scaled < 0.05:
+                continue
+            if abs(scaled - round(scaled)) < 1e-6:
+                iv = int(round(scaled))
+                for fmt in (f"{iv:,}", str(iv)):
+                    if fmt not in seen:
+                        seen.add(fmt)
+                        tokens.append((fmt, prio))
+            else:
+                for dec, p in ((1, 2), (2, 1)):
+                    fmt_c = f"{scaled:,.{dec}f}"
+                    fmt_p = f"{scaled:.{dec}f}"
+                    for fmt in (fmt_c, fmt_p):
+                        if fmt not in seen:
+                            seen.add(fmt)
+                            tokens.append((fmt, p))
+        return tokens
+
+    def find_html_table_by_value(value: str, label_hint: str = "") -> str:
+        """Find SEC HTML tables containing a numeric fact value (auto-checks thousands/millions/ones).
+
+        Pass the exact numeric value (e.g. '1779434000' or '-44000000') and optional
+        label_hint (e.g. 'Restructuring' or 'Americas') to prioritize matching tables/rows.
+        """
+        if not _ensure_loaded():
+            return "HTML filing not available locally for this accession."
+        tokens = _value_search_tokens(value)
+        if not tokens:
+            return "Pass a non-empty numeric value to search."
+        raw_s = str(value).strip()
+        want_neg = raw_s.startswith("-") or (raw_s.startswith("(") and raw_s.endswith(")"))
+        hint_words = [w for w in re.split(r"[^a-z0-9]+", (label_hint or "").lower()) if len(w) >= 3]
+        tables = cache["tables"]
+        hits: list[tuple[int, int, int, str]] = []  # (-prio, table_id, row_idx, matched_tok)
+        seen_table_rows: set[tuple[int, int]] = set()
+        for tbl in tables:
+            tid = tbl["table_id"]
+            hdr_blob = (tbl["title"] + " " + " ".join(" ".join(r) for r in tbl["rows"][:3])).lower()
+            for r_idx, row in enumerate(tbl["rows"]):
+                if (tid, r_idx) in seen_table_rows:
+                    continue
+                row_blob = " ".join(row).lower()
+                best_prio = -1
+                best_tok = ""
+                for cell in row:
+                    norm_cell = re.sub(r"[\s()$]+", "", cell)
+                    if not norm_cell:
+                        continue
+                    cell_is_neg = "(" in cell or cell.strip().startswith("-")
+                    for tok, prio in tokens:
+                        tok_plain = tok.replace(",", "")
+                        if norm_cell == tok or norm_cell == tok_plain or cell.strip("() $") == tok:
+                            score = prio
+                            if want_neg and cell_is_neg:
+                                score += 10
+                            elif want_neg and not cell_is_neg:
+                                score -= 1
+                            if hint_words:
+                                score += 5 * sum(1 for w in hint_words if w in row_blob)
+                                score += 2 * sum(1 for w in hint_words if w in hdr_blob)
+                            if score > best_prio:
+                                best_prio = score
+                                best_tok = tok
+                if best_prio >= 0:
+                    seen_table_rows.add((tid, r_idx))
+                    hits.append((-best_prio, tid, r_idx, best_tok))
+
+        if not hits:
+            sample = ", ".join(t for t, _ in tokens[:6])
+            return f"No HTML table cell matched {value!r} (tried: {sample})."
+
+        hits.sort()
+        out: list[str] = [f"Found {len(hits)} table match(es) for value {value!r}:"]
+        shown_tables = 0
+        seen_tids: set[int] = set()
+        for _, tid, r_idx, mtok in hits:
+            if tid in seen_tids:
+                continue
+            seen_tids.add(tid)
+            shown_tables += 1
+            if shown_tables > 4:
+                break
+            tbl = tables[tid]
+            rows = tbl["rows"]
+            out.append(
+                f"\n--- table_id={tid} | title={tbl['title'] or '(none)'} | matched={mtok!r} at row [{r_idx}] ---"
+            )
+            header_end = min(3, len(rows))
+            for h_idx in range(header_end):
+                marker = ">>> " if h_idx == r_idx else "    "
+                out.append(f"{marker}[{h_idx}] " + " | ".join(rows[h_idx]))
+            ctx_lo = max(header_end, r_idx - 5)
+            ctx_hi = min(len(rows), r_idx + 6)
+            if ctx_lo > header_end:
+                out.append("    ...")
+            for j in range(ctx_lo, ctx_hi):
+                marker = ">>> " if j == r_idx else "    "
+                out.append(f"{marker}[{j}] " + " | ".join(rows[j]))
+        return "\n".join(out)
+
+    tools = [
+        StructuredTool.from_function(
+            func=find_html_table_by_value,
+            name="find_html_table_by_value",
+            description="Find SEC .htm tables containing an exact numeric fact value (automatically checks units in ones/thousands/millions) and show column headers + surrounding rows.",
+        ),
         StructuredTool.from_function(
             func=list_html_tables,
             name="list_html_tables",
@@ -258,9 +380,13 @@ def build_html_table_tools(
             name="read_html_table",
             description="Read rows from a specific SEC .htm table_id (shows exact labels, numbers, and parentheses for negatives).",
         ),
-        StructuredTool.from_function(
-            func=search_html_text,
-            name="search_html_text",
-            description="Search the SEC .htm filing text for unit notes ('in thousands'/'in millions'), statement headings, or line items.",
-        ),
     ]
+    if include_text_search:
+        tools.append(
+            StructuredTool.from_function(
+                func=search_html_text,
+                name="search_html_text",
+                description="Search the SEC .htm filing text for unit notes ('in thousands'/'in millions'), statement headings, or line items.",
+            )
+        )
+    return tools

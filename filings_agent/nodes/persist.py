@@ -15,6 +15,7 @@ implicit write.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Callable
 
@@ -112,13 +113,15 @@ def make_persist_node(
             f"({plan.get('action')} by {plan.get('decided_by')})"
         )
 
+        no_new_concept = bool(state.get("no_new_concept"))
         # Newest-period concept promotion.  The resolve node decided that an
         # incoming tag is EQUIVALENT to a stored concept AND belongs to a newer
         # period; execute the merge here, before the write, so the bundle is
         # persisted under the promoted (winning) concept.  Values are only
         # repointed — never deleted — and the losing concept row is deleted.
         # Scoped to this filing's form type (10-K and 10-Q never cross).
-        promotions = state.get("concept_promotions") or []
+        # Disabled under --no-new-concept so stored concepts stay untouched.
+        promotions = [] if no_new_concept else (state.get("concept_promotions") or [])
         promotion_receipts: list[dict] = []
         if promotions:
             report_call(
@@ -173,10 +176,23 @@ def make_persist_node(
                 continue
 
             try:
+                persist_kwargs: dict[str, Any] = {
+                    "enforce_allowed_types": enforce_allowed_types,
+                    "replace_existing": bool(state.get("replace_existing")),
+                }
+                if no_new_concept:
+                    try:
+                        sig = inspect.signature(norm_service.persist_statement_bundle)
+                        if "allow_new_concepts" in sig.parameters or any(
+                            p.kind == inspect.Parameter.VAR_KEYWORD
+                            for p in sig.parameters.values()
+                        ):
+                            persist_kwargs["allow_new_concepts"] = False
+                    except (TypeError, ValueError):
+                        pass
                 wrote = norm_service.persist_statement_bundle(
                     bundle,
-                    enforce_allowed_types=enforce_allowed_types,
-                    replace_existing=bool(state.get("replace_existing")),
+                    **persist_kwargs,
                 )
                 for defect in (getattr(norm_service, "last_write_failures", None) or []):
                     write_errors.append({"statement_type": statement_type, **defect})
@@ -245,14 +261,14 @@ def make_persist_node(
         # Apply hierarchy repairs (re-pathing duplicate paths, moving non-relevant to path 555)
         hierarchy_plan = state.get("hierarchy_plan") or {}
         existing_updates = hierarchy_plan.get("existing_updates") or []
-        if existing_updates and hasattr(norm_service, "apply_hierarchy_updates"):
+        if not no_new_concept and existing_updates and hasattr(norm_service, "apply_hierarchy_updates"):
             try:
                 norm_service.apply_hierarchy_updates(existing_updates)
                 logger.info("persist: applied %d hierarchy update(s)", len(existing_updates))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("persist: could not apply hierarchy updates: %s", exc)
 
-        if hasattr(norm_service, "update_hierarchy_seed_metadata"):
+        if not no_new_concept and hasattr(norm_service, "update_hierarchy_seed_metadata"):
             try:
                 norm_service.update_hierarchy_seed_metadata(state.get("cik"), hierarchy_plan)
             except Exception as exc:  # noqa: BLE001

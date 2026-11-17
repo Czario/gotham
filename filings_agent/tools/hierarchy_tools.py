@@ -260,6 +260,11 @@ def _sanitize_proposed_rows(
             sibling_counts[p] += 1
             r["order"] = sibling_counts[p]
 
+    # Never hide any concept proposed by the agent.
+    for r in rows:
+        if r.get("hide"):
+            r["hide"] = False
+
     return rows
 
 
@@ -277,14 +282,14 @@ def build_unified_hierarchy_tools(
     identity_order_keys: dict | None = None,
     materialize: Any = None,
     sec_presentation: dict | None = None,
+    no_new_concept: bool = False,
 ) -> list[Any]:
-    """Build the hierarchy agent's toolset.
+    """Build the hierarchy agent's clean action toolset and pre-computed context.
 
-    ``proposal`` is a mutable dict the tools write decisions / rows / dims into.
-    ``materialize`` (plus the stored-identity maps) lets ``preview_hierarchy``
-    encode the proposal into the exact paths/order_keys that would be written,
-    so the agent checks the real result before finalizing — nothing is encoded
-    after the loop.
+    ``proposal`` is populated with ``_context_dump`` and ``_sec_pres_dump`` so
+    the agent receives all context upfront in ``task`` without burning LLM turns
+    on redundant read tools. ``propose_hierarchy`` / ``move_row`` / ``remove_row``
+    materialize and structurally lint inline.
     """
     stored_names = {r.get("concept") for r in stored_rows if r.get("concept")}
     filing_names = {r.get("concept") for r in filing_rows if r.get("concept")}
@@ -301,36 +306,7 @@ def build_unified_hierarchy_tools(
     cadence = "Annual (10-K/20-F)" if is_annual_form(form_type) else "Quarterly (10-Q)"
     scope_banner = f"[{company_cik or '?'} | {statement_type.upper() or 'STATEMENT'} | {cadence}]"
 
-    @tool
-    def query_stored_hierarchy() -> str:
-        """Show the FULL existing stored tree for this company+statement (all
-        periods), including dimensional members. Read this first."""
-        if not stored_rows:
-            return f"NO STORED HIERARCHY for {scope_banner} (this is a fresh seed). Build the whole tree from query_filing_hierarchy()."
-        dims = [r for r in stored_rows if r.get("dimension_concept")]
-        main = [r for r in stored_rows if not r.get("dimension_concept")]
-
-        def _parent_of_path(p: Any) -> str:
-            p = str(p or "")
-            return p.rsplit(".", 1)[0] if "." in p else ""
-
-        # Sibling order comes from order_key (path numbers may not match the
-        # visual order after a mid-tree insertion), so sort by parent + order_key.
-        main.sort(key=lambda r: (
-            _parent_of_path(r.get("path")),
-            str(r.get("order_key") or ""),
-            str(r.get("path") or ""),
-        ))
-        dims.sort(key=lambda r: (str(r.get("parent_concept") or ""), str(r.get("concept") or "")))
-        return (
-            f"STORED MAIN ROWS {scope_banner} ({len(main)}):\n" + "\n".join(fmt_row(r) for r in main)
-            + f"\n\nSTORED DIMENSIONAL MEMBERS ({len(dims)}):\n"
-            + "\n".join(fmt_row(r) for r in dims)
-        )
-
-    @tool
-    def query_filing_hierarchy() -> str:
-        """Show this filing's extracted line items and dimensional members."""
+    def _format_filing_hierarchy() -> str:
         from filings_agent.nodes.hierarchy_agent import build_parent_specific_segmentation_header
 
         main = [r for r in filing_rows if not r.get("dimension_concept")]
@@ -351,34 +327,29 @@ def build_unified_hierarchy_tools(
             + f"\n\nFILING DIMENSIONAL MEMBERS ({len(dims)}):\n"
             + "\n".join(fmt_dim(r) for r in dims)
         )
-        if sec_presentation:
-            from core.extractors.sec_presentation_extractor import format_sec_presentation_tree
-            sec_str = format_sec_presentation_tree(sec_presentation, statement_type)
-            if not sec_str.startswith("No raw SEC"):
-                out += f"\n\n{sec_str}"
         return out
 
-    @tool
-    def query_sec_presentation_tree() -> str:
-        """Show the exact SEC filing presentation linkbase (`_pre.xml`), calculation rollups (`_cal.xml`), and comparative periods."""
+    def _format_sec_presentation_tree() -> str:
+        if not sec_presentation:
+            return ""
         from core.extractors.sec_presentation_extractor import format_sec_presentation_tree
-        return format_sec_presentation_tree(sec_presentation, statement_type)
+        sec_str = format_sec_presentation_tree(sec_presentation, statement_type)
+        return "" if sec_str.startswith("No raw SEC") else sec_str
 
-    @tool
-    def query_hierarchy_diff() -> str:
-        """Compare this filing's concepts against the stored database hierarchy.
-
-        Returns:
-          - MATCHED: filing concepts already present in stored DB tree (reuse their parent and placement).
-          - NEW INCOMING: concepts in this filing not yet in DB (must either merge via decide_mapping or insert into propose_hierarchy).
-          - STORED GROUPING HEADERS: custom headers already in DB (reuse them in parent_header / rows).
-          - STORED ABSENT: concepts in DB but not in this specific filing.
-        """
+    def _format_hierarchy_diff() -> str:
         if not stored_rows:
             return f"NO STORED HIERARCHY for {scope_banner} (this is a fresh seed). All filing concepts are new. Build the whole tree from query_filing_hierarchy()."
 
-        stored_main_map = {r.get("concept"): r for r in stored_rows if not r.get("dimension_concept") and r.get("concept")}
-        stored_dims_map = {r.get("concept"): r for r in stored_rows if r.get("dimension_concept") and r.get("concept")}
+        stored_main_map = {
+            r.get("concept"): r
+            for r in stored_rows
+            if not r.get("dimension_concept") and r.get("concept") and r.get("path")
+        }
+        stored_dims_map = {
+            (r.get("parent_concept") or r.get("parent"), r.get("concept")): r
+            for r in stored_rows
+            if r.get("dimension_concept") and r.get("concept") and r.get("path")
+        }
         stored_headers = [r for r in stored_rows if str(r.get("concept", "")).startswith("custom:")]
 
         stored_main_sorted = sorted(
@@ -394,9 +365,15 @@ def build_unified_hierarchy_tools(
         filing_dims = [r for r in filing_rows if r.get("dimension_concept") and r.get("concept")]
 
         matched_main = [r for r in filing_main if r["concept"] in stored_main_map]
-        matched_dims = [r for r in filing_dims if r["concept"] in stored_dims_map]
+        matched_dims = [
+            r for r in filing_dims
+            if (r.get("parent_concept") or r.get("parent"), r["concept"]) in stored_dims_map
+        ]
         new_main = [r for r in filing_main if r["concept"] not in stored_main_map]
-        new_dims = [r for r in filing_dims if r["concept"] not in stored_dims_map]
+        new_dims = [
+            r for r in filing_dims
+            if (r.get("parent_concept") or r.get("parent"), r["concept"]) not in stored_dims_map
+        ]
 
         all_filing_concepts = {r.get("concept") for r in filing_rows if r.get("concept")}
         stored_absent = [r for r in stored_rows if r.get("concept") not in all_filing_concepts]
@@ -482,7 +459,8 @@ def build_unified_hierarchy_tools(
                 else:
                     parent_info = "Filing Parent: None (reported as root in filing linkbase)"
 
-                lines.append(f"  * [NEW LINE ITEM] {c} (\"{lbl}\"){incoming_period}")
+                val_str = f" | value={r.get('value')}" if r.get("value") is not None else ""
+                lines.append(f"  * [NEW LINE ITEM] {c} (\"{lbl}\"){val_str}{incoming_period}")
                 lines.append(f"      {parent_info}{cand_str}")
                 for s_line in siblings_info:
                     lines.append(f"      {s_line}")
@@ -534,7 +512,8 @@ def build_unified_hierarchy_tools(
                 if dim_cands:
                     extra.append(f"High-Probability Alias Candidates to merge via decide_mapping: {[dc[1] for dc in dim_cands[:3]]}")
                 extra_str = f"\n      ({'; '.join(extra)})" if extra else ""
-                lines.append(f"  * [NEW DIM MEMBER] {c} (\"{lbl}\"){extra_str}")
+                val_str = f" | value={r.get('value')}" if r.get("value") is not None else ""
+                lines.append(f"  * [NEW DIM MEMBER] {c} (\"{lbl}\"){val_str}{extra_str}")
                 lines.append("")
             lines.append("=" * 60)
             lines.append("")
@@ -601,14 +580,18 @@ def build_unified_hierarchy_tools(
                 "keep_tag": "stored",
                 "reason": parsed.get("reason") or "",
             }
+            if no_new_concept:
+                return f"OK — '{concept}' left unmapped (will be skipped under --no-new-concept)."
             return f"OK — '{concept}' will be created as its own row."
 
         incoming_period = filing_period_by_concept.get(concept)
         stored_period = stored_period_by_concept.get(same_as)
-        # Tag ownership follows the latest observed financial period. Promote
-        # only when both sides can be compared and the incoming fact is strictly
-        # newer; missing history or a tie keeps the established stored identity.
-        if (
+        # In --no-new-concept mode the stored hierarchy is strictly locked: never
+        # rename/promote stored concept tags, always keep the stored tag and path.
+        if no_new_concept:
+            keep_tag = "stored"
+            period_decision = "Stored concept locked (--no-new-concept); attaching values only."
+        elif (
             incoming_period is not None
             and stored_period is not None
             and incoming_period > stored_period
@@ -988,20 +971,21 @@ def build_unified_hierarchy_tools(
         proposal["dims"] = cur_dims
 
         _build_preview()
+        proposal["_preview_checked"] = True
+        lint_report = _run_linter()
 
         row_concepts = {r.get("concept") for r in proposal["rows"] if isinstance(r, dict)}
         unknown = [c for c in row_concepts if c not in known_names and not str(c).startswith("custom:")]
-        if unknown:
-            sorted_unknown = sorted(str(c) for c in unknown if c is not None)
-            return (
-                f"OK — recorded {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s) "
-                f"(note: unknown concepts {sorted_unknown[:10]}). Call finalize_hierarchy() now."
-            )
-        return (
-            f"OK — hierarchy recorded and materialized: "
-            f"{len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s). "
-            "Call finalize_hierarchy() now."
+        status_note = f" (note: unknown concepts {sorted(str(c) for c in unknown if c is not None)[:10]})" if unknown else ""
+        summary_line = (
+            f"Recorded and materialized {len(proposal['rows'])} row(s) and {len(proposal['dims'])} dim(s){status_note}."
         )
+        if lint_report.startswith("FINDINGS:"):
+            return (
+                f"{summary_line}\n{lint_report}\n"
+                "Fix structural issues via move_row() / remove_row() / propose_hierarchy(), or call finalize_hierarchy() if done."
+            )
+        return f"OK — {summary_line} Structural check clean. Call finalize_hierarchy() now."
 
     @tool
     def move_row(row_json: str) -> str:
@@ -1049,9 +1033,11 @@ def build_unified_hierarchy_tools(
         where = "dimensional members" if is_dim else "rows"
         (proposal["dims"] if is_dim else proposal["rows"]).append(spec)
         _build_preview()
-        return (
-            f"OK — '{concept}' moved to parent={parent!r} in {where}."
-        )
+        proposal["_preview_checked"] = True
+        lint_report = _run_linter()
+        if lint_report.startswith("FINDINGS:"):
+            return f"Moved '{concept}' to parent={parent!r} in {where}.\n{lint_report}"
+        return f"OK — '{concept}' moved to parent={parent!r} in {where}. Structural check clean. Call finalize_hierarchy() now."
 
     @tool
     def remove_row(row_json: str) -> str:
@@ -1087,7 +1073,11 @@ def build_unified_hierarchy_tools(
             {"concept": concept} if parent is None else {"concept": concept, "parent": parent}
         )
         _build_preview()
-        return f"OK — removed {before - after} entr(y/ies) for '{concept}'."
+        proposal["_preview_checked"] = True
+        lint_report = _run_linter()
+        if lint_report.startswith("FINDINGS:"):
+            return f"Removed {before - after} entr(y/ies) for '{concept}'.\n{lint_report}"
+        return f"OK — removed {before - after} entr(y/ies) for '{concept}'. Structural check clean."
 
     def _structural_findings(rows: list[dict], dims: list[dict], materialized: bool = True) -> list[str]:
         """Structural critic.  Path-based checks run only when the rows carry
@@ -1242,23 +1232,6 @@ def build_unified_hierarchy_tools(
             return "OK — no structural issues found."
         return "FINDINGS:\n" + "\n".join(f"  - {x}" for x in problems)
 
-    @tool
-    def lint_hierarchy() -> str:
-        """Report structural issues in your CURRENT proposal."""
-        return _run_linter()
-
-    @tool
-    def check_hierarchy() -> str:
-        """Run the FULL structural critic over your proposal (materialised).
-
-        Reports: duplicate paths, (path, order_key) collisions, missing parents,
-        whole-statement wrapper headers, flat dims, duplicate header names,
-        unplaced rows and non-sequential order keys.  Fix EVERY finding with
-        move_row() / remove_row() / propose_hierarchy(), re-check, and only call
-        finalize_hierarchy() once this returns OK.
-        """
-        return _run_linter()
-
     def _build_preview() -> tuple[list, list] | None:
         """Encode the proposal AND freeze it as the agent-checked payload."""
         res = _materialize_tree()
@@ -1297,100 +1270,34 @@ def build_unified_hierarchy_tools(
             identity_order_keys=identity_order_keys or {},
         )
 
-    @tool
-    def preview_hierarchy() -> str:
-        """Encode the current proposal into the EXACT paths/order_keys that will be
-        persisted, and show them.  Call this after propose_hierarchy() to check
-        the real result; revise and re-preview until it is correct, then finalize."""
-        res = _build_preview()
-        if res is None:
-            return "Preview unavailable."
-        rows, dims = res
-        proposal["_preview_checked"] = True
-        problems: list[str] = []
-        # The insert guard is (path, order_key) per dimension class, so check
-        # BOTH main rows and dimensional members — a dim placed directly under
-        # a line item can otherwise collide with a custom grouping header.
-        all_items = [("row", r) for r in rows] + [("dim", d) for d in dims]
-        seen_paths: dict[str, list[str]] = defaultdict(list)
-        seen_pok: dict[tuple, list[str]] = defaultdict(list)
-        for kind, item in all_items:
-            p = str(item.get("path") or "")
-            o = str(item.get("order_key") or "")
-            c = str(item.get("concept") or "?")
-            if p and p != "555":
-                seen_paths[p].append(f"{c}[{kind}]")
-                if o:
-                    seen_pok[(p, o, kind)].append(c)
-        for p, names in seen_paths.items():
-            if len(names) > 1:
-                problems.append(f"duplicate path {p} claimed by {names}")
-        for (p, o, _kind), names in seen_pok.items():
-            if len(set(names)) > 1:
-                problems.append(f"duplicate (path={p}, order_key={o}) by {sorted(set(names))}")
-        lines = [
-            f"PREVIEW — {len(rows)} row(s), {len(dims)} dim(s) (exact values that will be persisted):"
-        ]
-        for r in rows:
-            lines.append("  " + fmt_row(r))
-        if dims:
-            lines.append("  DIMENSIONAL MEMBERS:")
-            for d in dims:
-                lines.append("  " + fmt_row(d))
-        if problems:
-            lines.append("\nCHECK FAILURES (fix before finalizing):")
-            lines.extend(f"  - {x}" for x in problems)
-            lines.append(
-                "  → revise propose_hierarchy() to move one of the conflicting rows, then preview again."
-            )
-        else:
-            lines.append("\n✓ no duplicate paths or path/order_key collisions. If this tree is correct, call finalize_hierarchy().")
-        return "\n".join(lines)
-
     from ..adk.builtin_tools import (
-        InMemoryArtifactService,
         build_adk_exit_loop_tool,
-        build_adk_load_artifacts_tool,
         wrap_custom_function_tool,
     )
 
-    artifact_service = InMemoryArtifactService()
-    if sec_presentation:
-        artifact_service.save_artifact("sec_presentation", sec_presentation)
-    artifact_service.save_artifact("filing_rows", filing_rows)
-    if stored_rows:
-        artifact_service.save_artifact("stored_rows", stored_rows)
+    proposal["_context_dump"] = _format_hierarchy_diff() if stored_rows else _format_filing_hierarchy()
+    proposal["_sec_pres_dump"] = _format_sec_presentation_tree()
 
-    adk_load_artifacts = build_adk_load_artifacts_tool(artifact_service)
     adk_exit_loop = build_adk_exit_loop_tool(proposal)
 
-    if not stored_rows:
+    if no_new_concept:
         raw_tools = [
-            query_stored_hierarchy,
-            query_filing_hierarchy,
-            query_sec_presentation_tree,
+            decide_mapping,
+            adk_exit_loop,
+        ]
+    elif not stored_rows:
+        raw_tools = [
             propose_hierarchy,
             move_row,
             remove_row,
-            preview_hierarchy,
-            check_hierarchy,
-            lint_hierarchy,
-            adk_load_artifacts,
             adk_exit_loop,
         ]
     else:
         raw_tools = [
-            query_stored_hierarchy,
-            query_hierarchy_diff,
-            query_sec_presentation_tree,
             decide_mapping,
             propose_hierarchy,
             move_row,
             remove_row,
-            preview_hierarchy,
-            check_hierarchy,
-            lint_hierarchy,
-            adk_load_artifacts,
             adk_exit_loop,
         ]
     return [wrap_custom_function_tool(t) for t in raw_tools]

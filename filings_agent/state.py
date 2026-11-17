@@ -77,6 +77,7 @@ class FilingAgentState(TypedDict):
     existing_concepts: NotRequired[Optional[list]]
     hierarchy_plan: NotRequired[Optional[dict]]
     hierarchy_seeded: NotRequired[Optional[bool]]
+    no_new_concept: NotRequired[Optional[bool]]
 
     # ── concept resolution (P5b) ───────────────────────────────────────────
     # Summary of the agent's concept-equivalence decisions for this filing.
@@ -112,6 +113,7 @@ def new_state(
     company_doc: Optional[dict] = None,
     filing_date: Optional[str] = None,
     sec_client: Optional[Any] = None,
+    no_new_concept: bool = False,
 ) -> FilingAgentState:
     """Build an initial graph state for one filing."""
     return FilingAgentState(
@@ -126,6 +128,7 @@ def new_state(
         company_doc=company_doc or {},
         filing_date=filing_date,
         sec_client=sec_client,
+        no_new_concept=no_new_concept,
     )
 
 

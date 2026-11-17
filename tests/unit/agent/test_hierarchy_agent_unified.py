@@ -134,11 +134,6 @@ class _StubChat:
                           "args": {"rows_json": json.dumps(self.rows),
                                    "dims_json": json.dumps(self.dims)}, "id": "p1"})
             return AIMessage(content="", tool_calls=calls)
-        if self.step == 2:
-            # The agent must CHECK the materialized result before finalizing.
-            return AIMessage(content="", tool_calls=[
-                {"name": "preview_hierarchy", "args": {}, "id": "pv1"},
-            ])
         return AIMessage(content="", tool_calls=[
             {"name": "finalize_hierarchy",
              "args": {"result_json": json.dumps({"confirmed": True, "notes": "ok"})}, "id": "f1"},
@@ -370,8 +365,7 @@ def test_query_hierarchy_diff_and_header_consistency_lint():
     tools = build_unified_hierarchy_tools(stored, filing, proposal)
     tools_by_name = {t.name: t for t in tools}
 
-    assert "query_hierarchy_diff" in tools_by_name
-    diff_output = tools_by_name["query_hierarchy_diff"].invoke({})
+    diff_output = proposal.get("_context_dump", "")
     assert "MATCHED" in diff_output
     assert "us-gaap:Revenues" in diff_output
     assert "NEW INCOMING CONCEPTS" in diff_output
@@ -379,15 +373,14 @@ def test_query_hierarchy_diff_and_header_consistency_lint():
     assert "EXISTING STORED GROUPING HEADERS" in diff_output
     assert "custom:ProductSegmentation" in diff_output
 
-    # Test linter catches duplicate header spelling
-    tools_by_name["propose_hierarchy"].invoke({
+    # Test inline linter inside propose_hierarchy catches duplicate header spelling
+    lint_report = tools_by_name["propose_hierarchy"].invoke({
         "rows_json": json.dumps([
             {"concept": "us-gaap:Revenues", "parent": None, "order": 1},
             {"concept": "custom:ProductSegment", "parent": "us-gaap:Revenues", "order": 1}, # typo/inconsistent header
         ]),
         "dims_json": "[]",
     })
-    lint_report = tools_by_name["lint_hierarchy"].invoke({})
     assert "Reuse existing header" in lint_report
 
 
@@ -409,12 +402,16 @@ def test_propose_hierarchy_incremental_additions_merge():
     tools = build_unified_hierarchy_tools(stored, filing, proposal)
     tools_by_name = {t.name: t for t in tools}
 
-    # query_stored_hierarchy is now exposed on incremental so the agent sees the
-    # full stored tree before re-proposing the complete ordered tree.
-    assert "query_stored_hierarchy" in tools_by_name
-    assert "query_filing_hierarchy" not in tools_by_name
-    assert "query_hierarchy_diff" in tools_by_name
-    assert "preview_hierarchy" in tools_by_name
+    # Pre-computed context lives in proposal["_context_dump"]; only action tools
+    # are exposed to the LLM so it never burns turns on redundant reads/lints.
+    assert set(tools_by_name) == {
+        "decide_mapping",
+        "propose_hierarchy",
+        "move_row",
+        "remove_row",
+        "exit_loop",
+    }
+    assert "_context_dump" in proposal
 
     # Agent passes ONLY the NEW items in propose_hierarchy (partial merge);
     # stored rows are merged back with explicit positional ranks.
@@ -513,17 +510,16 @@ def test_incremental_merge_preserves_stored_order_keys_no_drift():
         materialize=_materialize,
     )
     tb = {t.name: t for t in tools}
-    assert "preview_hierarchy" in tb
-    assert "query_stored_hierarchy" in tb
+    assert "propose_hierarchy" in tb
+    assert "_context_dump" in proposal
 
-    tb["propose_hierarchy"].invoke({
+    res = tb["propose_hierarchy"].invoke({
         "rows_json": json.dumps([
             {"concept": "us-gaap:CloudMember", "parent": "us-gaap:Revenues", "order": 4},
         ]),
         "dims_json": "[]",
     })
-    preview = tb["preview_hierarchy"].invoke({})
-    assert "no duplicate paths" in preview
+    assert "Structural check clean" in res
 
     rows = proposal["_preview"]["rows"]
     by = {r["concept"]: r for r in rows}
@@ -620,10 +616,11 @@ def test_agentic_critic_and_move_remove_tools():
         materialize=_materialize,
     )
     tb = {t.name: t for t in tools}
-    assert {"check_hierarchy", "move_row", "remove_row"} <= set(tb)
+    assert {"propose_hierarchy", "move_row", "remove_row"} <= set(tb)
 
-    # Agent proposes a spurious whole-statement wrapper ROOT and a missing parent.
-    tb["propose_hierarchy"].invoke({
+    # Agent proposes a spurious whole-statement wrapper ROOT and a missing parent;
+    # propose_hierarchy runs the inline structural critic automatically.
+    report = tb["propose_hierarchy"].invoke({
         "rows_json": json.dumps([
             {"concept": "custom:OperatingActivitiesSection", "parent": None, "order": 1, "abstract": True},
             {"concept": "us-gaap:NetCashProvidedByUsedInOperatingActivities",
@@ -633,7 +630,6 @@ def test_agentic_critic_and_move_remove_tools():
         ]),
         "dims_json": "[]",
     })
-    report = tb["check_hierarchy"].invoke({})
     assert "whole-statement wrapper" in report
     assert "GhostParent" in report
 
@@ -642,12 +638,10 @@ def test_agentic_critic_and_move_remove_tools():
     tb["move_row"].invoke({"row_json": json.dumps({
         "concept": "us-gaap:NetCashProvidedByUsedInOperatingActivities", "parent": None, "position": 1,
     })})
-    tb["move_row"].invoke({"row_json": json.dumps({
+    report2 = tb["move_row"].invoke({"row_json": json.dumps({
         "concept": "us-gaap:DepreciationDepletionAndAmortization",
         "parent": "us-gaap:NetCashProvidedByUsedInOperatingActivities", "position": 2,
     })})
-
-    report2 = tb["check_hierarchy"].invoke({})
     assert "whole-statement wrapper" not in report2
     assert "GhostParent" not in report2
 
@@ -734,9 +728,10 @@ def test_incremental_new_dims_route_to_agent_with_html_tools(monkeypatch):
                 "bundles": [bundle]})
 
     assert out["status"] == "hierarchy_agent_done"
+    assert "find_html_table_by_value" in seen_tools
     assert "list_html_tables" in seen_tools
     assert "read_html_table" in seen_tools
-    assert "search_html_text" in seen_tools
+    assert "search_html_text" not in seen_tools
 
 
 def test_programmatic_incremental_fast_path_hands_over_to_llm_on_alias_candidate(monkeypatch):
@@ -954,6 +949,202 @@ def test_new_root_between_existing_roots_uses_fractional_lexicographic_order_key
     # 3. New child under Revenues gets next incremental order key 'd' (after a, b, c)
     assert by["custom:NewHardwareRevenue"]["path"] == "001.004"
     assert by["custom:NewHardwareRevenue"]["order_key"] == "d"
+
+
+class _MappingOnlyStubChat:
+    """Stub LLM for --no-new-concept: calls decide_mapping then finalize_hierarchy."""
+
+    def __init__(self, decisions=None):
+        self.decisions = list(decisions or [])
+        self.step = 0
+        self.tools = []
+
+    def bind_tools(self, tools):
+        self.tools = tools
+        return self
+
+    def invoke(self, messages):
+        self.step += 1
+        if self.step == 1 and self.decisions:
+            calls = [
+                {"name": "decide_mapping", "args": {"concept_json": json.dumps(d)}, "id": f"m{i}"}
+                for i, d in enumerate(self.decisions)
+            ]
+            return AIMessage(content="", tool_calls=calls)
+        return AIMessage(content="", tool_calls=[
+            {"name": "finalize_hierarchy",
+             "args": {"result_json": json.dumps({"confirmed": True, "notes": "mapped"})}, "id": "f1"},
+        ])
+
+
+def test_no_new_concept_blocks_when_no_stored_hierarchy():
+    bundle = _bundle([
+        {"concept": "us-gaap:Revenues", "label": "Revenues", "value": 1000.0},
+    ])
+    llm = _MappingOnlyStubChat()
+    node = make_hierarchy_agent_node(_Service([]), chat_llm=llm)
+    out = node({
+        "cik": "0000320193", "ticker": "AAPL", "status": "validated",
+        "no_new_concept": True, "bundles": [bundle],
+    })
+    assert out["status"] == "hierarchy_agent_done"
+    assert (out.get("hierarchy_plan") or {}).get("unresolved_statements") == ["income"]
+    assert llm.step == 0  # never invokes LLM when there is no stored hierarchy
+
+
+def test_no_new_concept_maps_aliases_and_skips_genuinely_new_concepts():
+    stored = [
+        {"_id": ObjectId(), "concept": "us-gaap:Revenues", "path": "001", "order_key": "a",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "custom:PollutedOld", "path": "404", "order_key": "z",
+         "parent_concept": None, "dimension_concept": False},
+        {"_id": ObjectId(), "concept": "aapl:IPhoneMember", "path": "001.001", "order_key": "a",
+         "parent_concept": "us-gaap:Revenues", "dimension_concept": True},
+    ]
+    service = _Service(stored)
+    # _Service._get_concept_repo_by_form_type filters out dim rows in the default helper;
+    # expose all stored rows (including stored dim row) to mirror MongoDB repo output.
+    service._get_concept_repo_by_form_type = lambda ft: _Repo(stored)
+
+    bundle = _bundle(
+        concepts=[
+            {"concept": "us-gaap:SalesRevenueNet", "label": "Net sales", "value": 100.0},
+            {"concept": "us-gaap:BrandNewExpense", "label": "Brand New Expense", "value": 25.0},
+        ],
+        dims=[
+            {"concept": "aapl:IPhoneMember", "parent_concept": "us-gaap:Revenues",
+             "dimension_data": {"concept_name": "us-gaap:Revenues", "dimensions": {"P": "iPhone"}}},
+            {"concept": "aapl:VisionProMember", "parent_concept": "us-gaap:Revenues",
+             "dimension_data": {"concept_name": "us-gaap:Revenues", "dimensions": {"P": "VisionPro"}}},
+        ],
+    )
+    llm = _MappingOnlyStubChat(decisions=[
+        # Even if LLM proposes keep_tag="incoming", --no-new-concept forces keep_tag="stored".
+        {"concept": "us-gaap:SalesRevenueNet", "same_as": "us-gaap:Revenues", "keep_tag": "incoming"},
+    ])
+    node = make_hierarchy_agent_node(service, chat_llm=llm)
+    out = node({
+        "cik": "0000320193", "ticker": "AAPL", "status": "validated",
+        "no_new_concept": True, "bundles": [bundle],
+    })
+
+    assert out["status"] == "hierarchy_agent_done"
+    assert (out.get("hierarchy_plan") or {}).get("unresolved_statements") == []
+    # Only decide_mapping (+ read-only HTML helpers & finalize) — never hierarchy mutation tools.
+    tool_names = {t.name for t in llm.tools}
+    assert "decide_mapping" in tool_names
+    assert {"propose_hierarchy", "move_row", "remove_row"}.isdisjoint(tool_names)
+    # Existing hierarchy must remain completely untouched (no updates, no promotions).
+    assert (out.get("hierarchy_plan") or {}).get("existing_updates") == []
+    assert out.get("concept_promotions") == []
+
+    # Only the mapped concept survives; genuinely new concept is dropped.
+    assert [c["concept"] for c in bundle.concepts] == ["us-gaap:SalesRevenueNet"]
+    assert bundle.concepts[0]["_concept_target"] == "us-gaap:Revenues"
+    assert bundle.concepts[0]["path"] == "001"
+    assert bundle.concepts[0]["order_key"] == "a"
+
+    # Only stored dimensional member survives; new unmapped member is dropped.
+    assert [d["concept"] for d in bundle.dimensional_concepts] == ["aapl:IPhoneMember"]
+    assert bundle.dimensional_concepts[0]["path"] == "001.001"
+
+
+def test_persist_node_respects_no_new_concept_skips_promotions_and_passes_flag():
+    from filings_agent.nodes.persist import make_persist_node
+
+    class _RecordingNormService:
+        def __init__(self):
+            self.promoted = False
+            self.calls = []
+            self.last_write_failures = []
+
+        def promote_concept(self, *args, **kwargs):
+            self.promoted = True
+            return {}
+
+        def persist_statement_bundle(
+            self,
+            bundle,
+            *,
+            enforce_allowed_types: bool = True,
+            replace_existing: bool = False,
+            allow_new_concepts: bool = True,
+        ) -> bool:
+            self.calls.append({
+                "statement_type": bundle.statement_type,
+                "allow_new_concepts": allow_new_concepts,
+            })
+            return True
+
+    ns = _RecordingNormService()
+    persist_node = make_persist_node(ns, enforce_allowed_types=True)
+    bundle = _bundle([{"concept": "us-gaap:Revenues", "label": "Revenues", "value": 100.0}])
+    out = persist_node({
+        "cik": "0000320193",
+        "no_new_concept": True,
+        "bundles": [bundle],
+        "concept_promotions": [{
+            "statement_type": "income",
+            "form_type": "10-Q",
+            "from_concept": "us-gaap:Revenues",
+            "to_concept": "us-gaap:SalesRevenueNet",
+        }],
+        "write_decision": {"action": "write", "allowed_statements": ["income"]},
+    })
+    assert ns.promoted is False
+    assert ns.calls == [{"statement_type": "income", "allow_new_concepts": False}]
+    assert out["persist_receipt"]["statements_written"] == 1
+
+
+def test_html_extract_submit_drops_unstored_concepts_when_no_new_concept():
+    from filings_agent.nodes.html_extract_agent import extract_statements_from_html_agent
+
+    class _HtmlStubChat:
+        def __init__(self):
+            self.step = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            self.step += 1
+            if self.step == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "submit_html_statement",
+                    "args": {
+                        "statement_type": "income",
+                        "unit_multiplier": 1000.0,
+                        "period_date": "2026-06-30",
+                        "items_json": json.dumps([
+                            {"concept": "us-gaap:Revenues", "label": "Revenues", "value": 10},
+                            {"concept": "custom:BrandNewLine", "label": "Brand New Line", "value": 5},
+                        ]),
+                    },
+                    "id": "s1",
+                }])
+            return AIMessage(content="", tool_calls=[{
+                "name": "finalize_html_extraction",
+                "args": {"result_json": json.dumps({"done": True})},
+                "id": "f1",
+            }])
+
+    extracted = extract_statements_from_html_agent(
+        html_text="<html><body><table><tr><td>Revenues</td><td>10</td></tr></table></body></html>",
+        accession_number="0001-26-0001",
+        ticker="AAPL",
+        cik="0000320193",
+        form_type="10-Q",
+        existing_concepts={
+            "income": [{"concept": "us-gaap:Revenues", "label": "Revenues", "path": "001", "abstract": False}],
+            "balancesheet": [],
+            "cashflow": [],
+        },
+        no_new_concept=True,
+        chat_llm=_HtmlStubChat(),
+    )
+    assert [it["concept"] for it in extracted.get("income", [])] == ["us-gaap:Revenues"]
+    assert extracted["income"][0]["value"] == 10_000.0
+
 
 
 

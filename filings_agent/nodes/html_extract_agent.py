@@ -153,6 +153,7 @@ def extract_statements_from_html_agent(
     form_type: Optional[str] = None,
     norm_service: Any = None,
     existing_concepts: Optional[dict[str, list[dict[str, Any]]]] = None,
+    no_new_concept: bool = False,
     chat_llm: Any = None,
     on_event: Any = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -202,14 +203,26 @@ def extract_statements_from_html_agent(
 
         mult = float(unit_multiplier or 1.0)
         p_date = period_date or str((reporting_period or {}).get("end_date") or "")
+        stored_tags = (
+            {str(r.get("concept") or "") for r in (concept_catalog.get(st) or []) if r.get("concept")}
+            if no_new_concept
+            else set()
+        )
         normalized_items: list[dict[str, Any]] = []
+        skipped_new = 0
         for idx, it in enumerate(raw_items):
             if not isinstance(it, dict) or not it.get("label"):
                 continue
             concept = str(it.get("concept") or "").strip()
             if not concept:
+                if no_new_concept:
+                    skipped_new += 1
+                    continue
                 clean = "".join(w.capitalize() for w in str(it["label"]).split() if w.isalnum())
                 concept = f"custom:{clean or f'LineItem{idx + 1}'}"
+            if no_new_concept and concept not in stored_tags:
+                skipped_new += 1
+                continue
             raw_val = it.get("value")
             is_abs = bool(it.get("abstract", False))
             is_eps = bool(it.get("is_per_share", False))
@@ -233,6 +246,11 @@ def extract_statements_from_html_agent(
             })
 
         if not normalized_items:
+            if no_new_concept and skipped_new:
+                return (
+                    f"OK — skipped all {skipped_new} unstored concept(s) for '{st}' "
+                    f"(--no-new-concept is active; nothing recorded)."
+                )
             return "Error: no valid items parsed from items_json."
         # Prevent abstract headers from colliding with numeric total rows sharing the same tag.
         numeric_concepts = {
@@ -273,10 +291,17 @@ def extract_statements_from_html_agent(
         if any(db_counts.values())
         else " No existing DB concepts found for this company yet."
     )
+    no_new_hint = (
+        " IMPORTANT: --no-new-concept is ACTIVE. Call lookup_existing_concepts for each "
+        "statement first and ONLY submit rows that map to an exact existing DB concept tag. "
+        "Skip any line item that does not map to an existing DB concept."
+        if no_new_concept
+        else ""
+    )
     task = (
         f"Extract all available primary financial statements (income, balancesheet, cashflow) "
         f"from SEC filing {accession_number or '?'} ({ticker or '?'}) using list_html_tables, "
-        f"read_html_table, and lookup_existing_concepts.{db_hint}"
+        f"read_html_table, and lookup_existing_concepts.{db_hint}{no_new_hint}"
     )
     run_agent_loop(
         _HTML_EXTRACT_SYSTEM,

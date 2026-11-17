@@ -28,7 +28,11 @@ SAMPLE_HTML = """
 
 def test_html_table_tools_list_read_search():
     tools = {t.name: t for t in build_html_table_tools(html_text=SAMPLE_HTML)}
-    assert set(tools) == {"list_html_tables", "read_html_table", "search_html_text"}
+    assert set(tools) == {"find_html_table_by_value", "list_html_tables", "read_html_table", "search_html_text"}
+
+    val_out = tools["find_html_table_by_value"].invoke({"value": "22750560000"})
+    assert "table_id=0" in val_out
+    assert "Sales" in val_out
 
     listed = tools["list_html_tables"].invoke({"statement_hint": "income"})
     assert "table_id=0" in listed
