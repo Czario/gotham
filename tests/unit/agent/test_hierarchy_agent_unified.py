@@ -317,6 +317,27 @@ def test_materialize_keeps_same_header_under_each_parent():
     assert by_concept["us-gaap:ProductMember"]["path"].startswith("002.001.")
 
 
+def test_materialize_rescopes_mismatched_parent_header_to_actual_parent():
+    """If a dim under OperatingIncomeLoss accidentally references custom:RevenueSegmentSegmentation
+    owned by Revenues, _materialize must re-scope it to OperatingIncomeSegmentSegmentation."""
+    rows, dims = _materialize(
+        [
+            {"concept": "us-gaap:Revenues", "label": "Net Sales", "parent": None, "order": 1},
+            {"concept": "custom:RevenueSegmentSegmentation", "label": "Net Sales Segment Segmentation", "parent": "us-gaap:Revenues", "abstract": True, "order": 1},
+            {"concept": "us-gaap:OperatingIncomeLoss", "label": "Operating Income", "parent": None, "order": 2},
+        ],
+        [
+            {"concept": "hrl:RetailSegmentMember", "parent_concept": "us-gaap:Revenues", "parent_header": "custom:RevenueSegmentSegmentation", "order": 1},
+            {"concept": "hrl:RetailSegmentMember", "parent_concept": "us-gaap:OperatingIncomeLoss", "parent_header": "custom:RevenueSegmentSegmentation", "order": 1},
+        ],
+        {},
+    )
+    op_dims = [d for d in dims if d["parent_concept"] == "us-gaap:OperatingIncomeLoss"]
+    assert len(op_dims) == 1
+    assert op_dims[0]["parent_header"] == "custom:OperatingIncomeSegmentSegmentation"
+    assert op_dims[0]["path"].startswith("002.001.")
+
+
 def test_materialize_never_reuses_a_stored_path_held_by_an_absent_row():
     """Regression: a newly-added row must not steal the slot of an existing
     row the agent did not re-propose (that is how duplicate paths appear)."""

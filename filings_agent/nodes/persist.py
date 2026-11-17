@@ -258,22 +258,6 @@ def make_persist_node(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("persist: could not update hierarchy seed metadata: %s", exc)
 
-        # Backfill missing historical / comparative period facts discovered in this filing
-        backfill_plan = state.get("historical_backfill")
-        backfill_summary = None
-        if isinstance(backfill_plan, dict) and backfill_plan.get("entries"):
-            try:
-                from .historical_backfill import persist_historical_backfill
-
-                backfill_summary = persist_historical_backfill(
-                    norm_service,
-                    state,
-                    permitted_statements=set(plan.get("statements") or []),
-                )
-                backfill_plan = {**backfill_plan, "persist_summary": backfill_summary}
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("persist: historical backfill failed: %s", exc)
-
         post_write_hook = state.get("post_write_hook")
         if callable(post_write_hook):
             try:
@@ -305,15 +289,11 @@ def make_persist_node(
             "decided_by": plan.get("decided_by"),
             "decision_reason": plan.get("reason"),
         }
-        if backfill_summary and (backfill_summary.get("values_inserted") or backfill_summary.get("dims_inserted")):
-            receipt["historical_backfill"] = backfill_summary
         out_state = {
             **state,
             "status": "saved",
             "persist_receipt": receipt,
         }
-        if backfill_plan is not None:
-            out_state["historical_backfill"] = backfill_plan
         return out_state
 
     return persist_node

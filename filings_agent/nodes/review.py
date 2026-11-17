@@ -127,6 +127,7 @@ def make_review_node(*, chat_llm: Any = None, on_event: Any = None) -> Callable[
                     finalize_name="finalize_review",
                     chat_llm=chat_llm,
                     on_event=on_event,
+                    role="review",
                 )
                 if isinstance(result, dict) and isinstance(result.get("repairs"), list):
                     proposals.extend(x for x in result["repairs"] if isinstance(x, dict))

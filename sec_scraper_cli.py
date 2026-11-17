@@ -2325,19 +2325,60 @@ class SECDataScraperApp:
                     except Exception as e:
                         logger.debug(f"Could not enrich company info with fiscal year for {accession_number}: {e}")
             
-            # Process using unified financial processor
+            # Process using unified financial processor (with ADK HTML agent fallback when XBRL is absent)
             self.progress.set_status("downloading / parsing XBRL")
             _extract_t0 = time.perf_counter()
             statements_data = self.financial_processor.process_filing(
                 filing_info, cik, company_info_enriched
             )
+            _extract_source = "XBRL"
+            if not statements_data or not statements_data.get('statements'):
+                try:
+                    from filings_agent.mda import find_local_html, read_html_file
+                    from filings_agent.nodes.html_extract_agent import extract_statements_from_html_agent
+                    from core.extractors.sec_data_extractors import extract_period_info_from_sec_api
+
+                    _tkr = self.sec_client.get_ticker_from_cik(cik) or str(cik)
+                    _hdir = self.html_download_path or os.getenv('SEC_HTML_DOWNLOAD_PATH') or str(Path.home() / 'sec_html_filings')
+                    _local_html = find_local_html(str(accession_number or ''), ticker=_tkr, html_dir=_hdir)
+                    if not _local_html and accession_number:
+                        self.sec_client.download_html_filing(
+                            cik, accession_number,
+                            filing_info.get('filingDate') or filing_info.get('reportDate') or '2010-01-01',
+                            _hdir, _tkr, reload=False,
+                        )
+                        _local_html = find_local_html(str(accession_number), ticker=_tkr, html_dir=_hdir)
+                    _html_txt = read_html_file(_local_html) if _local_html else None
+                    if _html_txt:
+                        self.progress.set_status("extracting statements from HTML...")
+                        _rp = extract_period_info_from_sec_api(filing_info, company_info_enriched)
+                        _agent_stmts = extract_statements_from_html_agent(
+                            html_text=_html_txt,
+                            accession_number=str(accession_number or ''),
+                            ticker=_tkr,
+                            reporting_period=_rp,
+                            cik=str(cik or ''),
+                            form_type=filing_info.get('form') or filing_info.get('formType'),
+                            norm_service=getattr(self, '_norm_service', None),
+                        )
+                        if _agent_stmts:
+                            statements_data = {
+                                'statements': _agent_stmts,
+                                'reporting_period': _rp,
+                                'html_content': _html_txt,
+                                'filing_info': filing_info,
+                            }
+                            _extract_source = "HTML"
+                except Exception as _html_exc:
+                    logger.warning(f"HTML agent fallback failed for {accession_number}: {_html_exc}")
+
             _extract_ms = (time.perf_counter() - _extract_t0) * 1000
             if self._presenter is not None:
                 n_statements = len((statements_data or {}).get('statements') or {})
                 self._presenter.step(
                     "extract",
-                    (f"{n_statements} statement table(s) parsed from XBRL"
-                     if statements_data else "no XBRL statements found"),
+                    (f"{n_statements} statement table(s) parsed from {_extract_source}"
+                     if statements_data else "no XBRL or HTML statements found"),
                     ok=bool(statements_data),
                     duration_ms=_extract_ms,
                 )

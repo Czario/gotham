@@ -139,6 +139,7 @@ def fix_company_statement_hierarchy(
         finalize_description="Call once propose_hierarchy has been recorded. Pass {\"status\": \"done\"}.",
         chat_llm=chat_llm,
         max_steps=6,
+        role="hierarchy",
     )
 
     if not proposal["rows"]:

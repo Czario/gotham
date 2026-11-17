@@ -196,6 +196,7 @@ def run_agent_loop(
     before_tool_callback: Callable[[str, dict[str, Any]], Any] | None = None,
     after_tool_callback: Callable[[str, dict[str, Any], Any], Any] | None = None,
     finalize_validator: Callable[[dict[str, Any]], str | None] | None = None,
+    role: str | None = None,
 ) -> dict[str, Any] | None:
     """Run the tool-calling agent loop.
 
@@ -244,7 +245,7 @@ def run_agent_loop(
 
     if chat_llm is None:
         try:
-            chat_llm = build_chat_llm()
+            chat_llm = build_chat_llm(role=role)
         except ValueError as exc:
             logger.warning("Agent loop unavailable for %s: %s", ticker, exc)
             return None

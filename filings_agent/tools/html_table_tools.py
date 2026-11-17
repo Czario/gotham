@@ -7,11 +7,18 @@ deterministic parsers.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import threading
+from collections import OrderedDict
 from typing import Any, Optional
 
 from langchain_core.tools import StructuredTool
+
+_HTML_INDEX_LOCK = threading.Lock()
+_HTML_INDEX_CACHE: OrderedDict[str, tuple[list[dict[str, Any]], list[str]]] = OrderedDict()
+_HTML_INDEX_MAX = 16
 
 
 def load_filing_html(
@@ -124,6 +131,19 @@ def build_html_table_tools(
         if cache["loaded"]:
             return bool(cache["tables"] or cache["lines"])
         cache["loaded"] = True
+        cache_key = (
+            f"acc:{accession_number}"
+            if accession_number
+            else (f"sha:{hashlib.sha256(html_text.encode('utf-8', errors='ignore')).hexdigest()[:24]}" if html_text else None)
+        )
+        if cache_key:
+            with _HTML_INDEX_LOCK:
+                hit = _HTML_INDEX_CACHE.get(cache_key)
+                if hit is not None:
+                    _HTML_INDEX_CACHE.move_to_end(cache_key)
+                    cache["tables"], cache["lines"] = hit
+                    return True
+
         raw = load_filing_html(
             html_text=html_text,
             accession_number=accession_number,
@@ -136,6 +156,12 @@ def build_html_table_tools(
             tables, lines = _index_html_tables(raw)
             cache["tables"] = tables
             cache["lines"] = lines
+            if cache_key:
+                with _HTML_INDEX_LOCK:
+                    _HTML_INDEX_CACHE[cache_key] = (tables, lines)
+                    _HTML_INDEX_CACHE.move_to_end(cache_key)
+                    while len(_HTML_INDEX_CACHE) > _HTML_INDEX_MAX:
+                        _HTML_INDEX_CACHE.popitem(last=False)
             return True
         except Exception:
             return False

@@ -33,7 +33,7 @@ OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 # ── DeepSeek ───────────────────────────────────────────────────────────────
 DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120"))
+DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "240"))
 DEEPSEEK_THINKING: str = os.getenv("DEEPSEEK_THINKING", "").strip().lower()
 DEEPSEEK_REASONING_EFFORT: str = os.getenv("DEEPSEEK_REASONING_EFFORT", "").strip().lower()
 
@@ -48,12 +48,18 @@ GROQ_TPM: int = int(os.getenv("GROQ_TPM", "12000"))
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_REQUEST_TIMEOUT: float = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "120"))
 MODEL_NAME: str = os.getenv("MODEL_NAME", "").strip()
+HIERARCHY_MODEL: str = os.getenv("HIERARCHY_MODEL", "").strip()
+GUIDANCE_MODEL: str = os.getenv("GUIDANCE_MODEL", "").strip()
 
 
-def get_model_name(provider: str) -> str:
-    """Return the explicitly configured model name for the selected provider."""
+def get_model_name(provider: str, role: str | None = None) -> str:
+    """Return the explicitly configured model name for the selected provider and optional role."""
     if provider not in {"deepseek", "groq", "gemini", "ollama"}:
         raise ValueError(f"Unsupported LLM_PROVIDER {provider!r}")
+    if role in ("hierarchy", "review", "html_extract") and HIERARCHY_MODEL:
+        return HIERARCHY_MODEL
+    if role == "guidance" and GUIDANCE_MODEL:
+        return GUIDANCE_MODEL
     if not MODEL_NAME:
         raise ValueError(
             "MODEL_NAME must be set in the project .env (or process environment) "

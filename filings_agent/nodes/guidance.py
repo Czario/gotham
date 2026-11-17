@@ -146,6 +146,7 @@ def make_guidance_extract_node(
                     finalize_description=GUIDANCE_FINALIZE_DESCRIPTION,
                     chat_llm=chat_llm,
                     on_event=on_event,
+                    role="guidance",
                 )
                 if isinstance(result, dict):
                     raw_records = result.get("guidance")

@@ -28,10 +28,6 @@ from filings_agent.adk import (
 )
 from filings_agent.company_graph import build_company_graph
 from filings_agent.graph import build_filing_graph
-from filings_agent.nodes.historical_backfill import (
-    make_historical_backfill_node,
-    persist_historical_backfill,
-)
 from filings_agent.nodes.stock_audit import run_complete_stock_audit
 from filings_agent.state import new_company_state, new_state
 from filings_agent.validation.sec_presentation_diff import check_sec_presentation_diff
@@ -129,74 +125,6 @@ def test_sec_presentation_snapshot_and_diff_validator():
     finding_types = {f.type for f in findings}
     assert "missing_sec_presentation_concept" in finding_types
     assert "missing_sec_dimensional_breakdown" in finding_types
-
-
-def test_historical_comparative_period_backfill():
-    """Verify comparative prior-period facts missing in DB are discovered and backfilled."""
-    statement_docs = [
-        {
-            "statement_type": "income",
-            "data": [
-                {
-                    "concept": "us-gaap:Revenues",
-                    "label": "Total net sales",
-                    "value": 400000.0,
-                    "period": "2024-01-01 to 2024-12-31",
-                    "comparative_facts": [
-                        {
-                            "concept": "us-gaap:Revenues",
-                            "label": "Total net sales",
-                            "value": 350000.0,
-                            "period": "2023-01-01 to 2023-12-31",
-                            "unit": "USD",
-                        },
-                        {
-                            "concept": "us-gaap:RestructuringCharges",
-                            "label": "Restructuring charges",
-                            "value": 12000.0,
-                            "period": "2023-01-01 to 2023-12-31",
-                            "unit": "USD",
-                        },
-                    ],
-                    "comparative_dimensional_facts": [
-                        {
-                            "concept": "us-gaap:Revenues",
-                            "label": "Cloud Segment",
-                            "value": 150000.0,
-                            "period": "2023-01-01 to 2023-12-31",
-                            "dimension_details": {"us-gaap:StatementBusinessSegmentsAxis": "co:CloudMember"},
-                        }
-                    ],
-                }
-            ],
-        }
-    ]
-    state = new_state(
-        cik="0000320193",
-        ticker="AAPL",
-        form_type="10-K",
-        accession_number="0000320193-25-000001",
-        statement_docs=statement_docs,
-    )
-    state["reporting_period"] = {"end_date": "2024-12-31", "fiscal_year": 2024, "period_type": "annual"}
-    state["sec_presentation"] = build_sec_presentation_snapshot(statement_docs=statement_docs)
-
-    class _FakeNorm:
-        db_connection = None
-
-    node = make_historical_backfill_node(_FakeNorm())
-    out = node(state)
-    bf = out["historical_backfill"]
-    assert bf["periods_checked"] == 1
-    assert bf["missing_facts_found"] == 2
-    assert bf["missing_dim_facts_found"] == 1
-    assert bf["entries"][0]["end_date"] == "2023-12-31"
-    assert bf["entries"][0]["cadence"] == "annual"
-
-    summary = persist_historical_backfill(_FakeNorm(), out)
-    assert summary["periods_backfilled"] == 1
-    assert summary["values_inserted"] == 2
-    assert summary["dims_inserted"] == 1
 
 
 def test_complete_stock_audit_detects_hierarchy_continuity_and_scale_issues():

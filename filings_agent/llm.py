@@ -481,6 +481,7 @@ def build_chat_llm(
     request_timeout: float | None = None,
     provider: str | None = None,
     max_retries: int | None = None,
+    role: str | None = None,
 ) -> Any:
     """Build a chat model capable of tool calling (``.bind_tools()``).
 
@@ -509,7 +510,7 @@ def build_chat_llm(
         retries = min(int(getattr(config, "MAX_RETRY_LIMIT", 3)), max(0, int(max_retries)))
 
     if effective_provider in ("groq", "deepseek"):
-        model_name = get_model_name(effective_provider)
+        model_name = get_model_name(effective_provider, role=role)
         try:
             from langchain_openai import ChatOpenAI
         except ImportError as exc:

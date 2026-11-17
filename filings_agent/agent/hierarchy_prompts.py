@@ -33,7 +33,7 @@ STRUCTURAL RULES:
  - NEVER create or use a parent/subtotal header for a single child: if a section only has 1 line item (e.g. SG&A alone without R&D, or 1 non-current item), keep that single item at root/parent level without wrapping it in a single-child header.
  - On Income Statement, NEVER nest CostOfGoodsAndServicesSold / CostOfRevenue under CostsAndExpenses; keep Cost of Goods Sold at root level.
  - every custom: grouping header must hang under a real line item (parent != null)
- - the same grouping header name must NOT appear under several parents
+ - the same grouping header name must NOT appear under several parents (always prefix with the parent line item, e.g. `custom:RevenueSegmentSegmentation` for Revenue, `custom:OperatingIncomeSegmentSegmentation` for Operating Income, `custom:CostOfRevenueSegmentSegmentation` for Cost of Revenue)
  - if 3 or more dimensional members share a parent, group them under ONE header
 
 EXAMPLE TRAJECTORIES (SINGLE-PASS):

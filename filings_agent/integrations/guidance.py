@@ -224,8 +224,10 @@ def upsert_guidance_records(
         "upserted": 0,
         "skipped_manual": 0,
         "demoted": 0,
+        "swept": 0,
         "superseded": [],
     }
+    written_ids: list[Any] = []
 
     for rec in records:
         period = rec.get("period") or {}
@@ -325,14 +327,42 @@ def upsert_guidance_records(
             "period.quarter": q,
             "period.period_type": ptype,
         }
-        col.update_one(
+        up_res = col.update_one(
             filt,
             {"$set": doc, "$setOnInsert": {"created_at": now}},
             upsert=True,
         )
+        up_id = getattr(up_res, "upserted_id", None)
+        if up_id is None:
+            existing = col.find_one(filt, {"_id": 1})
+            if isinstance(existing, dict):
+                up_id = existing.get("_id")
+        if up_id is not None:
+            written_ids.append(up_id)
         summary["upserted"] += 1
         if supersedes:
             summary["superseded"].append(supersedes)
+
+    # Sweep stale or duplicate source="llm" docs for this same filing so
+    # reruns (even if the LLM renames a metric or drops an item) never leave
+    # duplicate guidance rows in guidance_values.  Manual entries are untouched.
+    if accession_number and written_ids and hasattr(col, "delete_many"):
+        try:
+            del_res = col.delete_many({
+                "cik": cik,
+                "accession_number": accession_number,
+                "source": "llm",
+                "_id": {"$nin": written_ids},
+            })
+            swept = getattr(del_res, "deleted_count", 0)
+            summary["swept"] = swept
+            if swept:
+                logger.info(
+                    "guidance: swept %d stale/duplicate LLM doc(s) for CIK %s %s",
+                    swept, cik, accession_number,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("guidance stale sweep skipped: %s", exc)
 
     return summary
 

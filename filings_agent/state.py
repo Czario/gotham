@@ -43,7 +43,6 @@ class FilingAgentState(TypedDict):
     # ── P1 output: in-memory bundles (no DB writes yet) ────────────────────
     bundles: NotRequired[Optional[list]]
     sec_presentation: NotRequired[Optional[dict]]
-    historical_backfill: NotRequired[Optional[dict]]
 
     # ── sign conventions (post-extraction) ─────────────────────────────────
     # In-memory sign corrections applied by the sign subagent before validation:

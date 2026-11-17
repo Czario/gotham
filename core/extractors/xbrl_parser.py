@@ -329,7 +329,10 @@ class FlexibleXBRLExtractor:
             for attempt, candidate_url in enumerate(candidates_to_try):
                 logger.debug(f"Loading XBRL document (attempt {attempt + 1}/{len(candidates_to_try)}): {candidate_url}")
                 # Transient SEC failures (503/network) are common on long
-                # backfills; retry before abandoning a candidate.
+                # backfills; retry before abandoning a candidate. Note: Arelle
+                # often returns a partial ModelXbrl (with 0 facts or 0
+                # presentation relationships) when a companion .xsd/_pre.xml
+                # returns HTTP 503, so treat those as retryable too.
                 model = None
                 for _retry in range(3):
                     try:
@@ -338,9 +341,32 @@ class FlexibleXBRLExtractor:
                         logger.warning(f"   Arelle load error ({load_exc}) for {candidate_url}")
                         model = None
                     if model:
+                        _facts = len(model.facts) if hasattr(model, 'facts') else 0
+                        _pres_rels = 0
+                        try:
+                            _pres_rels = len(model.relationshipSet(XbrlConst.parentChild).modelRelationships)
+                        except Exception:
+                            _pres_rels = 0
+                        _errs = " ".join(str(e) for e in (getattr(model, 'errors', None) or []))
+                        _has_io_err = any(tok in _errs for tok in ('IOerror', '503', 'Service Unavailable', 'timed out'))
+                        if _facts > 0 and _pres_rels > 0 and not _has_io_err:
+                            break
+                        if _retry < 2:
+                            logger.warning(
+                                f"   ⚠️  Incomplete Arelle load for {candidate_url.split('/')[-1]} "
+                                f"(facts={_facts}, pres_rels={_pres_rels}, io_err={_has_io_err}); "
+                                f"retrying ({_retry + 1}/2)..."
+                            )
+                            try:
+                                self.model_manager.close(model)
+                            except Exception:
+                                pass
+                            model = None
+                            time.sleep(2.0 * (_retry + 1))
+                            continue
                         break
                     if _retry < 2:
-                        time.sleep(1.5 * (_retry + 1))
+                        time.sleep(2.0 * (_retry + 1))
                 if not model:
                     logger.warning(f"   Arelle failed to load: {candidate_url}")
                     continue
@@ -350,6 +376,10 @@ class FlexibleXBRLExtractor:
                         f"   ⚠️  {candidate_url.split('/')[-1]} loaded but has 0 facts — "
                         f"trying next candidate..."
                     )
+                    try:
+                        self.model_manager.close(model)
+                    except Exception:
+                        pass
                     continue
                 modelXbrl = model
                 used_url = candidate_url

@@ -4,7 +4,7 @@ Orchestrates the filing pipeline using Google ADK's ``ADKSequentialAgent``,
 ``ADKStepAgent``, ``InMemorySessionService``, ``InMemoryArtifactService``,
 and ``InMemoryMemoryService``:
 
-    fetch_filing → xbrl_extract → normalize_bundle → historical_backfill →
+    fetch_filing → xbrl_extract → normalize_bundle →
     hierarchy_agent → validate → (repair / agent_review if needed) →
     decide → persist → (guidance if configured) → END
 """
@@ -20,7 +20,6 @@ from .nodes.decide import make_decide_node
 from .nodes.fetch_filing import make_fetch_filing_node
 from .nodes.guidance import make_guidance_extract_node, make_guidance_save_node
 from .nodes.hierarchy_agent import make_hierarchy_agent_node
-from .nodes.historical_backfill import make_historical_backfill_node
 from .nodes.normalize import make_normalize_node
 from .nodes.persist import make_persist_node
 from .nodes.repair import make_repair_node
@@ -85,7 +84,48 @@ def build_filing_graph(
     def _route_after_save(state: dict) -> str:
         if state.get("status") == "saved":
             return "extract_guidance"
+        fut = state.get("_guidance_future")
+        if fut is not None:
+            try:
+                fut.cancel()
+            except Exception:
+                pass
         return "__end__"
+
+    guidance_extract_fn = make_guidance_extract_node(
+        chat_llm=guidance_chat_llm,
+        mda_provider=mda_provider,
+        on_event=on_event,
+    )
+    _norm_node = make_normalize_node(norm_service)
+
+    def _normalize_and_start_guidance(state: dict) -> dict:
+        out = _norm_node(state)
+        if out.get("status") == "normalized":
+            from . import config
+            if config.GUIDANCE_ENABLED:
+                from concurrent.futures import ThreadPoolExecutor
+                pool = ThreadPoolExecutor(max_workers=1)
+                fut = pool.submit(guidance_extract_fn, dict(out))
+                pool.shutdown(wait=False)
+                out["_guidance_future"] = fut
+        return out
+
+    def _await_or_run_guidance(state: dict) -> dict:
+        fut = state.get("_guidance_future")
+        if fut is not None:
+            clean_state = {k: v for k, v in state.items() if k != "_guidance_future"}
+            try:
+                res = fut.result()
+                return {
+                    **clean_state,
+                    "guidance_records": res.get("guidance_records", []),
+                    "guidance_extract": res.get("guidance_extract", {}),
+                }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("parallel guidance future failed (%s); falling back to sync", exc)
+                return guidance_extract_fn(clean_state)
+        return guidance_extract_fn(state)
 
     sub_agents = [
         ADKStepAgent(
@@ -111,17 +151,8 @@ def build_filing_graph(
         ),
         ADKStepAgent(
             "normalize_bundle",
-            _wrap(make_normalize_node(norm_service), "normalize_bundle_node", decision_chat_llm),
+            _wrap(_normalize_and_start_guidance, "normalize_bundle_node", decision_chat_llm),
             description="Normalize extracted statement documents into in-memory bundles.",
-        ),
-        ADKStepAgent(
-            "historical_backfill",
-            _wrap(
-                make_historical_backfill_node(norm_service, chat_llm=decision_chat_llm, on_event=on_event),
-                "historical_backfill_node",
-                decision_chat_llm,
-            ),
-            description="Discover and stage missing comparative historical period facts and breakdowns.",
         ),
         ADKStepAgent(
             "hierarchy_agent",
@@ -183,11 +214,7 @@ def build_filing_graph(
         ADKStepAgent(
             "extract_guidance",
             _wrap(
-                make_guidance_extract_node(
-                    chat_llm=guidance_chat_llm,
-                    mda_provider=mda_provider,
-                    on_event=on_event,
-                ),
+                _await_or_run_guidance,
                 "extract_guidance_node",
                 decision_chat_llm,
             ),
@@ -203,8 +230,7 @@ def build_filing_graph(
     edges = {
         "fetch_filing": _route_after("xbrl_extract"),
         "xbrl_extract": _route_after("normalize_bundle"),
-        "normalize_bundle": _route_after("historical_backfill"),
-        "historical_backfill": _route_after("validate"),
+        "normalize_bundle": _route_after("validate"),
         "validate": _route_needs,
         "agent_review": "repair",
         "repair": "hierarchy_agent",

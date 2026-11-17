@@ -329,8 +329,23 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
         else:
             norm_dims.append(item)
 
-    # 3. Synthesize any parent_header referenced in dims (or custom parent) if not already declared in rows
-    existing_row_keys: set[tuple[Any, Any]] = {(r.get("parent"), r.get("concept")) for r in norm_rows}
+    # 3. Synthesize any parent_header referenced in dims (or custom parent) if not already declared in rows.
+    # Guard: a custom: segmentation header belongs to ONE parent_concept. If a dim under parent B
+    # accidentally references a custom: header owned by parent A (e.g. custom:RevenueSegmentSegmentation
+    # on OperatingIncomeLoss), re-scope it to parent B via build_parent_specific_segmentation_header.
+    parent_label_by_concept: dict[str, str] = {
+        str(r["concept"]): str(r["label"]).strip()
+        for r in norm_rows
+        if r.get("concept") and r.get("label") and not str(r.get("concept")).startswith("custom:")
+    }
+    header_owner: dict[str, str] = {}
+    for r in norm_rows:
+        rc = str(r.get("concept") or "")
+        rp = r.get("parent") or r.get("parent_concept")
+        if rc.startswith("custom:") and rp and not str(rp).startswith("custom:"):
+            header_owner.setdefault(rc, str(rp))
+
+    existing_row_keys: set[tuple[Any, Any]] = {(r.get("parent") or r.get("parent_concept"), r.get("concept")) for r in norm_rows}
     header_counts: dict[Any, int] = defaultdict(int)
     for d in norm_dims:
         ph = d.get("parent_header")
@@ -338,16 +353,25 @@ def _materialize(rows: list[dict], dims: list[dict], stored_paths: dict[str, str
         if not ph and d.get("parent") and str(d.get("parent")).startswith("custom:"):
             ph = d.get("parent")
         if ph and str(ph).startswith("custom:"):
-            # A member whose parent IS the header needs no synthesis; only
-            # synthesize when we know the real (non-header) line item it hangs
-            # under.  Otherwise the header would parent itself (infinite walk).
             if not pc or str(pc).startswith("custom:"):
                 continue
+            owner = header_owner.get(str(ph))
+            if owner and owner != str(pc) and (pc, ph) not in existing_row_keys:
+                new_ph, new_lbl = build_parent_specific_segmentation_header(
+                    str(pc), parent_label_by_concept.get(str(pc)), str(ph)
+                )
+                ph = new_ph
+                d["parent_header"] = new_ph
+                if d.get("parent") and str(d.get("parent")).startswith("custom:"):
+                    d["parent"] = new_ph
+            else:
+                header_owner.setdefault(str(ph), str(pc))
+                new_lbl = None
             key = (pc, ph)
             if key not in existing_row_keys:
                 existing_row_keys.add(key)
                 header_counts[pc] += 1
-                label = _re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", str(ph).split(":")[-1])
+                label = new_lbl or _re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", str(ph).split(":")[-1])
                 norm_rows.append({
                     "concept": ph,
                     "parent": pc,
@@ -1497,7 +1521,7 @@ def make_hierarchy_agent_node(
         seeded: list[str] = []
         all_promotions: list[dict] = []
 
-        for bundle in bundles:
+        def _process_one_bundle(bundle):
             stmt_t0 = time.perf_counter()
             stmt_type = getattr(bundle, "statement_type", "?")
             stored, stored_paths, occupied_paths, identity_paths, identity_order_keys = _stored_rows_for(norm_service, bundle)
@@ -1505,9 +1529,8 @@ def make_hierarchy_agent_node(
                 stored, stored_paths, occupied_paths, identity_paths, identity_order_keys = _stored_rows_for(norm_service, bundle)
             filing_rows = _filing_rows_for(bundle, sec_presentation=state.get("sec_presentation"))
             if not filing_rows and not stored:
-                continue
-            if not stored:
-                seeded.append(stmt_type)
+                return None
+            was_seeded = not stored
 
             # ── Fast-path: skip LLM when all filing concepts are already stored ─────
             # Compute the diff deterministically. If there are no new concepts,
@@ -1630,6 +1653,36 @@ def make_hierarchy_agent_node(
                             f"with their parent and exact sibling position (all stored concepts and their order keys are preserved automatically);\n"
                             f"3. Immediately call finalize_hierarchy({{\"status\": \"done\"}})."
                         )
+                    def _validate_all_placed(_parsed: dict) -> Optional[str]:
+                        prev = proposal.get("_preview")
+                        if not prev or not prev.get("rows"):
+                            return "Call propose_hierarchy(rows_json, dims_json) before finalizing."
+                        if stored and new_concepts:
+                            merged_keys = set((proposal.get("merges") or {}).keys())
+                            placed_main = {str(r.get("concept")) for r in (prev.get("rows") or []) if r.get("concept")}
+                            placed_dims = {
+                                (d.get("parent_concept"), d.get("concept"))
+                                for d in (prev.get("dims") or [])
+                                if d.get("concept")
+                            }
+                            missing: list[str] = []
+                            for nc in new_concepts:
+                                nc_c = str(nc.get("concept") or "")
+                                if nc_c in merged_keys:
+                                    continue
+                                if nc.get("dimension_concept"):
+                                    nc_p = nc.get("parent_concept") or nc.get("parent")
+                                    if (nc_p, nc_c) not in placed_dims:
+                                        missing.append(f"{nc_p} -> {nc_c}")
+                                elif nc_c and nc_c not in placed_main:
+                                    missing.append(nc_c)
+                            if missing:
+                                return (
+                                    f"Incomplete: you omitted {len(missing)} new item(s): {', '.join(missing[:8])}. "
+                                    f"Include them in propose_hierarchy(rows_json, dims_json) or merge via decide_mapping."
+                                )
+                        return None
+
                     try:
                         _ = run_agent_loop(
                             AGENTIC_HIERARCHY_SYSTEM_PROMPT,
@@ -1639,8 +1692,10 @@ def make_hierarchy_agent_node(
                             finalize_name="finalize_hierarchy",
                             finalize_description="Call when the full hierarchy is decided. Pass {\"status\": \"done\"}.",
                             chat_llm=chat_llm,
-                            max_steps=5,
+                            max_steps=8,
+                            role="hierarchy",
                             on_event=on_event,
+                            finalize_validator=_validate_all_placed,
                         )
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("hierarchy agent failed for %s/%s: %s",
@@ -1658,7 +1713,7 @@ def make_hierarchy_agent_node(
                     "hierarchy agent produced no checked tree for %s/%s; skipping",
                     bundle.company_cik, bundle.statement_type,
                 )
-                continue
+                return None
             rows, dims = preview["rows"], preview["dims"]
 
             # (parent_concept, concept) -> (path, order, parent_header) for dims
@@ -1798,21 +1853,54 @@ def make_hierarchy_agent_node(
                     continue
                 
                 target = dim.get("_concept_target") or dim.get("concept")
+                # Never fall back across different parent_concepts: a dimensional member
+                # like hrl:RetailSegmentMember repeats under Revenue, Cost, and OperatingIncome.
                 entry = dim_plan.get((dim.get("parent_concept"), target))
-                if not entry:
-                    # Fallback: search dim_plan for ANY entry matching the target concept
-                    for (p, c), e in dim_plan.items():
-                        if c == target:
-                            entry = e
-                            break
+                if not entry and dim.get("container_concept"):
+                    entry = dim_plan.get((dim.get("container_concept"), target))
                 if entry:
                     dim["path"], dim["order_key"], dim["parent_header"] = entry
                     dim["hierarchy_level"] = len(str(dim["path"]).split(".")) - 1
                     dim["level"] = dim["hierarchy_level"]
                     dim["_hierarchy_resolved"] = True
                 else:
-                    dim["path"] = None
-                    dim["order_key"] = None
+                    # Safety net: never leave a dim with path=None / order_key=None
+                    p_c = dim.get("parent_concept") or dim.get("container_concept")
+                    p_row = next((i for i in list(concrete) if isinstance(i, dict) and i.get("concept") == p_c and i.get("path")), None)
+                    p_path = p_row.get("path") if p_row else stored_paths.get(str(p_c or ""))
+                    if p_c and p_path:
+                        p_lbl = (p_row or {}).get("label") or str(p_c).split(":")[-1]
+                        hdr_c, hdr_lbl = build_parent_specific_segmentation_header(
+                            str(p_c), p_lbl, dim.get("segment_type") or "segment"
+                        )
+                        existing_hdr = next(
+                            (a for a in abstracts if isinstance(a, dict) and a.get("concept") == hdr_c and a.get("parent_concept") == p_c and a.get("path")),
+                            None,
+                        )
+                        if not existing_hdr:
+                            hdr_path = f"{p_path}.001"
+                            abstracts.append({
+                                "concept": hdr_c, "label": hdr_lbl, "value": None, "period": None,
+                                "abstract": True, "parent_concept": p_c, "path": hdr_path,
+                                "order_key": "a", "hierarchy_level": len(hdr_path.split(".")) - 1,
+                                "level": len(hdr_path.split(".")) - 1, "_hierarchy_resolved": True,
+                            })
+                        else:
+                            hdr_path = existing_hdr["path"]
+                        sibling_count = sum(
+                            1 for d2 in (getattr(bundle, "dimensional_concepts", None) or [])
+                            if isinstance(d2, dict) and str(d2.get("path") or "").startswith(f"{hdr_path}.")
+                        )
+                        n_idx = sibling_count + 1
+                        dim["path"] = f"{hdr_path}.{n_idx:03d}"
+                        dim["order_key"] = chr(ord("a") + min(n_idx - 1, 25))
+                        dim["parent_header"] = hdr_c
+                        dim["hierarchy_level"] = len(dim["path"].split(".")) - 1
+                        dim["level"] = dim["hierarchy_level"]
+                        dim["_hierarchy_resolved"] = True
+                    else:
+                        dim["path"] = None
+                        dim["order_key"] = None
 
             # merges -> attach (stored name wins) or promotion (incoming name wins).
             promotions: list[dict] = []
@@ -1868,9 +1956,6 @@ def make_hierarchy_agent_node(
             else:
                 # Existing stock: strictly zero updates to existing stored hierarchy
                 existing_updates = []
-            total_updates += len(existing_updates)
-            all_promotions.extend(promotions)
-            reasoned_about += 1
             bundle._agent_updates = existing_updates
             if not (stored and not new_concepts):
                 stmt_dur = time.perf_counter() - stmt_t0
@@ -1879,6 +1964,24 @@ def make_hierarchy_agent_node(
                     stmt_type, stmt_dur, len(rows), len(existing_updates),
                 )
                 report_detail(f"{stmt_type}: done")
+            return (stmt_type, was_seeded, existing_updates, promotions)
+
+        if len(bundles) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(3, len(bundles))) as pool:
+                results = list(pool.map(_process_one_bundle, bundles))
+        else:
+            results = [_process_one_bundle(b) for b in bundles]
+
+        for res in results:
+            if res is None:
+                continue
+            st_name, was_seeded, ex_updates, promos = res
+            if was_seeded:
+                seeded.append(st_name)
+            total_updates += len(ex_updates)
+            all_promotions.extend(promos)
+            reasoned_about += 1
 
         plan = {
             "decided_by": "agent",
