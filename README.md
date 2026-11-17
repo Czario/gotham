@@ -72,6 +72,14 @@ uv run main --file stocks_download.txt --reload --fiscal-year 2023 --fiscal-quar
 
 *(Note: `--quarter` or `-q` can be used as aliases for `--fiscal-quarter`)*
 
+### Keep stored hierarchy untouched (`--no-new-concept`)
+
+When `--no-new-concept` is passed, the pipeline keeps the existing stored hierarchy in MongoDB untouched: incoming concepts that map to an existing concept in the stored hierarchy are allowed (values attach to the stored concept), while genuinely new unmapped concepts are skipped so values are only inserted into existing hierarchy rows.
+
+```bash
+uv run main --companies AAPL --reload --fiscal-year 2026 --fiscal-quarter Q3 --no-new-concept
+```
+
 ### Load or reload a specific statement for a specific quarter
 
 You can restrict extraction and loading to a single financial statement for a specific quarter.
@@ -128,6 +136,8 @@ uv run python -m cli.main statement --ticker AAPL --fiscal-year 2023 --quarter Q
 | `--latest` | Processing | Process only the most recent filing for each company |
 | `--no-dimensions` | Processing | Skip dimensional (segment / product / geography) extraction |
 | `--no-reconciliation` | Processing | Disable SEC companyfacts gap-fill reconciliation pass |
+| `--no-new-concept` | Processing | Keep stored hierarchy untouched: map matching tags to existing concepts and skip genuinely new concepts so values only populate existing hierarchy rows |
+| `--fix-hierarchy`, `--fix-hi` | Processing | Fix stored hierarchy in place using the Hierarchy Agent and SEC HTML tables without re-scraping values |
 | `--no-download-html-filings` | HTML | Skip downloading HTML/HTM filings (enabled by default to `SEC_HTML_DOWNLOAD_PATH` or `~/sec_html_filings`, saving both `.htm` and `.html.gz`) |
 | `--verbose` | Output | Detailed per-filing INFO log output (disables progress bars) |
 | `--debug` | Output | Full DEBUG-level logs (implies `--verbose`) |
