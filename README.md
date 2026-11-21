@@ -80,6 +80,29 @@ When `--no-new-concept` is passed, the pipeline keeps the existing stored hierar
 uv run main --companies AAPL --reload --fiscal-year 2026 --fiscal-quarter Q3 --no-new-concept
 ```
 
+### Load guidance only (`--guidence-only` / `--guidance-only`)
+
+Extract and save forward-looking MD&A guidance into `guidance_values` without extracting, normalizing, validating, or writing financial statements, company metadata, or post-processing company stages (Q4 calculation / SEC `companyfacts` reconciliation).
+
+- Skips filings that already have guidance stored in `guidance_values` (even if financial statements are already stored for the filing).
+- With `--reload`, re-extracts guidance for the selected filings and upserts in place (sweeping stale `source="llm"` rows while keeping `source="manual"` entries untouched, and never touching financial statements).
+
+```bash
+# Load guidance for a company from a specific year onwards
+uv run main --companies AAPL --year 2025 --guidence-only
+
+# Load guidance for only the latest filing
+uv run main --companies AAPL --latest --guidence-only
+
+# Force re-extract guidance for a specific quarter
+uv run main --companies AAPL --fiscal-year 2025 --quarter Q2 --guidence-only --reload
+
+# Load guidance for a single filing by URL
+uv run main --url "https://www.sec.gov/Archives/edgar/data/320193/000032019324000123/0000320193-24-000123-index.htm" --guidence-only
+```
+
+*(Note: `--guidance-only` and `--guidence-only` are interchangeable aliases.)*
+
 ### Load or reload a specific statement for a specific quarter
 
 You can restrict extraction and loading to a single financial statement for a specific quarter.
@@ -137,6 +160,7 @@ uv run python -m cli.main statement --ticker AAPL --fiscal-year 2023 --quarter Q
 | `--no-dimensions` | Processing | Skip dimensional (segment / product / geography) extraction |
 | `--no-reconciliation` | Processing | Disable SEC companyfacts gap-fill reconciliation pass |
 | `--no-new-concept` | Processing | Keep stored hierarchy untouched: map matching tags to existing concepts and skip genuinely new concepts so values only populate existing hierarchy rows |
+| `--guidance-only`, `--guidence-only` | Processing | Extract and save forward-looking MD&A guidance into `guidance_values` only — skips XBRL extraction, financial statement writes, and company post-processing |
 | `--fix-hierarchy`, `--fix-hi` | Processing | Fix stored hierarchy in place using the Hierarchy Agent and SEC HTML tables without re-scraping values |
 | `--no-download-html-filings` | HTML | Skip downloading HTML/HTM filings (enabled by default to `SEC_HTML_DOWNLOAD_PATH` or `~/sec_html_filings`, saving both `.htm` and `.html.gz`) |
 | `--verbose` | Output | Detailed per-filing INFO log output (disables progress bars) |
