@@ -547,6 +547,7 @@ class SECDataScraperApp:
         html_download_path: Optional[str] = None,
         enable_reconciliation: bool = True,
         no_new_concept: bool = False,
+        guidance_only: bool = False,
         progress: Optional["ProgressManager"] = None,
     ):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
@@ -559,6 +560,7 @@ class SECDataScraperApp:
         self.enable_dimensions = enable_dimensions
         self.enable_reconciliation = enable_reconciliation
         self.no_new_concept = bool(no_new_concept)
+        self.guidance_only = bool(guidance_only)
         self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
         # Per-company state (sequential-only — no threading needed)
         self.current_company_data = None
@@ -594,9 +596,11 @@ class SECDataScraperApp:
             raise RuntimeError("DATABASE_NAME environment variable is required. Set it in your .env file.")
 
         # Dedup is derived from the actual concept_values collections — no separate tracker needed.
-        _norm_db = _MongoClient(_mongo_uri)['normalize_data']
+        _mongo_client = _MongoClient(_mongo_uri)
+        _norm_db = _mongo_client['normalize_data']
         self._cv_annual_col    = _norm_db['concept_values_annual']
         self._cv_quarterly_col = _norm_db['concept_values_quarterly']
+        self._guidance_col     = _mongo_client[_database_name]['guidance_values']
         # Ensure the index that makes accession lookups fast exists (idempotent)
 
         # ---------------------------------------------------------------------------
@@ -623,6 +627,7 @@ class SECDataScraperApp:
 
         # ── P7: agent graphs / audit / durable session ──────────────────────
         self._filing_graph = None      # cached per-filing LangGraph
+        self._guidance_only_graph = None  # cached guidance-only ADK graph
         self._company_graph = None     # cached company-stage LangGraph
         self._presenter = None         # live terminal step narration (lazy)
         self._audit = None             # JSONL audit trail (lazy)
@@ -1011,6 +1016,35 @@ class SECDataScraperApp:
             on_event=self._agent_event_sink(),
         )
         return self._filing_graph
+
+    def _build_guidance_only_agent_graph(self):
+        """Build (and cache) the guidance-only agent graph (extract_guidance → save_guidance)."""
+        if self._guidance_only_graph is not None:
+            return self._guidance_only_graph
+        from filings_agent.graph import build_guidance_only_graph
+
+        self._guidance_only_graph = build_guidance_only_graph(
+            on_event=self._agent_event_sink(),
+        )
+        return self._guidance_only_graph
+
+    def _find_existing_guidance(self, cik: str, accession_number: Optional[str]) -> bool:
+        """Return True when guidance_values already contains records for (cik, accession_number)."""
+        if not accession_number:
+            return False
+        try:
+            cik_variants = list(dict.fromkeys([str(cik), str(cik).zfill(10), str(cik).lstrip('0')]))
+            acc = str(accession_number).strip()
+            clean_acc = acc[:-5] if acc.endswith('-xbrl') else acc
+            acc_variants = list(dict.fromkeys([acc, clean_acc, f"{clean_acc}-xbrl"]))
+            doc = self._guidance_col.find_one(
+                {'cik': {'$in': cik_variants}, 'accession_number': {'$in': acc_variants}},
+                projection={'_id': 1},
+            )
+            return doc is not None
+        except Exception as e:
+            logger.debug(f"Error checking existing guidance for {cik}/{accession_number}: {e}")
+            return False
     
     def filter_latest_filings(self, filings_list: List[Dict], cik: str, latest_date: str) -> List[Dict]:
         """Filter filings to only include those with reporting periods newer than the latest in database"""
@@ -1155,9 +1189,10 @@ class SECDataScraperApp:
             all_filings_for_company = list(filings_list)
             if self.target_fiscal_year or self.target_fiscal_quarter:
                 filings_list = self._filter_filings_by_fiscal_period(filings_list, company_data)
-                filings_list = self._ensure_prior_quarters_for_cashflow(
-                    cik, filings_list, all_filings_for_company, company_data
-                )
+                if not self.guidance_only:
+                    filings_list = self._ensure_prior_quarters_for_cashflow(
+                        cik, filings_list, all_filings_for_company, company_data
+                    )
                 logger.info(f"After fiscal year/quarter filtering: {len(filings_list)} filings")
             
             # Update company name for logging
@@ -1170,7 +1205,7 @@ class SECDataScraperApp:
             if conv:
                 self.current_company_doc['fiscal_year_convention'] = conv
                 company_data['fiscal_year_convention'] = conv
-                if self.db is not None:
+                if self.db is not None and not self.guidance_only:
                     self.db.companies.update_one(
                         {'cik': {'$in': [cik, cik.lstrip('0')]}},
                         {'$set': {'fiscal_year_convention': conv}}
@@ -1222,7 +1257,7 @@ class SECDataScraperApp:
             for i, filing in enumerate(filing_iterator, 1):
                 accession_number = filing.get('accessionNumber', '')
                 form_type = filing.get('form', '')
-                if form_type in FOREIGN_ANNUAL_FORMS:
+                if form_type in FOREIGN_ANNUAL_FORMS and not self.guidance_only:
                     if not self._record_foreign_annual_filing(cik, filing):
                         filings_failed += 1
                         continue
@@ -1255,26 +1290,41 @@ class SECDataScraperApp:
                 # ── Non-reload: skip filings already in the database ──
                 else:
                     filing_bar.set_description_str(f"{ticker:<6} {form_type} {filing_date_short} ⬇")
-                    existing_filing = self._find_existing_filing(cik, filing)
-                    if existing_filing:
-                        self._ensure_skipped_quarterly_cashflow_deaccumulated(cik, filing)
-                        _period_label = self._format_filing_period(filing, self.current_company_data)
-                        self.progress.status(
-                            f"  [skip]   {_period_label:<12} {accession_number or filing_date}  already stored"
-                        )
-                        logger.debug(f"📋 Filing {accession_number or filing_date} already processed, skipping")
-                        if self.html_download_path and accession_number:
-                            self.sec_client.download_html_filing(
-                                cik, accession_number, filing_date or '2010-01-01',
-                                self.html_download_path, ticker, reload=self.reload
+                    if self.guidance_only:
+                        if self._find_existing_guidance(cik, accession_number):
+                            _period_label = self._format_filing_period(filing, self.current_company_data)
+                            self.progress.status(
+                                f"  [skip]   {_period_label:<12} {accession_number or filing_date}  guidance already stored"
                             )
-                        filings_skipped += 1
-                        if summary and accession_number:
-                            summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
-                        continue
+                            logger.debug(f"📋 Guidance for {accession_number or filing_date} already stored, skipping")
+                            filings_skipped += 1
+                            if summary and accession_number:
+                                summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
+                            continue
+                    else:
+                        existing_filing = self._find_existing_filing(cik, filing)
+                        if existing_filing:
+                            self._ensure_skipped_quarterly_cashflow_deaccumulated(cik, filing)
+                            _period_label = self._format_filing_period(filing, self.current_company_data)
+                            self.progress.status(
+                                f"  [skip]   {_period_label:<12} {accession_number or filing_date}  already stored"
+                            )
+                            logger.debug(f"📋 Filing {accession_number or filing_date} already processed, skipping")
+                            if self.html_download_path and accession_number:
+                                self.sec_client.download_html_filing(
+                                    cik, accession_number, filing_date or '2010-01-01',
+                                    self.html_download_path, ticker, reload=self.reload
+                                )
+                            filings_skipped += 1
+                            if summary and accession_number:
+                                summary.log_filing_progress(ticker, i, total_target, accession_number, "skipped")
+                            continue
                 
-                # Process individual filing with full SEC API data
-                processing_result = self.process_filing_with_full_data(cik, filing)
+                # Process individual filing
+                if self.guidance_only:
+                    processing_result = self.process_filing_guidance_only(cik, filing)
+                else:
+                    processing_result = self.process_filing_with_full_data(cik, filing)
                 
                 if processing_result:
                     filings_processed += 1
@@ -1310,12 +1360,14 @@ class SECDataScraperApp:
             self.progress.close_filing_bar()
 
             # Step 4: Run post-processing only when this run actually saved a
-            # filing. If every selected filing was skipped, there is no new
-            # accumulator data and no reason to make the potentially slow
-            # companyfacts API reconciliation calls.
-            if filings_processed > 0:
+            # filing. If every selected filing was skipped (or guidance-only),
+            # there is no new accumulator data and no reason to run the
+            # company stage.
+            if filings_processed > 0 and not self.guidance_only:
                 self.progress.set_status(f"{ticker:<6} company stage...")
                 self._run_company_agent_stage(cik, ticker)
+            elif filings_processed > 0 and self.guidance_only:
+                self.progress.set_status(f"{ticker:<6} guidance complete")
             else:
                 self.progress.set_status(f"{ticker:<6} no new filings")
 
@@ -1378,7 +1430,7 @@ class SECDataScraperApp:
             if conv:
                 self.current_company_doc['fiscal_year_convention'] = conv
                 company_data['fiscal_year_convention'] = conv
-                if self.db is not None:
+                if self.db is not None and not self.guidance_only:
                     self.db.companies.update_one(
                         {'cik': {'$in': [cik, cik.lstrip('0')]}},
                         {'$set': {'fiscal_year_convention': conv}}
@@ -1403,7 +1455,7 @@ class SECDataScraperApp:
                     'cik': cik
                 }
 
-            if target_filing.get('form') in FOREIGN_ANNUAL_FORMS:
+            if target_filing.get('form') in FOREIGN_ANNUAL_FORMS and not self.guidance_only:
                 if not self._record_foreign_annual_filing(cik, target_filing):
                     return False
 
@@ -1435,55 +1487,62 @@ class SECDataScraperApp:
             except Exception:
                 self._last_period_label = None
 
-            # Accession/period deduplication. A 20-F/A is only considered
-            # already handled when that amendment itself is present; an
-            # original 20-F for the same year must not block the amendment.
-            if not self.reload and self._find_existing_filing(cik, target_filing):
-                logger.info("Filing %s is already stored; skipping", accession_number)
-                if self.html_download_path and accession_number:
-                    filing_date_for_download = target_filing.get('filingDate', target_filing.get('reportDate', '2010-01-01'))
-                    self.sec_client.download_html_filing(
-                        cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
-                    )
-                return True
+            # Accession/period deduplication.
+            if self.guidance_only:
+                if not self.reload and self._find_existing_guidance(cik, accession_number):
+                    logger.info("Guidance for %s is already stored; skipping", accession_number)
+                    self.progress.status(f"  [skip]  guidance already stored  {accession_number}")
+                    return True
+            else:
+                # A 20-F/A is only considered already handled when that
+                # amendment itself is present; an original 20-F for the same
+                # year must not block the amendment.
+                if not self.reload and self._find_existing_filing(cik, target_filing):
+                    logger.info("Filing %s is already stored; skipping", accession_number)
+                    if self.html_download_path and accession_number:
+                        filing_date_for_download = target_filing.get('filingDate', target_filing.get('reportDate', '2010-01-01'))
+                        self.sec_client.download_html_filing(
+                            cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+                        )
+                    return True
 
-            # Guard: skip if this filing's period is already covered — same
-            # logic as --latest in the CLI. Amendments are exempt: same report
-            # date is expected, and they may revise the annual facts.
-            # Compare the filing's reportDate against the most recent
-            # reporting_period.end_date stored for this company.  If the
-            # filing's period is not NEWER, it is already in normalize_data
-            # (from a prior XBRL run or the reconciliation gap-fill).
-            if not self.reload:
-                report_date_str = target_filing.get('reportDate')
-                if report_date_str:
-                    latest_stored = self.get_latest_filing_date(cik)
-                    if latest_stored:
-                        from datetime import datetime as _dt
-                        report_dt  = _dt.strptime(report_date_str, '%Y-%m-%d')
-                        latest_dt  = _dt.strptime(latest_stored,   '%Y-%m-%d')
-                        if report_dt <= latest_dt and str(target_filing.get('form') or '').upper() != '20-F/A':
-                            logger.info(
-                                f"Filing {accession_number} period {report_date_str} "
-                                f"already covered (latest stored: {latest_stored}) — skipping"
-                            )
-                            self.progress.status(
-                                f"  [skip]  period {report_date_str} already stored"
-                                f"  (latest: {latest_stored})"
-                            )
-                            if self.html_download_path and accession_number:
-                                filing_date_for_download = target_filing.get('filingDate', target_filing.get('reportDate', '2010-01-01'))
-                                self.sec_client.download_html_filing(
-                                    cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+                # Guard: skip if this filing's period is already covered — same
+                # logic as --latest in the CLI. Amendments are exempt: same report
+                # date is expected, and they may revise the annual facts.
+                if not self.reload:
+                    report_date_str = target_filing.get('reportDate')
+                    if report_date_str:
+                        latest_stored = self.get_latest_filing_date(cik)
+                        if latest_stored:
+                            from datetime import datetime as _dt
+                            report_dt  = _dt.strptime(report_date_str, '%Y-%m-%d')
+                            latest_dt  = _dt.strptime(latest_stored,   '%Y-%m-%d')
+                            if report_dt <= latest_dt and str(target_filing.get('form') or '').upper() != '20-F/A':
+                                logger.info(
+                                    f"Filing {accession_number} period {report_date_str} "
+                                    f"already covered (latest stored: {latest_stored}) — skipping"
                                 )
-                            return True
+                                self.progress.status(
+                                    f"  [skip]  period {report_date_str} already stored"
+                                    f"  (latest: {latest_stored})"
+                                )
+                                if self.html_download_path and accession_number:
+                                    filing_date_for_download = target_filing.get('filingDate', target_filing.get('reportDate', '2010-01-01'))
+                                    self.sec_client.download_html_filing(
+                                        cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+                                    )
+                                return True
 
             logger.info(f"Processing filing {accession_number} for {company_name} ({ticker})")
             self.progress.status(f"  [company]  {company_name}  ({ticker})")
 
             # Process the filing
-            self.progress.set_status(f"parsing XBRL  {form_type_label}")
-            success = self.process_filing_with_full_data(cik, target_filing)
+            if self.guidance_only:
+                self.progress.set_status(f"extracting guidance  {form_type_label}")
+                success = self.process_filing_guidance_only(cik, target_filing)
+            else:
+                self.progress.set_status(f"parsing XBRL  {form_type_label}")
+                success = self.process_filing_with_full_data(cik, target_filing)
 
             if success:
                 logger.info(f"✅ Successfully processed filing {accession_number}")
@@ -1491,15 +1550,15 @@ class SECDataScraperApp:
                 logger.error(f"❌ Failed to process filing {accession_number}")
 
             # Deaccumulate quarterly deltas and fill extraction gaps only
-            # after a filing was actually saved. Avoid reconciliation network
-            # calls when the requested filing was skipped or failed.
-            if success:
+            # after a filing was actually saved (never in guidance-only mode).
+            if success and not self.guidance_only:
                 self.progress.set_status("company stage")
                 self._run_company_agent_stage(cik, ticker)
 
             # Read period label from the DB (written by normalization service —
             # no calculation here, just reading what was stored).
-            self._last_period_label: Optional[str] = self._get_latest_period_label(cik)
+            if not self.guidance_only:
+                self._last_period_label: Optional[str] = self._get_latest_period_label(cik)
 
             _result_icon = "\u2713 processed" if success else "\u2717 failed"
             self.progress.status(f"  [result]  {_result_icon}  {accession_number}")
@@ -2165,6 +2224,119 @@ class SECDataScraperApp:
         return sorted(filings, key=_sort_key)
 
     @safe_processing_operation("filing_processing", default_return=False)
+    def process_filing_guidance_only(self, cik: str, filing_info: Dict) -> bool:
+        """Extract and save forward-looking MD&A guidance only for a single filing.
+
+        Skips XBRL extraction, normalization, hierarchy compilation, validation,
+        and financial-statement persistence.
+        """
+        required_fields = ['accessionNumber', 'form']
+        if not validate_required_fields(filing_info, required_fields, "process_filing_guidance_only"):
+            return False
+
+        accession_number: str = filing_info['accessionNumber']
+        form_type: str = filing_info['form']
+        ticker = self.sec_client.get_ticker_from_cik(cik) or f"CIK_{cik}"
+        if self.progress is not None:
+            ticker = self.progress.label(cik, ticker)
+        company_name = (self.current_company_doc or {}).get('name') or (self.current_company_data or {}).get('name') or str(cik)
+
+        filing_date = filing_info.get('filingDate')
+        report_period = filing_info.get('reportDate') or filing_date
+
+        # Build reporting_period deterministically from SEC metadata (no XBRL needed)
+        fiscal_year = None
+        quarter_num = None
+        period_type = 'annual' if is_annual_form(form_type) else 'quarterly'
+        if report_period:
+            try:
+                from utilities.helpers.period_utils import FiscalYearCalculator
+                fiscal_year_end = self._get_authoritative_fiscal_year_end(self.current_company_data)
+                fiscal_year_conv = self._get_authoritative_fiscal_year_convention(self.current_company_data)
+                report_end_date = datetime.strptime(str(report_period)[:10], '%Y-%m-%d')
+                fiscal_year, quarter_num = FiscalYearCalculator.calculate_fiscal_year_and_quarter(
+                    report_end_date, fiscal_year_end, fiscal_year_convention=fiscal_year_conv
+                )
+            except Exception as e:
+                logger.debug(f"Could not calculate fiscal period for guidance-only {accession_number}: {e}")
+
+        reporting_period = {
+            'end_date': report_period,
+            'period_type': period_type,
+            'fiscal_year': fiscal_year,
+            'quarter': None if period_type == 'annual' else quarter_num,
+        }
+
+        period_label = self._format_filing_period(filing_info, self.current_company_data)
+        self._ensure_audit()
+        if self._presenter is not None:
+            self._presenter.filing_header(
+                {
+                    'ticker': ticker,
+                    'cik': cik,
+                    'form_type': form_type,
+                    'accession_number': accession_number,
+                },
+                period_label=period_label,
+            )
+        else:
+            self.progress.status(
+                f"  [guidance] {period_label:<12} {form_type} {accession_number} extracting"
+            )
+
+        # Ensure HTML filing is cached locally when html_download_path is enabled
+        if self.html_download_path:
+            filing_date_for_download = filing_date or report_period or '2010-01-01'
+            self.sec_client.download_html_filing(
+                cik, accession_number, filing_date_for_download, self.html_download_path, ticker, reload=self.reload
+            )
+
+        try:
+            from filings_agent.state import new_state
+            from filings_agent.hooks import set_detail_callback
+
+            agent_state = new_state(
+                cik=cik,
+                ticker=ticker,
+                company_name=company_name,
+                form_type=form_type,
+                accession_number=accession_number,
+                filing_doc={'form_type': form_type, 'accession_number': accession_number},
+                company_doc=self.current_company_doc or {'cik': cik, 'name': company_name},
+                filing_date=filing_date or report_period,
+                sec_client=self.sec_client,
+            )
+            agent_state['reporting_period'] = reporting_period
+            if self.html_download_path:
+                agent_state['html_dir'] = self.html_download_path
+
+            self.progress.set_status(f"{ticker:<6} guidance agent...")
+            set_detail_callback(self.progress.set_status)
+            try:
+                final_state = self._build_guidance_only_agent_graph().invoke(agent_state)
+            finally:
+                set_detail_callback(None)
+
+            extract_info = final_state.get('guidance_extract') or {}
+            save_info = final_state.get('guidance_save') or {}
+            extract_status = extract_info.get('status')
+            save_status = save_info.get('status')
+            n_records = len(final_state.get('guidance_records') or [])
+
+            if extract_status in ('error', 'no_period') or save_status == 'failed':
+                reason = extract_info.get('error') or save_info.get('error') or extract_status or save_status
+                logger.warning(f"⚠️  Guidance-only failed for {accession_number}: {reason}")
+                return False
+
+            logger.info(
+                f"✅ Guidance-only complete for {accession_number}: "
+                f"extract={extract_status}, records={n_records}, save={save_status}"
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"⚠️  Guidance-only failed for {accession_number}: {exc}", exc_info=True)
+            return False
+
     def process_filing_with_full_data(self, cik: str, filing_info: Dict) -> bool:
         """
         Process a filing with full data (online mode).
@@ -3311,6 +3483,12 @@ def main(argv: Optional[Sequence[str]] = None):
         help='Keep the stored hierarchy untouched: allow mapping incoming tags to '
              'existing stored concepts, and skip genuinely new concepts so values '
              'are only inserted into existing hierarchy concepts.')
+    proc.add_argument(
+        '--guidance-only', '--guidence-only',
+        action='store_true', dest='guidance_only',
+        help='Extract and save forward-looking MD&A guidance only — skips XBRL '
+             'extraction, financial statement normalization/persistence, and '
+             'post-processing company stages.')
 
     # --- HTML download options --------------------------------------------
     html = parser.add_argument_group('HTML filing downloads')
@@ -3424,6 +3602,14 @@ def main(argv: Optional[Sequence[str]] = None):
         if args.only_download_files:
             print("❌ --url cannot be used with --only-download-files")
             sys.exit(1)
+
+    if args.guidance_only:
+        if args.only_download_files:
+            print("❌ --guidance-only/--guidence-only cannot be used with --only-download-files")
+            sys.exit(1)
+        if args.fix_hierarchy:
+            print("❌ --guidance-only/--guidence-only cannot be used with --fix-hierarchy")
+            sys.exit(1)
     
     # HTML download: enabled by default; disabled only with --no-download-html-filings.
     html_download_path = ""
@@ -3481,6 +3667,7 @@ def main(argv: Optional[Sequence[str]] = None):
                 html_download_path=html_download_path,
                 enable_reconciliation=not args.no_reconciliation,
                 no_new_concept=args.no_new_concept,
+                guidance_only=args.guidance_only,
                 progress=progress,
             )
             
@@ -3641,6 +3828,8 @@ def main(argv: Optional[Sequence[str]] = None):
                 print("Dimensions processing ENABLED - will capture segment, product, and geographic data")
             if args.no_new_concept:
                 print("NO-NEW-CONCEPT MODE ENABLED - keeping stored hierarchy untouched (mapping only; skipping new concepts)")
+            if args.guidance_only:
+                print("GUIDANCE-ONLY MODE ENABLED - extracting & saving MD&A guidance only (skipping financial statements and company stage)")
             if html_download_path:
                 print(f"HTML downloading ENABLED - saving to {html_download_path}")
             elif args.no_download_html_filings:
@@ -3696,6 +3885,7 @@ def main(argv: Optional[Sequence[str]] = None):
             html_download_path=html_download_path,
             enable_reconciliation=not args.no_reconciliation,
             no_new_concept=args.no_new_concept,
+            guidance_only=args.guidance_only,
             progress=progress,
         )
 

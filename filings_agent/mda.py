@@ -248,7 +248,7 @@ def default_mda_provider(state: dict) -> Optional[str]:
         cik=str(state.get("cik") or ""),
         ticker=state.get("ticker"),
         form_type=str(state.get("form_type") or ""),
-        html_dir=os.getenv("SEC_HTML_DOWNLOAD_PATH"),
+        html_dir=state.get("html_dir") or os.getenv("SEC_HTML_DOWNLOAD_PATH"),
         html_text=state.get("html_text"),
         sec_client=state.get("sec_client"),
         filing_date=state.get("filing_date"),

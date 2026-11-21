@@ -134,11 +134,18 @@ def run_once(
     fixture: str,
     *,
     persist: bool,
+    guidance_only: bool = False,
     norm_service: Any = None,
     report_store: Any = None,
 ) -> dict:
     """Run one filing through the graph (or compute+validate) and return the state."""
     state = load_fixture_state(fixture)
+    if guidance_only:
+        from filings_agent.graph import build_guidance_only_graph
+
+        graph = build_guidance_only_graph()
+        return graph.invoke(state)
+
     if norm_service is None:
         norm_service = _build_norm_service()
 
@@ -198,16 +205,17 @@ def run_batch_mode(
     session_path: Optional[str] = None,
     resume: bool = True,
     company_stage: bool = False,
+    guidance_only: bool = False,
 ) -> dict:
     """Run a batch of filings through the graph with audit + resume."""
     from filings_agent.audit import build_audit_log, install_audit
     from filings_agent.batch import run_batch, run_company_stage
-    from filings_agent.graph import build_filing_graph
+    from filings_agent.graph import build_filing_graph, build_guidance_only_graph
     from filings_agent.reports import build_report_store
     from filings_agent.session import build_session
 
     states = load_batch_states(batch_path)
-    if norm_service is None:
+    if not guidance_only and norm_service is None:
         norm_service = _build_norm_service()
 
     audit = install_audit(audit_path)
@@ -216,11 +224,14 @@ def run_batch_mode(
         # events (node/tool events come from the hook layer).
         audit = build_audit_log(audit_path)
     session = build_session(session_path)
-    graph = build_filing_graph(norm_service, report_store=build_report_store())
+    if guidance_only:
+        graph = build_guidance_only_graph()
+    else:
+        graph = build_filing_graph(norm_service, report_store=build_report_store())
 
     out = run_batch(graph, states, session=session, audit=audit, skip_saved=resume)
 
-    if company_stage:
+    if company_stage and not guidance_only:
         from filings_agent.company_graph import build_company_graph
 
         accumulated = _accumulate_quarterly(states)
@@ -276,6 +287,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Run the full graph and write to MongoDB (--fixture default: compute + validate only).",
     )
+    parser.add_argument(
+        "--guidance-only",
+        "--guidence-only",
+        action="store_true",
+        dest="guidance_only",
+        help="Extract and save forward-looking MD&A guidance only (skip financial statements).",
+    )
     parser.add_argument("--audit-log", help="JSONL audit trail path (default: AGENT_AUDIT_LOG or .filings_agent/audit.jsonl).")
     parser.add_argument("--session-file", help="Durable session path (default: AGENT_SESSION_FILE or .filings_agent/session.jsonl).")
     parser.add_argument("--no-resume", action="store_true", help="Ignore the session ledger; re-run everything.")
@@ -300,6 +318,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 session_path=args.session_file,
                 resume=not args.no_resume,
                 company_stage=args.company_stage,
+                guidance_only=args.guidance_only,
             )
         except FileNotFoundError as exc:
             print(f"error: batch file not found: {exc}", file=sys.stderr)
@@ -321,11 +340,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.fixture:
         parser.error("one of --fixture or --batch is required")
 
-    mode = "PERSIST (writes to MongoDB)" if args.persist else "compute + validate (no statement writes)"
+    if args.guidance_only:
+        mode = "GUIDANCE-ONLY (MD&A guidance extraction + save only)"
+    elif args.persist:
+        mode = "PERSIST (writes to MongoDB)"
+    else:
+        mode = "compute + validate (no statement writes)"
     print(f"filings-agent: {mode}")
 
     try:
-        final = run_once(args.fixture, persist=args.persist)
+        final = run_once(args.fixture, persist=args.persist, guidance_only=args.guidance_only)
     except FileNotFoundError as exc:
         print(f"error: fixture not found: {exc}", file=sys.stderr)
         return 2
@@ -343,7 +367,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         for f in findings:
             print(f"  [{f.get('severity'):>6}] {f.get('type')}: {f.get('message')}")
 
-    ok = final.get("status") in ("normalized", "validated", "saved")
+    if args.guidance_only:
+        extract_status = (final.get("guidance_extract") or {}).get("status")
+        save_status = (final.get("guidance_save") or {}).get("status")
+        ok = extract_status not in ("error", "no_period") and save_status != "failed"
+    else:
+        ok = final.get("status") in ("normalized", "validated", "saved")
     return 0 if ok else 1
 
 

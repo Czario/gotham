@@ -252,5 +252,58 @@ def build_filing_graph(
     return ADKGraphRunner(root_agent, app_name="filings_agent")
 
 
+def build_guidance_only_graph(
+    *,
+    guidance_chat_llm: Any = None,
+    mda_provider: Any = None,
+    decision_chat_llm: Any = None,
+    on_event: Any = None,
+) -> ADKGraphRunner:
+    """Build a lightweight Google ADK workflow that ONLY extracts and saves guidance.
+
+    Skips XBRL extraction, normalization, hierarchy compilation, validation,
+    repair, and financial-statement persistence:
+
+        extract_guidance → save_guidance → END
+    """
+    sub_agents = [
+        ADKStepAgent(
+            "extract_guidance",
+            _wrap(
+                make_guidance_extract_node(
+                    chat_llm=guidance_chat_llm,
+                    mda_provider=mda_provider,
+                    on_event=on_event,
+                    force_enabled=True,
+                ),
+                "extract_guidance_node",
+                decision_chat_llm,
+            ),
+            description="MD&A forward-looking guidance extraction (guidance-only mode).",
+        ),
+        ADKStepAgent(
+            "save_guidance",
+            _wrap(
+                make_guidance_save_node(force_enabled=True),
+                "save_guidance_node",
+                decision_chat_llm,
+            ),
+            description="Guidance persistence (guidance-only mode).",
+        ),
+    ]
+    edges = {
+        "extract_guidance": "save_guidance",
+        "save_guidance": "__end__",
+    }
+    root_agent = ADKSequentialAgent(
+        "guidance_only_pipeline_agent",
+        sub_agents,
+        description="Google ADK guidance-only extraction and persistence pipeline.",
+        entry_point="extract_guidance",
+        edges=edges,
+    )
+    return ADKGraphRunner(root_agent, app_name="filings_agent")
+
+
 # Convenience alias used by the CLI / entry point.
 build_graph = build_filing_graph

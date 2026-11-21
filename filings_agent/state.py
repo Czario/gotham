@@ -91,6 +91,7 @@ class FilingAgentState(TypedDict):
     # ── guidance (P6) ──────────────────────────────────────────────────────
     mda_text: NotRequired[Optional[str]]
     html_text: NotRequired[Optional[str]]
+    html_dir: NotRequired[Optional[str]]
     guidance_records: NotRequired[Optional[list]]
     guidance_extract: NotRequired[Optional[dict]]
     guidance_save: NotRequired[Optional[dict]]

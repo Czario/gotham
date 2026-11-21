@@ -397,6 +397,7 @@ def normalize_guidance_records(
         return [], ["__guidance__ is not a list"]
 
     records: list[dict[str, Any]] = []
+    seen_idx: dict[tuple[Any, ...], int] = {}
     issues: list[str] = []
     cap = max(1, GUIDANCE_MAX_RECORDS or 15)
 
@@ -408,8 +409,8 @@ def normalize_guidance_records(
             issues.append(f"record {i + 1}: not an object — dropped")
             continue
 
-        # metric + curated defaults
-        metric = _clean_str(raw.get("metric"), 80) or "other"
+        # metric + curated defaults (lowercase canonical so "Revenue" and "revenue" never duplicate)
+        metric = (_clean_str(raw.get("metric"), 80) or "other").lower()
         profile = metric_profile(metric)
         default_label, default_statement, _direction = (
             profile if profile else (None, "income", "up")
@@ -585,6 +586,26 @@ def normalize_guidance_records(
         }
         if lines_out is not None:
             doc["_lines"] = lines_out  # internal evidence — save node strips it
+
+        dedup_key = (
+            metric,
+            basis,
+            period_doc.get("fiscal_year"),
+            period_doc.get("quarter"),
+            period_type,
+        )
+        if dedup_key in seen_idx:
+            prev_i = seen_idx[dedup_key]
+            prev_doc = records[prev_i]
+            # Prefer quantitative over qualitative when both exist for the same metric+period
+            if prev_doc.get("form") == "qualitative" and doc.get("form") != "qualitative":
+                records[prev_i] = doc
+                issues.append(f"record {i + 1} ({metric}): replaced qualitative duplicate for same period")
+            else:
+                issues.append(f"record {i + 1} ({metric}): duplicate metric+period dropped")
+            continue
+
+        seen_idx[dedup_key] = len(records)
         records.append(doc)
 
     return records, issues

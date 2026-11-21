@@ -65,6 +65,7 @@ def make_guidance_extract_node(
     chat_llm: Any = None,
     mda_provider: Optional[Callable[[dict], Optional[str]]] = None,
     on_event: Any = None,
+    force_enabled: bool = False,
 ) -> Callable[[dict], dict]:
     """Build the ``extract_guidance`` node."""
 
@@ -79,7 +80,7 @@ def make_guidance_extract_node(
         )
         from ..mda import default_mda_provider
 
-        if not config.GUIDANCE_ENABLED:
+        if not force_enabled and not config.GUIDANCE_ENABLED:
             return {**state, "guidance_records": [], "guidance_extract": {"status": "disabled"}}
 
         period = _filing_period(state)
@@ -187,7 +188,7 @@ def make_guidance_extract_node(
     return extract_guidance_node
 
 
-def make_guidance_save_node() -> Callable[[dict], dict]:
+def make_guidance_save_node(*, force_enabled: bool = False) -> Callable[[dict], dict]:
     """Build the ``save_guidance`` node (upsert + score; never fails the run)."""
 
     def save_guidance_node(state: dict) -> dict:
@@ -197,7 +198,7 @@ def make_guidance_save_node() -> Callable[[dict], dict]:
             upsert_guidance_records,
         )
 
-        if not config.GUIDANCE_ENABLED:
+        if not force_enabled and not config.GUIDANCE_ENABLED:
             return {**state, "guidance_save": {"status": "disabled"}}
 
         records = state.get("guidance_records") or []
