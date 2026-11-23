@@ -1,6 +1,6 @@
 # SEC EDGAR Financial Data Scraper & Normalization Pipeline
 
-Extracts XBRL financial data (`10-K`, `10-Q`, `20-F`, `20-F/A`) from SEC EDGAR filings, normalizes concepts and dimensional breakdowns, validates and repairs through an agent pipeline, and stores canonical data in MongoDB.
+Extracts financial statements and forward-looking guidance from SEC EDGAR XBRL filings (`10-K`, `10-Q`, `20-F`, `20-F/A`), earnings releases (`8-K`, `6-K`), and IR press-release PDFs/URLs, normalizes concepts and dimensional breakdowns, validates and repairs through an agent pipeline, and stores canonical data in MongoDB (`normalize_data`).
 
 ---
 
@@ -82,7 +82,7 @@ uv run main --companies AAPL --reload --fiscal-year 2026 --fiscal-quarter Q3 --n
 
 ### Load guidance only (`--guidence-only` / `--guidance-only`)
 
-Extract and save forward-looking MD&A guidance into `guidance_values` without extracting, normalizing, validating, or writing financial statements, company metadata, or post-processing company stages (Q4 calculation / SEC `companyfacts` reconciliation).
+Extract and save forward-looking guidance (from `10-K`/`10-Q`/`20-F` MD&A and/or `8-K`/`6-K` earnings releases) into `guidance_values` without extracting, normalizing, validating, or writing financial statements, company metadata, or post-processing stages (Q4 calculation / SEC `companyfacts` reconciliation).
 
 - Skips filings that already have guidance stored in `guidance_values` (even if financial statements are already stored for the filing).
 - With `--reload`, re-extracts guidance for the selected filings and upserts in place (sweeping stale `source="llm"` rows while keeping `source="manual"` entries untouched, and never touching financial statements).
@@ -149,9 +149,14 @@ uv run main --failures --companies MSFT
 - `worker-8k` — 8-K / 6-K / IR PDF earnings releases (`sec:filings:8k`, includes Playwright + Chromium)
 
 ```bash
+# Docker Compose (recommended)
 docker compose up -d --build                 # build and start both workers
 docker compose restart worker-10kq worker-8k # restart after code edits (no rebuild)
 docker compose logs -f worker-10kq worker-8k
+
+# Local workers (without Docker)
+uv run sec-scraper-worker                    # 10-K / 10-Q / 20-F worker
+uv run earnings-8k-worker                    # 8-K / 6-K / IR PDF worker
 ```
 
 ### Load or reload a specific statement for a specific quarter
@@ -211,14 +216,16 @@ uv run python -m cli.main statement --ticker AAPL --fiscal-year 2023 --quarter Q
 | `--no-dimensions` | Processing | Skip dimensional (segment / product / geography) extraction |
 | `--no-reconciliation` | Processing | Disable SEC companyfacts gap-fill reconciliation pass |
 | `--no-new-concept` | Processing | Keep stored hierarchy untouched: map matching tags to existing concepts and skip genuinely new concepts so values only populate existing hierarchy rows |
-| `--guidance-only`, `--guidence-only` | Processing | Extract and save forward-looking MD&A guidance into `guidance_values` only — skips XBRL extraction, financial statement writes, and company post-processing |
-| `--form FORM` | Filtering | SEC form(s): `all` (auto US `10-K/10-Q/8-K` or foreign `20-F/6-K`), `10-K`, `10-Q`, `10k-10q`, `20-F`, `8-K`, `6-K`, `20f-6k`, `10k-10q-8k` |
+| `--guidance-only`, `--guidence-only` | Processing | Extract and save forward-looking guidance (`10-K`/`10-Q`/`20-F` MD&A and `8-K`/`6-K` releases) into `guidance_values` only — skips financial statement writes and company post-processing |
+| `--form FORM`, `--from FORM` | Filtering | SEC form(s): `all` (auto US `10-K/10-Q/8-K` or foreign `20-F/6-K`), `10-K`, `10-Q`, `10k-10q`, `20-F`, `8-K`, `6-K`, `20f-6k`, `10k-10q-8k` |
+| `--earnings` | Earnings | Shortcut to run `8-K`/`6-K` earnings release extraction (optional when `--form 8-K` or `--form 6-K` is passed) |
 | `--accession ACC [...]` | Earnings | Pin one or more exact accession numbers for `8-K` / `6-K` |
 | `--quarterly-only` | Earnings | Skip annual filings and post-save Q4 derivation for `8-K` / `6-K` |
 | `--dry-run` | Earnings | Preview matching `8-K` / `6-K` filings or test connectivity without LLM calls or DB writes |
 | `--failures` | Earnings | Inspect degraded/failed `8-K` / `6-K` runs in MongoDB |
 | `--fix-hierarchy`, `--fix-hi` | Processing | Fix stored hierarchy in place using the Hierarchy Agent and SEC HTML tables without re-scraping values |
 | `--no-download-html-filings` | HTML | Skip downloading HTML/HTM filings (enabled by default to `SEC_HTML_DOWNLOAD_PATH` or `~/sec_html_filings`, saving both `.htm` and `.html.gz`) |
+| `--only-download-files` | HTML | Download HTML filings only — no XBRL extraction or database writes |
 | `--verbose` | Output | Detailed per-filing INFO log output (disables progress bars) |
 | `--debug` | Output | Full DEBUG-level logs (implies `--verbose`) |
 
