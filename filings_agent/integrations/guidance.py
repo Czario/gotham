@@ -237,6 +237,7 @@ def upsert_guidance_records(
     accession_number: str | None = None,
     form_type: str = "8-K",
     filing_period: Any = None,
+    db: Any = None,
 ) -> dict[str, Any]:
     """Persist normalized guidance records into ``guidance_values``.
 
@@ -246,7 +247,7 @@ def upsert_guidance_records(
     with or without --reload): never creates duplicate or triplicate rows for
     the same filing/metric/concept/period.
     """
-    db = _get_db()
+    db = db if db is not None else _get_db()
     col = _guidance_col(db)
     now = datetime.now(tz=timezone.utc)
 

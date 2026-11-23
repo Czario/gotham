@@ -88,6 +88,10 @@ Extract and save forward-looking MD&A guidance into `guidance_values` without ex
 - With `--reload`, re-extracts guidance for the selected filings and upserts in place (sweeping stale `source="llm"` rows while keeping `source="manual"` entries untouched, and never touching financial statements).
 
 ```bash
+# Load guidance across ALL relevant forms (US: 10-K/10-Q/8-K; Foreign: 20-F/6-K)
+uv run main --companies MSFT --form all --guidence-only
+uv run main --companies ASML --form all --guidence-only --year 2024
+
 # Load guidance for a company from a specific year onwards
 uv run main --companies AAPL --year 2025 --guidence-only
 
@@ -102,6 +106,53 @@ uv run main --url "https://www.sec.gov/Archives/edgar/data/320193/00003201932400
 ```
 
 *(Note: `--guidance-only` and `--guidence-only` are interchangeable aliases.)*
+
+### Select SEC forms (`--form`)
+
+Control exactly which SEC forms to process — works with `--year`, `--end-year`, `--fiscal-year`, `--quarter`, `--latest`, `--reload`, and `--statement`:
+
+| `--form` value | What it processes |
+| --- | --- |
+| *(omitted)* | Default XBRL (`10-K`, `10-Q`, `20-F`, `20-F/A`) |
+| `all` | **Auto-detected per company** — US: `10-K`, `10-Q`, `8-K`; Foreign: `20-F`, `20-F/A`, `6-K` |
+| `10k-10q` | Only `10-K` and `10-Q` (`10-K` or `10-Q` alone also supported) |
+| `20-F` | Only `20-F` / `20-F/A` |
+| `8-K` | All `8-K` earnings releases from `--year` (default `2010`) to now |
+| `6-K` | All `6-K` foreign earnings releases from `--year` (default `2010`) to now |
+| `20f-6k`, `10k-10q-8k` | Any combination of XBRL + earnings forms |
+
+```bash
+# Complete data (financial statements + guidance) — auto-detects US vs foreign
+uv run main --companies MSFT --form all                  # US: 10-K, 10-Q, 8-K
+uv run main --companies ASML --form all                  # Foreign: 20-F, 6-K
+
+# Specific forms (2010 → now by default, or scoped by year/quarter)
+uv run main --companies MSFT --form 10k-10q
+uv run main --companies MSFT --form 8-K --year 2024
+uv run main --companies ASML --form 6-K --fiscal-year 2025 --quarter Q2 --reload
+
+# --latest works for ANY form (processes only the single newest filing)
+uv run main --companies MSFT --form all --latest
+uv run main --companies MSFT --form 8-K --latest
+uv run main --companies ASML --form 6-K --latest
+
+# Manual IR PDF / press-release URL, pinned accession, or failure inspection
+uv run main --companies MSFT --form 8-K --url https://example.com/release.pdf
+uv run main --companies ASML --form 6-K --accession 0001628280-26-048235
+uv run main --failures --companies MSFT
+```
+
+### Background Redis Workers (Docker Compose)
+
+`gotham` runs both workers from a single multi-stage `Dockerfile`:
+- `worker-10kq` — 10-K / 10-Q / 20-F XBRL filings (`sec:filings:10kq`, lean image)
+- `worker-8k` — 8-K / 6-K / IR PDF earnings releases (`sec:filings:8k`, includes Playwright + Chromium)
+
+```bash
+docker compose up -d --build                 # build and start both workers
+docker compose restart worker-10kq worker-8k # restart after code edits (no rebuild)
+docker compose logs -f worker-10kq worker-8k
+```
 
 ### Load or reload a specific statement for a specific quarter
 
@@ -161,6 +212,11 @@ uv run python -m cli.main statement --ticker AAPL --fiscal-year 2023 --quarter Q
 | `--no-reconciliation` | Processing | Disable SEC companyfacts gap-fill reconciliation pass |
 | `--no-new-concept` | Processing | Keep stored hierarchy untouched: map matching tags to existing concepts and skip genuinely new concepts so values only populate existing hierarchy rows |
 | `--guidance-only`, `--guidence-only` | Processing | Extract and save forward-looking MD&A guidance into `guidance_values` only — skips XBRL extraction, financial statement writes, and company post-processing |
+| `--form FORM` | Filtering | SEC form(s): `all` (auto US `10-K/10-Q/8-K` or foreign `20-F/6-K`), `10-K`, `10-Q`, `10k-10q`, `20-F`, `8-K`, `6-K`, `20f-6k`, `10k-10q-8k` |
+| `--accession ACC [...]` | Earnings | Pin one or more exact accession numbers for `8-K` / `6-K` |
+| `--quarterly-only` | Earnings | Skip annual filings and post-save Q4 derivation for `8-K` / `6-K` |
+| `--dry-run` | Earnings | Preview matching `8-K` / `6-K` filings or test connectivity without LLM calls or DB writes |
+| `--failures` | Earnings | Inspect degraded/failed `8-K` / `6-K` runs in MongoDB |
 | `--fix-hierarchy`, `--fix-hi` | Processing | Fix stored hierarchy in place using the Hierarchy Agent and SEC HTML tables without re-scraping values |
 | `--no-download-html-filings` | HTML | Skip downloading HTML/HTM filings (enabled by default to `SEC_HTML_DOWNLOAD_PATH` or `~/sec_html_filings`, saving both `.htm` and `.html.gz`) |
 | `--verbose` | Output | Detailed per-filing INFO log output (disables progress bars) |

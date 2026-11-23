@@ -1,20 +1,22 @@
-# Distributed 10-K / 10-Q extraction worker.
+# Distributed SEC extraction workers:
+#   - worker-10kq: 10-K / 10-Q / 20-F XBRL filings  (queue: sec:filings:10kq)
+#   - worker-8k:   8-K / 6-K / IR PDF earnings      (queue: sec:filings:8k)
 #
-# Networking: same as earning_scraping_agent worker.
+# Networking:
 #   MongoDB — joins backend_true_grids_backend_network (shared with admin_backend)
 #   Redis   — reaches admin_backend's Redis via host port 6379
 #
 # Usage:
-#   docker compose up -d          # first time (or after dep / Dockerfile changes)
-#   docker compose up -d --build  # after pyproject.toml / uv.lock changes
-#   docker compose restart worker-10kq  # after any code change (no rebuild needed)
-#   docker compose logs -f worker-10kq
+#   docker compose up -d --build                 # build and start both workers
+#   docker compose restart worker-10kq worker-8k # restart after code edits (no rebuild)
+#   docker compose logs -f worker-10kq worker-8k
 
 services:
   worker-10kq:
     build:
       context: .
       dockerfile: Dockerfile
+      target: worker-10kq
     env_file:
       - path: .env
         required: false
@@ -25,20 +27,41 @@ services:
       DATABASE_NAME:          normalize_data
       SEC_HTML_DOWNLOAD_PATH: /app/sec_html_filings
       PYTHONUNBUFFERED:       "1"
-      # Suppress uv hardlink warning when cache and target are on different
-      # filesystems (Docker volume vs container layer).
       UV_LINK_MODE:           copy
     volumes:
-      # Mount source so code edits are reflected without rebuilding the image.
-      # uv sync installs the project in editable mode, so Python reads from
-      # this mount at runtime.  After editing, run:
-      #   docker compose restart worker-10kq
       - .:/app
-      # Preserve the .venv built during the image build so the host mount
-      # above doesn't hide it.
       - /app/.venv
-      # SEC HTML filing downloads (persistent across restarts)
       - /Users/aijaz/sec_html_filings:/app/sec_html_filings
+    restart: unless-stopped
+    networks:
+      - backend_true_grids_backend_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker-8k:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker-8k
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      REDIS_URL:           redis://host.docker.internal:6379/0
+      REDIS_QUEUE_NAME:    sec:filings:8k
+      IR_TEMP_FILINGS_DIR: /app/uploads/ir-filings
+      MONGODB_URI:         mongodb://mongo:27017/?directConnection=true
+      DATABASE_NAME:       normalize_data
+      NORMALIZE_DB_NAME:   normalize_data
+      LLM_PROVIDER:        ${LLM_PROVIDER:-deepseek}
+      PYTHONUNBUFFERED:    "1"
+      TZ:                  ${TZ:-UTC}
+      RUN_LOGS_DIR:        /app/Logs
+      UV_LINK_MODE:        copy
+    volumes:
+      - .:/app
+      - /app/.venv
+      - ../admin_backend/uploads/ir-filings:/app/uploads/ir-filings
     restart: unless-stopped
     networks:
       - backend_true_grids_backend_network

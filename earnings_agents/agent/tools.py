@@ -1,0 +1,947 @@
+"""Agent tools — document navigation + calculation for the pi-style agent.
+
+The agent receives a plain-text document (HTML tags stripped) and navigates
+it with three navigation tools, exactly like a coding agent navigates a
+codebase:
+
+    get_document_info()           — size overview
+    read_lines(start, end)        — read a line range
+    search(query, context_lines)  — find matching lines with context
+
+Plus three utility tools:
+
+    get_prior_value(metric)    — DB lookup for sanity checking
+    verify_identity(r,c,g)     — GP = Rev − CoR check
+    calculate(expression)      — arithmetic evaluator for derived metrics
+
+The calculate tool lets the agent compute derived values itself (Gross Profit,
+Operating Income, Net Income, EPS, margins) instead of relying on external
+deterministic derivation code.
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Callable
+
+from langchain_core.tools import tool as _lc_tool
+
+from earnings_agents.agent.indexer import build_section_index, format_section_index
+
+logger = logging.getLogger(__name__)
+
+
+def build_pi_tools(
+    document_text: str,
+    cik: str | None = None,
+    company_name: str = "",
+    company_industry: dict | None = None,
+    document_map: list[dict] | None = None,
+    target_concepts: list[dict] | None = None,
+    prebuilt_sections: dict | None = None,
+    section_store: dict | None = None,
+    section_builder: Callable[[str], tuple[dict, float]] | None = None,
+    prescan_is_hints: list[dict] | None = None,
+    include_find_sections: bool = True,
+    fiscal_year: int | None = None,
+    quarter: int | None = None,
+    include_cashflow_tools: bool = True,
+    period: Any | None = None,
+    prior_values: dict[str, float] | None = None,
+    allowed_statements: list[str] | None = None,
+) -> list:
+    """Build the pi-style tool set for raw document navigation.
+
+    Args:
+        document_text: Full plain-text of the filing (possibly a concatenated
+            multi-exhibit bundle).
+        cik: Company CIK for company info lookup.
+        company_name: Company name for display.
+        company_industry: Cached ``{sic_code, sic_description}`` profile from
+            ``normalize_data.companies`` — ``get_company_info`` returns it
+            directly instead of re-querying MongoDB (falls back to a DB
+            lookup when absent).
+        document_map: Exhibit boundaries inside *document_text*
+            (``[{exhibit, url, line_start, line_end, truncated, skipped}]``).
+            When provided, ``get_document_info`` lists it so the agent can
+            jump straight to the exhibit holding the data it needs.
+        prebuilt_sections: An already-built section map (from the period pass)
+            — ``find_sections`` returns it instantly instead of re-indexing.
+        section_store: Mutable dict; ``find_sections`` writes the built index
+            into ``section_store["index"]`` so the graph can persist it to
+            state for the extraction pass.
+        section_builder: Callable ``(text, query=None) -> (index, elapsed)``
+            used by ``find_sections`` on a cold cache.  Defaults to the LLM
+            section locator (``agent/indexer.build_section_index``).
+        prescan_is_hints: Prescan-detected financial-statement exhibit hints
+            (``[{exhibit, lines, primary_count, secondary_count, bs_count,
+            cf_count, income, balance_sheet, cash_flow}]``).  When present,
+            ``find_sections`` returns an instant routing hint instead of
+            calling the expensive LLM indexer.
+        include_find_sections: When False, ``find_sections`` is omitted from
+            the returned tool set.  The period agent uses this — it only
+            needs the period header (get_document_info/search/read_lines),
+            and a stray ``find_sections()`` call there would trigger the
+            expensive full-document LLM indexer for no benefit.
+        fiscal_year: The canonical fiscal year from the detected period —
+            baked into the ``deaccumulate_cashflow`` tool closure so the
+            agent cannot hallucinate the fiscal year.
+        quarter: The canonical quarter (1–3, or None for annual) from the
+            detected period — baked into ``deaccumulate_cashflow``.
+        include_cashflow_tools: When False, the cash-flow de-accumulation tools
+            (``detect_cashflow_period_basis`` / ``deaccumulate_cashflow``) are
+            omitted.  The period agent uses this — it runs before period
+            detection and never touches the cash-flow statement.
+    """
+    lines = document_text.split("\n")
+    total_lines = len(lines)
+    total_chars = len(document_text)
+    document_map = document_map or []
+    allowed_statement_set = {
+        str(item).strip().lower()
+        for item in (allowed_statements or [c.get("statement_type") for c in (target_concepts or [])])
+        if item
+    }
+
+    if prior_values is None and cik and target_concepts and period is not None:
+        try:
+            from earnings_agents.agent.derive import load_prior_values
+            prior_values = load_prior_values(target_concepts, cik, period)
+        except Exception as exc:
+            logger.debug("Failed to load prior values in build_pi_tools: %s", exc)
+            prior_values = {}
+    elif prior_values is None:
+        prior_values = {}
+
+    # ── Search index: word → line numbers ──────────────────────────────
+    _line_index: dict[str, list[int]] = {}
+    for i, line in enumerate(lines):
+        for word in re.findall(r"[a-zA-Z]{4,}", line.lower()):
+            _line_index.setdefault(word, []).append(i)
+
+    # Cash-flow concepts the agent has de-accumulated THIS run (normalized
+    # concept keys).  verify_cash_flow_identity refuses to verify a YTD
+    # cash-flow statement until at least one flow row has been
+    # de-accumulated — this FORCES the de-accumulation instead of relying on
+    # the agent to optionally follow the prompt.
+    _cf_deaccumulated: set[str] = set()
+
+    def _exhibit_for_line(ln: int) -> str:
+        """Which exhibit does a line belong to (empty when single-document)."""
+        if not document_map:
+            return ""
+        for d in document_map:
+            ls = d.get("line_start")
+            le = d.get("line_end")
+            if ls and le and ls <= ln <= le:
+                return d.get("exhibit") or d.get("url") or ""
+        return ""
+
+    # ── 1. Document info ───────────────────────────────────────────────
+    @_lc_tool
+    def get_document_info() -> str:
+        """Get an overview of the document bundle's size and structure.
+
+        Returns total line/character counts, the exhibit map (which document
+        holds which line ranges), and a preview of the first lines.  Use this
+        FIRST to understand the document before navigating — income-statement
+        detail may live in a supplemental exhibit.
+        """
+        # Show first 10 non-empty lines as a "table of contents" preview
+        preview_lines: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and len(stripped) > 3 and not stripped.startswith(("*", "(", "|", "§", "═")):
+                preview_lines.append(stripped[:120])
+                if len(preview_lines) >= 15:
+                    break
+        toc = "\n".join(f"  {i+1:4d}: {l}" for i, l in enumerate(preview_lines[:15]))
+
+        if document_map:
+            map_lines = []
+            for i, d in enumerate(document_map):
+                status: list[str] = []
+                if d.get("skipped"):
+                    status.append(f"SKIPPED — {d.get('reason') or 'unavailable'}")
+                elif d.get("error"):
+                    status.append(f"ERROR: {str(d['error'])[:60]}")
+                elif d.get("truncated"):
+                    status.append("TRUNCATED")
+                rng = (
+                    f"lines {d['line_start']}-{d['line_end']}"
+                    if d.get("line_start") else "not loaded"
+                )
+                suffix = f"  [{'; '.join(status)}]" if status else ""
+                map_lines.append(
+                    f"  {i+1}. {d.get('exhibit') or d.get('url') or '?'}: {rng}{suffix}"
+                )
+            docs_block = "\n".join(map_lines)
+        else:
+            docs_block = f"  single document — lines 1-{total_lines}"
+
+        # Per-exhibit opening lines so the agent can classify each document
+        # (press release vs presentation vs supplemental) WITHOUT reading it.
+        doc_preview_lines: list[str] = []
+        for d in document_map or []:
+            ls = d.get("line_start")
+            if not ls:
+                continue
+            end = d.get("line_end") or total_lines
+            head: list[str] = []
+            for i in range(ls - 1, min(end, total_lines)):
+                s = lines[i].strip()
+                if s and len(s) > 3 and not s.startswith(("*", "(", "|", "§", "═")):
+                    head.append(s[:100])
+                    if len(head) >= 3:
+                        break
+            label = d.get("exhibit") or d.get("url") or "?"
+            preview = " | ".join(head) if head else "(no readable preview)"
+            doc_preview_lines.append(f"  • {label} (lines {ls}-{end}): {preview}")
+        docs_preview = "\n".join(doc_preview_lines)
+
+        return (
+            f"Document bundle: {total_chars:,} characters, {total_lines:,} lines, "
+            f"{len(document_map) or 1} exhibit(s)\n"
+            f"Exhibit map:\n{docs_block}\n"
+            + (f"Exhibit previews:\n{docs_preview}\n" if docs_preview else "")
+            + f"First lines (preview):\n{toc}"
+        )
+
+    # ── 1b. Section map (prescan hints → instant, LLM indexer as fallback) ──
+    section_index_cache: dict[str, Any] = {}
+    _section_builder = section_builder or build_section_index
+
+    @_lc_tool
+    def find_sections(query: str | None = None) -> str:
+        """Get the document's section map with line ranges.
+
+        Returns the major sections (income statement, segment results,
+        EPS/share data, balance sheet, ...) with their 1-based line ranges.
+        Call this FIRST to locate the income statement, then read_lines() the
+        range it reports.  The map is returned instantly when available from
+        prescan hints or a pre-built index; the LLM indexer is a last resort.
+
+        Args:
+            query: Optional focus hint (e.g. "where is EPS?").  The full map
+                is returned either way; on a cold cache the hint steers the
+                indexer to make sure the relevant section is included.
+        """
+        if prebuilt_sections:
+            return format_section_index(prebuilt_sections)
+        if section_index_cache:
+            return format_section_index(section_index_cache)
+
+        # Prescan found the income-statement exhibit — return an instant
+        # routing hint instead of calling the expensive LLM indexer.
+        if prescan_is_hints:
+            best = prescan_is_hints[0]
+            parts = [
+                f"Financial-statement exhibit (prescan): {best['exhibit']}",
+                f"  lines {best['lines'][0]}-{best['lines'][1]}"
+                f" (IS {best.get('primary_count', 0)}+{best.get('secondary_count', 0)} ctx, "
+                f"BS {best.get('bs_count', 0)}, CF {best.get('cf_count', 0)})",
+            ]
+            # Add remaining exhibits as secondary targets.
+            for h in prescan_is_hints[1:]:
+                parts.append(
+                    f"  Also: {h['exhibit']} lines {h['lines'][0]}-{h['lines'][1]}"
+                    f" (IS {h.get('primary_count', 0)}+{h.get('secondary_count', 0)} ctx, "
+                    f"BS {h.get('bs_count', 0)}, CF {h.get('cf_count', 0)})"
+                )
+            return "\n".join(parts)
+
+        try:
+            index, elapsed = _section_builder(document_text, query=query)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "find_sections failed for %s: %s", cik or "?", exc, exc_info=True
+            )
+            from earnings_agents.hooks import report_call
+
+            report_call(
+                f"  [index]  section map FAILED ({str(exc)[:80]}) — "
+                f"agent will navigate with search()/read_lines()"
+            )
+            return (
+                "Section indexing failed. Use search() and read_lines() to "
+                "navigate the document instead."
+            )
+        section_index_cache.update(index)
+        if section_store is not None:
+            section_store["index"] = index
+        from earnings_agents.hooks import report_call
+
+        report_call(
+            f"  [index]  section map built — {len(index.get('sections') or [])} "
+            f"section(s), coverage {index.get('coverage')} ({elapsed:.1f}s)"
+        )
+        return format_section_index(index)
+
+    # ── 2. Read lines ─────────────────────────────────────────────────
+    @_lc_tool
+    def read_lines(start: int, end: int) -> str:
+        """Read a range of lines from the document.
+
+        Args:
+            start: Starting line number (1-based, inclusive).
+            end: Ending line number (1-based, inclusive).
+
+        Returns the specified lines with line numbers for reference.
+        Use this to read a section you've located via search().
+        """
+        if start < 1 or end > total_lines or start > end:
+            return (
+                f"Invalid range. Document has {total_lines:,} lines. "
+                f"Request read_lines(1, min(500, {total_lines})) for the start."
+            )
+
+        result_lines: list[str] = []
+        for i in range(start - 1, min(end, total_lines)):
+            line_text = lines[i][:500]
+            result_lines.append(f"{i + 1:5d}: {line_text}")
+
+        header = f"Lines {start}-{min(end, total_lines)} of {total_lines:,}:"
+        return header + "\n" + "\n".join(result_lines)
+
+    # ── 3. Search ──────────────────────────────────────────────────────
+    @_lc_tool
+    def search(query: str, context_lines: int = 3) -> str:
+        """Search the document for lines containing a term or phrase.
+
+        Args:
+            query: Text to search for (e.g. "Revenue", "Cost of", "interest").
+            context_lines: Lines of context before/after each match (default 3).
+
+        Returns matching lines with line numbers.  Use read_lines() to
+        read the surrounding section in full.
+
+        TIP: Search for metric names, dollar amounts, or date headers
+        to locate the income statement quickly.
+        """
+        if not query.strip():
+            return "Empty query — provide a search term."
+
+        query_lower = query.lower()
+        words = re.findall(r"[a-zA-Z]{4,}", query_lower)
+
+        candidates: set[int] = set()
+        if words:
+            candidates = set(_line_index.get(words[0], []))
+            for w in words[1:]:
+                candidates &= set(_line_index.get(w, []))
+            if not candidates:
+                for w in words:
+                    candidates |= set(_line_index.get(w, []))
+
+        # Also direct substring match
+        direct_matches: set[int] = set()
+        for i, line in enumerate(lines):
+            if query_lower in line.lower():
+                direct_matches.add(i)
+
+        all_matches = candidates | direct_matches
+        if not all_matches:
+            return f"No lines found matching '{query}'."
+
+        # Group into blocks with context
+        ctx = context_lines
+        sorted_matches = sorted(all_matches)
+        blocks: list[list[int]] = []
+        current_block = [sorted_matches[0]]
+        for m in sorted_matches[1:]:
+            if m - current_block[-1] <= ctx * 2:
+                current_block.append(m)
+            else:
+                blocks.append(current_block)
+                current_block = [m]
+        blocks.append(current_block)
+
+        out_lines: list[str] = []
+        for block in blocks[:15]:
+            block_start = max(0, block[0] - ctx)
+            block_end = min(total_lines, block[-1] + ctx + 1)
+            exhibit = _exhibit_for_line(block[0])
+            tag = f" ({exhibit})" if exhibit else ""
+            out_lines.append(f"── lines {block_start + 1}-{block_end}{tag} ──")
+            for i in range(block_start, block_end):
+                marker = ">>>" if i in all_matches else "   "
+                line_text = lines[i][:200]
+                out_lines.append(f"{marker} {i + 1:5d}: {line_text}")
+
+        if len(blocks) > 15:
+            out_lines.append(f"... ({len(blocks) - 15} more blocks)")
+        return "\n".join(out_lines)
+
+    # ── 4. Prior value lookup ──────────────────────────────────────────
+    @_lc_tool
+    def get_prior_value(
+        metric: str | None = None,
+        metric_description: str | None = None,
+    ) -> str:
+        """Look up the prior reporting period's value for a metric.
+
+        Args:
+            metric: A short description, e.g. "Revenue" or "Weighted Average Number of Shares Outstanding".
+            metric_description: Synonym for metric.
+
+        Returns the prior period's value for reference.  Use ONLY to
+        confirm the correct column — do NOT return it as your answer.
+        """
+        raw = metric or metric_description or ""
+        desc_lower = raw.lower().strip()
+        if not desc_lower:
+            return "Please provide a metric description, e.g. get_prior_value(metric='Revenue')."
+        pv = prior_values or {}
+        for label, value in pv.items():
+            if label.lower() == desc_lower:
+                return (
+                    f"Prior period '{label}': {value:,.0f} (stored in full raw units; "
+                    f"report current-period values in the filing's table scale, do NOT pre-multiply)"
+                )
+        for label, value in pv.items():
+            label_lower = label.lower()
+            if desc_lower in label_lower or label_lower in desc_lower:
+                return (
+                    f"Prior period '{label}': {value:,.0f} (stored in full raw units; "
+                    f"report current-period values in the filing's table scale, do NOT pre-multiply)"
+                )
+        if pv:
+            available = ", ".join(list(pv.keys())[:10])
+            return f"No prior value for '{raw}'. Available: {available}"
+        return "No prior-period reference values available."
+
+    # ── 5. Identity verification ──────────────────────────────────────
+    @_lc_tool
+    def verify_identity(
+        revenue: float,
+        cost_of_revenue: float,
+        gross_profit: float,
+    ) -> str:
+        """Verify that Gross Profit = Revenue − Cost of Revenue.
+
+        Call before finalizing to confirm correct column selection.
+        """
+        expected = revenue - cost_of_revenue
+        diff = abs(gross_profit - expected)
+        pct = (diff / max(abs(revenue), 1)) * 100
+        if pct < 1.0:
+            return (
+                f"✓ VERIFIED: Revenue ({revenue:,.0f}) − Cost of Revenue "
+                f"({cost_of_revenue:,.0f}) = {expected:,.0f} ≈ Gross Profit "
+                f"({gross_profit:,.0f}). Column is correct."
+            )
+        else:
+            return (
+                f"✗ FAILED: Revenue ({revenue:,.0f}) − Cost of Revenue "
+                f"({cost_of_revenue:,.0f}) = {expected:,.0f}, but Gross Profit "
+                f"= {gross_profit:,.0f}. Difference: {diff:,.0f} ({pct:.2f}%). "
+                f"Wrong column — re-read the income statement."
+            )
+
+    @_lc_tool
+    def verify_balance_sheet_identity(
+        total_assets: float,
+        total_liabilities: float,
+        total_equity: float,
+    ) -> str:
+        """Verify that Total Assets = Total Liabilities + Total Equity.
+
+        Call after reading the Balance Sheet to confirm numbers match the
+        fundamental accounting equation (Assets = Liabilities + Equity).
+        """
+        rhs = total_liabilities + total_equity
+        diff = abs(total_assets - rhs)
+        pct = (diff / max(abs(total_assets), 1)) * 100
+        if pct < 1.0 or diff < 0.05:
+            return (
+                f"✓ VERIFIED: Total Assets ({total_assets:,.0f}) ≈ Liabilities "
+                f"({total_liabilities:,.0f}) + Equity ({total_equity:,.0f}) = {rhs:,.0f}. "
+                f"Balance Sheet is balanced."
+            )
+        else:
+            return (
+                f"✗ FAILED: Total Assets ({total_assets:,.0f}) != Liabilities "
+                f"({total_liabilities:,.0f}) + Equity ({total_equity:,.0f}) = {rhs:,.0f}. "
+                f"Difference: {diff:,.0f} ({pct:.2f}%). Check column selection, "
+                f"scale, or whether equity includes noncontrolling interests."
+            )
+
+    @_lc_tool
+    def verify_cash_flow_identity(
+        operating_cf: float,
+        investing_cf: float,
+        financing_cf: float,
+        net_change: float,
+    ) -> str:
+        """Verify that Net Change in Cash = Operating CF + Investing CF + Financing CF.
+
+        Call after reading the Statement of Cash Flows to verify that the
+        three section totals sum to the reported net change in cash.
+        """
+        # FORCING FUNCTION: if the cash-flow statement is year-to-date
+        # ("Six/Nine Months Ended") and the agent has not yet de-accumulated
+        # any flow row, REFUSE to verify.  This blocks the agent from
+        # reporting YTD values as the quarter.
+        from earnings_agents.agent.deaccumulate import detect_cashflow_statement_basis
+        basis = detect_cashflow_statement_basis(document_text)
+        if (
+            basis
+            and basis["basis"] in ("ytd_6m", "ytd_9m")
+            and quarter in (2, 3)
+            and not _cf_deaccumulated
+        ):
+            return (
+                f"✗ NOT VERIFIED — the cash-flow statement is \"{basis['evidence']}\" "
+                f"(YEAR-TO-DATE, {basis['months']} months).  The values you passed "
+                f"(operating {operating_cf:,.0f}, investing {investing_cf:,.0f}, "
+                f"financing {financing_cf:,.0f}, net change {net_change:,.0f}) are "
+                f"{basis['months']}-month CUMULATIVES, NOT the quarter.  De-accumulate "
+                f"EVERY cash-flow flow row via deaccumulate_cashflow(value=<printed>,"
+                f"concept_key=<bracketed key>, ytd_months={basis['months']},"
+                f"filing_label=<row label>), then call verify_cash_flow_identity() again "
+                f"with the de-accumulated quarterly values."
+            )
+
+        expected = operating_cf + investing_cf + financing_cf
+        diff = abs(net_change - expected)
+        pct = (diff / max(abs(net_change), 1)) * 100 if net_change != 0 else 0.0
+        if pct < 1.0 or diff < 0.05:
+            return (
+                f"✓ VERIFIED: Operating ({operating_cf:,.0f}) + Investing ({investing_cf:,.0f}) "
+                f"+ Financing ({financing_cf:,.0f}) = {expected:,.0f} ≈ Net Change ({net_change:,.0f}). "
+                f"Cash flow section totals match net change.\n"
+                f"⚠ This identity holds for BOTH quarterly and year-to-date (YTD) values. "
+                f"If the cash-flow header is 'Six/Nine Months Ended', the figures are YTD — "
+                f"call detect_cashflow_period_basis() then deaccumulate_cashflow() per flow row "
+                f"before reporting."
+            )
+        else:
+            return (
+                f"✗ FAILED: Operating ({operating_cf:,.0f}) + Investing ({investing_cf:,.0f}) "
+                f"+ Financing ({financing_cf:,.0f}) = {expected:,.0f}, but reported Net Change "
+                f"= {net_change:,.0f}. Difference: {diff:,.0f} ({pct:.2f}%). "
+                f"Check signs (used in investing/financing) or foreign exchange effects."
+            )
+
+    # ── 6. Calculator (for derived metrics) ─────────────────────────────
+    def _safe_eval_expression(expression: str) -> str:
+        """Evaluate a simple arithmetic expression via safe AST evaluation.
+
+        Shared by the ``calculate`` and ``compute`` tools (both are LangChain
+        StructuredTools, so the raw evaluator must live in a plain function
+        they can both call).
+        """
+        import ast
+        import operator
+
+        _ops = {
+            ast.Add: operator.add,
+            ast.Sub: operator.sub,
+            ast.Mult: operator.mul,
+            ast.Div: operator.truediv,
+            ast.USub: operator.neg,
+            ast.UAdd: operator.pos,
+        }
+
+        def _eval(node):
+            # ast.Num/ast.Str are aliases of ast.Constant since Python 3.8;
+            # read .value (node.n is deprecated in 3.14).
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            if isinstance(node, ast.BinOp):
+                left = _eval(node.left)
+                right = _eval(node.right)
+                op_fn = _ops.get(type(node.op))
+                if op_fn is None:
+                    raise ValueError(f"Unsupported operator: {ast.dump(node.op)}")
+                return op_fn(left, right)
+            if isinstance(node, ast.UnaryOp):
+                operand = _eval(node.operand)
+                op_fn = _ops.get(type(node.op))
+                if op_fn is None:
+                    raise ValueError(f"Unsupported unary operator")
+                return op_fn(operand)
+            if isinstance(node, ast.ParenExpr):
+                return _eval(node.value)
+            raise ValueError(f"Unsupported expression type: {ast.dump(node)}")
+
+        try:
+            # Clean the expression: remove commas, currency symbols, whitespace
+            clean = expression.replace(",", "").replace("$", "").strip()
+            # SEC/IR convention: a bare parenthesized number is NEGATIVE.
+            # Convert (1,234) → (0-1234) so the sign survives arithmetic
+            # (e.g. "-(175,685)" becomes -(0-175685) = +175685, i.e. the
+            # double negative the author wrote).  Groups containing operators
+            # "(a - b)" are untouched.
+            clean = re.sub(r"\((\d+(?:\.\d+)?)\)", r"(0-\1)", clean)
+            tree = ast.parse(clean, mode="eval")
+            result = _eval(tree.body)
+            if isinstance(result, float) and result == int(result):
+                result = int(result)
+            return str(result)
+        except Exception as exc:
+            return f"Error evaluating '{expression}': {exc}"
+
+    @_lc_tool
+    def calculate(expression: str) -> str:
+        """Evaluate a simple arithmetic expression and return the result.
+
+        Use this to compute derived metrics AFTER extracting raw values from
+        the document, keeping numbers in the statement's printed table scale
+        (never pre-multiply by thousands/millions/billions).  For example:
+
+          calculate("1006.3 - 509.8")                → Gross Profit (in table units)
+          calculate("(753.2 - 272.4) / 753.2 * 100") → margin %
+          calculate("33900 / 15700")                 → EPS
+
+        Supports: +, -, *, /, parentheses, decimal numbers.
+        No variables, no functions, no imports — pure arithmetic only.
+
+        NOTE: a parenthesized number on its own follows SEC/IR convention and
+        is NEGATIVE — calculate("(175,685)") → -175685, so passing a
+        negative-looking table row keeps its sign.
+        """
+        return _safe_eval_expression(expression)
+
+    # ── 7. Company info lookup ──────────────────────────────────────────
+    @_lc_tool
+    def get_company_info() -> str:
+        """Get the company's industry profile (SIC code + description).
+
+        ADVISORY CONTEXT ONLY: use it to understand what kind of company
+        you're dealing with (bank, insurer, manufacturer, retailer) so you
+        can recognize industry terminology in the filing.  Industry data can
+        never supply values — extract numbers from the filing only.
+        """
+        from earnings_agents.agent.industry import normalize_company_industry
+
+        profile = normalize_company_industry(company_industry)
+        if profile:
+            return (
+                f"Company: {company_name or '?'}\n"
+                f"CIK: {cik or 'unknown'}\n"
+                f"Industry: {profile['sic_description'] or '?'} "
+                f"(SIC {profile['sic_code'] or '?'})"
+            )
+
+        # Fallback — callers that built the toolset without a cached profile
+        # (or with an empty one) get the full document lookup.
+        try:
+            from earnings_agents.integrations.normalize import _get_client, _NORMALIZE_DB
+            db = _get_client()[_NORMALIZE_DB]
+            doc = db["companies"].find_one({"cik": cik}) if cik else None
+            if not doc:
+                return f"Company not found in database. CIK: {cik or 'unknown'}"
+
+            ind = doc.get("industry") or {}
+            corp = doc.get("corporate_info") or {}
+            market = doc.get("market_info") or {}
+            sic = ind.get("sic_code", "?")
+            sic_desc = ind.get("sic_description", "?")
+            fy = corp.get("fiscal_year_end", "?")
+            exchanges = ", ".join(market.get("exchanges", []))
+            entity = corp.get("entity_type", "?")
+
+            return (
+                f"Company: {company_name or doc.get('name', '?')}\n"
+                f"CIK: {cik}\n"
+                f"Industry: {sic_desc} (SIC {sic})\n"
+                f"Fiscal Year End: {fy} (MMDD format — e.g. 1231 = Dec 31)\n"
+                f"Exchange: {exchanges}\n"
+                f"Entity Type: {entity}"
+            )
+        except Exception as exc:
+            return f"Error looking up company info: {exc}"
+
+    # ── 8. Currency detection ──────────────────────────────────────────
+    @_lc_tool
+    def detect_currency(start: int | None = None, end: int | None = None) -> str:
+        """Detect the currency declared in a line range of the document.
+
+        Args:
+            start: First line (1-based, inclusive). Omit to scan the whole document.
+            end: Last line (1-based, inclusive). Omit to scan the whole document.
+
+        Returns the detected currency code, confidence, and evidence. Use
+        read_lines() to find a table's currency declaration first, then call
+        this on that line range to confirm it before extracting numbers.
+        """
+        from earnings_agents.agent.currency import detect_currency as _detect
+
+        if start is None or end is None:
+            snippet = document_text
+        else:
+            if start < 1 or end > total_lines or start > end:
+                return f"Invalid range. Document has {total_lines:,} lines."
+            snippet = "\n".join(lines[start - 1 : end])
+
+        res = _detect(snippet)
+        if not res["detected_codes"]:
+            return "No currency declaration detected in this range."
+        evidence = ", ".join(res["evidence"]) if res["evidence"] else "symbol only"
+        return (
+            f"Currency: {res['currency']} (confidence: {res['confidence']})\n"
+            f"Codes detected: {', '.join(res['detected_codes'])}\n"
+            f"Evidence: {evidence}"
+        )
+
+    # ── 9. Scale detection ─────────────────────────────────────────────
+    @_lc_tool
+    def detect_scale(start: int | None = None, end: int | None = None) -> str:
+        """Detect the numeric scale declared in a line range of the document.
+
+        Args:
+            start: First line (1-based, inclusive). Omit to scan the whole document.
+            end: Last line (1-based, inclusive). Omit to scan the whole document.
+
+        Returns the detected scale ("thousands" | "millions" | "billions" |
+        "mixed" | none), confidence, and evidence. Call this on each table's
+        declaration line range before extracting so reported values carry the
+        correct per-table scale.
+        """
+        from earnings_agents.agent.scale import detect_scale as _detect
+
+        if start is None or end is None:
+            snippet = document_text
+        else:
+            if start < 1 or end > total_lines or start > end:
+                return f"Invalid range. Document has {total_lines:,} lines."
+            snippet = "\n".join(lines[start - 1 : end])
+
+        res = _detect(snippet)
+        if not res["detected_scales"]:
+            return "No scale declaration detected in this range."
+        evidence = ", ".join(res["evidence"]) if res["evidence"] else "declaration only"
+        return (
+            f"Scale: {res['scale'] or 'unknown'} (confidence: {res['confidence']})\n"
+            f"Scales detected: {', '.join(res['detected_scales'])}\n"
+            f"Evidence: {evidence}"
+        )
+
+    # ── 10. Concept mapping (in-loop semantic mapping) ─────────────────
+    @_lc_tool
+    def map_concept(
+        metric_label: str,
+        candidates: list[str] | None = None,
+        statement_type: str | None = None,
+    ) -> str:
+        """Map a filing row label to a concept from the target concept list.
+
+        Args:
+            metric_label: The row label as printed in the document, e.g.
+                "Total revenue" or "Cloud and software".
+            candidates: Optional list of concept labels to restrict the
+                search to. Omit to search the full target list.
+            statement_type: Optional statement to filter to ("income",
+                "balancesheet", "cashflow").
+
+        Returns the matching concept's exact bracketed key (and concept id).
+        Use when a filing row's wording does not exactly match the concept
+        list label. The value is never changed by mapping — only the key.
+        """
+        if not target_concepts:
+            return "No target concepts available for mapping."
+        label_lower = metric_label.strip().lower()
+        if not label_lower:
+            return "Empty label — provide the filing row's label."
+
+        from earnings_agents.agent.derive import _norm_label
+
+        cands = target_concepts
+        if statement_type:
+            st_norm = statement_type.strip().lower()
+            st_map = {"is": "income", "bs": "balancesheet", "cf": "cashflow"}
+            st_target = st_map.get(st_norm, st_norm)
+            cands = [c for c in cands if (c.get("statement_type") or "").strip().lower() == st_target]
+
+        if candidates:
+            cset = {c.strip().lower() for c in candidates}
+            cands = [
+                c for c in cands
+                if (c.get("label") or "").strip().lower() in cset
+                or (c.get("taxonomy_key") or c.get("concept") or "").strip().lower() in cset
+            ]
+
+        exact: list[dict] = []
+        norm: list[dict] = []
+        for c in cands:
+            label = (c.get("label") or "").strip()
+            key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+            if label.lower() == label_lower or key.lower() == label_lower:
+                exact.append(c)
+            elif _norm_label(label) == _norm_label(metric_label):
+                norm.append(c)
+
+        pool = exact or norm
+        if not pool:
+            return (
+                "No concept found for this label. Check the concept list "
+                "and try a synonym or a different label."
+            )
+        if len(pool) > 1:
+            preview = "; ".join(
+                f"[{(c.get('taxonomy_key') or c.get('concept') or '?')}] "
+                f"\"{c.get('label')}\" (id={c.get('_id')})" for c in pool[:5]
+            )
+            return (
+                f"Multiple concepts match: {preview}. Pass candidates to "
+                "disambiguate, or read the filing to decide which row this is."
+            )
+        c = pool[0]
+        key = (c.get("taxonomy_key") or c.get("concept") or "").strip()
+        return (
+            f"Matched: [{(key or c.get('label'))}] — \"{c.get('label')}\" "
+            f"(concept_id={c.get('_id')})"
+        )
+
+    # ── 11. Deterministic arithmetic for derived concepts ──────────────
+    @_lc_tool
+    def compute(expression: str) -> str:
+        """Compute an exact arithmetic result for a derived metric.
+
+        Identical to calculate() but intended for building concept values
+        (e.g. Gross Profit = Revenue − Cost of Revenue, or a parent = sum of
+        its children). Arithmetic is exact and deterministic — never rounded
+        by the model. Call calculate()/compute() instead of doing arithmetic
+        yourself, and report the result under the concept's bracketed key.
+        """
+        return _safe_eval_expression(expression)
+
+    # ── 12. Cash-flow period-basis detection (advisory) ────────────────
+    @_lc_tool
+    def detect_cashflow_period_basis(start: int | None = None, end: int | None = None) -> str:
+        """Detect the CASH-FLOW statement's period basis (quarterly vs year-to-date).
+
+        Args:
+            start: Optional first line (1-based) to restrict the scan.
+            end: Optional last line (1-based) to restrict the scan.
+
+        Call this with NO arguments BEFORE extracting cash-flow numbers — it
+        locates the cash-flow statement header and reports its column basis.
+        ytd_6m / ytd_9m ("Six/Nine Months Ended") means the printed flow
+        values are CUMULATIVE year-to-date and must be de-accumulated via
+        deaccumulate_cashflow() before reporting.  quarterly ("Three Months
+        Ended") means the printed values are already the quarter.
+        """
+        from earnings_agents.agent.deaccumulate import (
+            detect_cashflow_period_basis as _detect_basis,
+            detect_cashflow_statement_basis as _detect_cf_basis,
+        )
+
+        if start is None and end is None:
+            b = _detect_cf_basis(document_text)
+            if not b:
+                return (
+                    "No cash-flow statement header found. Use search(\"cash flows\") "
+                    "to locate it, then call detect_cashflow_period_basis(start, end) "
+                    "on its header lines."
+                )
+            if b["basis"] in ("ytd_6m", "ytd_9m"):
+                directive = (
+                    f"YEAR-TO-DATE ({b['months']} months) — the printed flow values are "
+                    f"CUMULATIVE, NOT the quarter.  De-accumulate EVERY flow row via "
+                    f"deaccumulate_cashflow(value=<printed>, concept_key=<bracketed key>, "
+                    f"ytd_months={b['months']}, filing_label=<row label>) and report the "
+                    f"RETURNED quarterly value.  \"...ending balances\" → as-is; "
+                    f"\"...beginning balances\" → skip."
+                )
+            elif b["basis"] == "annual":
+                directive = (
+                    "Annual (12 months) — treat as the full fiscal year, not a quarter."
+                )
+            else:
+                directive = "quarterly — extract the printed values as-is."
+            return (
+                f"Cash-flow statement basis: {b['basis']} ({b['months']} months) — "
+                f"evidence: \"{b['evidence']}\"\n{directive}"
+            )
+
+        if start is None or end is None:
+            snippet = document_text
+        else:
+            if start < 1 or end > total_lines or start > end:
+                return f"Invalid range. Document has {total_lines:,} lines."
+            snippet = "\n".join(lines[start - 1 : end])
+
+        found = _detect_basis(snippet)
+        if not found:
+            return "No 'X Months Ended' / 'Year Ended' header in this range."
+        parts = [
+            f"Period basis: {f['basis']} ({f['months']} months) — evidence: \"{f['evidence']}\""
+            for f in found
+        ]
+        parts.append(
+            "If the cash-flow column header is 'Six/Nine Months Ended' "
+            "(ytd_6m/ytd_9m), the printed flow values are year-to-date — "
+            "de-accumulate each flow via deaccumulate_cashflow(). "
+            "'Three Months Ended' = the quarter itself (no de-accumulation)."
+        )
+        return "\n".join(parts)
+
+    # ── 13. Cash-flow YTD de-accumulation ─────────────────────────────
+    @_lc_tool
+    def deaccumulate_cashflow(
+        value: float,
+        concept_key: str,
+        ytd_months: int,
+        filing_label: str | None = None,
+    ) -> str:
+        """De-accumulate one year-to-date (YTD) cash-flow value into its quarter.
+
+        Args:
+            value: The CURRENT-period YTD value read from the cash-flow
+                statement (e.g. the "Six/Nine Months Ended" column).
+            concept_key: The bracketed taxonomy key of the cash-flow row
+                (resolve the filing label with map_concept() first), e.g.
+                "[us-gaap:PaymentsToAcquirePropertyPlantAndEquipment]".
+            ytd_months: The cash-flow header's month count — 6 for Q2, 9 for Q3.
+            filing_label: The row label AS PRINTED in the filing (e.g. "Cash,
+                cash equivalents and restricted cash, ending balances") — used
+                to distinguish end-of-period snapshots (as-is) from
+                beginning-of-period snapshots (skip).
+
+        Returns the quarterly value (Q2 = 6m − Q1, Q3 = 9m − (Q1+Q2)), or a
+        directive: AS-IS (end-of-period snapshot, e.g. ending cash), beginning cash
+        balance (resolved from prior quarter ending cash), SKIP (other beginning-of-period
+        snapshot), or MISSING (a prior quarter isn't stored yet).  Report the
+        returned quarterly value under the bracketed key and list it in
+        __derived__.  Never de-accumulate unless the header is YTD.
+        """
+        from earnings_agents.agent.deaccumulate import deaccumulate_cashflow_value
+
+        result = deaccumulate_cashflow_value(
+            cik=cik,
+            value=value,
+            concept_key=concept_key,
+            fiscal_year=fiscal_year,
+            quarter=quarter,
+            ytd_months=ytd_months,
+            target_concepts=target_concepts,
+            filing_label=filing_label or "",
+        )
+        # Record a successful de-accumulation so verify_cash_flow_identity
+        # knows the agent has de-accumulated (unblocks its YTD refusal).
+        if result.startswith("De-accumulated"):
+            _cf_deaccumulated.add((concept_key or "").strip().strip("[]"))
+        return result
+
+    tools = [
+        get_document_info,
+        read_lines,
+        search,
+        get_prior_value,
+        verify_identity,
+        verify_balance_sheet_identity,
+        verify_cash_flow_identity,
+        calculate,
+        get_company_info,
+        detect_currency,
+        detect_scale,
+        map_concept,
+        compute,
+    ]
+    if include_cashflow_tools:
+        tools.extend([detect_cashflow_period_basis, deaccumulate_cashflow])
+    if include_find_sections:
+        tools.insert(1, find_sections)
+    return tools

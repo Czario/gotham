@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+_MODEL_NAME: str = os.getenv("MODEL_NAME", "").strip()
+
+OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL") or _MODEL_NAME or "llama3.1:8b"
+OLLAMA_NUM_CTX: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+
+# LLM provider selector: "deepseek" (default), "groq", "gemini", or "ollama".
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
+
+# Groq-only settings (read when LLM_PROVIDER="groq").
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL") or _MODEL_NAME or "openai/gpt-oss-120b"
+GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_REQUEST_TIMEOUT: float = float(os.getenv("GROQ_REQUEST_TIMEOUT", "60"))
+# Groq rate-limit budgets (free-tier defaults; override via env vars for paid plans).
+GROQ_RPM: int = int(os.getenv("GROQ_RPM", "30"))       # requests per minute
+GROQ_TPM: int = int(os.getenv("GROQ_TPM", "12000"))    # tokens per minute
+
+# DeepSeek settings (read when LLM_PROVIDER="deepseek").
+# deepseek-chat (fast/cheap), deepseek-reasoner (R1, slower, higher accuracy)
+DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL") or _MODEL_NAME or "deepseek-chat"
+DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+DEEPSEEK_REQUEST_TIMEOUT: float = float(os.getenv("DEEPSEEK_REQUEST_TIMEOUT", "120"))
+
+# Indexer (find_sections) routing.  The section locator is a simple one-shot
+# call — it can run on a FAST provider (e.g. gemini-2.5-flash) even when the
+# agent loops run on a slower default provider.  Empty INDEX_LLM_PROVIDER →
+# same provider as LLM_PROVIDER.  If the provider's API key is missing the
+# indexer falls back to the default provider (never fails a run).
+INDEX_LLM_PROVIDER: str = os.getenv("INDEX_LLM_PROVIDER", "").strip().lower()
+INDEX_LLM_MODEL: str = os.getenv("INDEX_LLM_MODEL", "").strip()
+
+# Google Gemini settings (read when LLM_PROVIDER="gemini").
+# Uses the official google-genai SDK (https://ai.google.dev/gemini-api/docs/libraries).
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL") or _MODEL_NAME or "gemini-2.5-flash"
+GEMINI_REQUEST_TIMEOUT: float = float(os.getenv("GEMINI_REQUEST_TIMEOUT", "120"))
+MONGODB_URI: str = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+MONGODB_DB: str = os.getenv("MONGODB_DB", "earnings_db")
+# SEC-normalized concepts/values normally live in this DB.  Override only for
+# isolated staging/pilot runs; defaults to DATABASE_NAME or normalize_data.
+NORMALIZE_DB_NAME: str = os.getenv("NORMALIZE_DB_NAME") or os.getenv("DATABASE_NAME") or "normalize_data"
+MONGODB_COLLECTION: str = os.getenv("MONGODB_COLLECTION", "earnings")
+
+# Redis queue settings (used by the 8-K worker).
+REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_QUEUE_NAME: str = os.getenv("REDIS_QUEUE_NAME", "sec:filings")
+
+# Seconds before HTTP requests time out
+HTTP_TIMEOUT: int = 30
+
+EXTRACTION_MAX_CHARS: int = int(os.getenv("EXTRACTION_MAX_CHARS", "3000000"))
+
+# Target financial statements to extract (comma-separated, e.g. "income,balancesheet,cashflow").
+# Defaults to extracting income statement, balance sheet, and cash flow statement.
+TARGET_STATEMENTS_RAW: str = os.getenv(
+    "TARGET_STATEMENTS", "income,balancesheet,cashflow"
+)
+TARGET_STATEMENTS: list[str] = [
+    s.strip().lower() for s in TARGET_STATEMENTS_RAW.split(",") if s.strip()
+] or ["income"]
+
+# When True (default), teach the extraction agent to de-accumulate year-to-date
+# (YTD) cash-flow statements into quarterly values.  Some filers present their
+# cash-flow statement on a YTD basis only ("Six Months Ended" for Q2, "Nine
+# Months Ended" for Q3); those flow values are cumulative, so the quarter is
+# derived as Q2 = 6m − Q1, Q3 = 9m − (Q1+Q2) via the deaccumulate_cashflow
+# tool (prior quarters come from concept_values_quarterly).  Set to 0 to
+# disable (the agent then treats printed cash-flow values as quarterly).
+DEACCUMULATE_YTD_CASHFLOW: bool = os.getenv(
+    "DEACCUMULATE_YTD_CASHFLOW", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+# Multi-exhibit fetching — filings can carry several EX-99 exhibits (press
+# release, presentation, supplemental information); the income statement often
+# lives in a supplemental exhibit (e.g. BofA's 99.3).  fetch_filing concatenates
+# all text exhibits; these caps bound per-exhibit and total size.
+FETCH_EXHIBIT_MAX_CHARS: int = int(os.getenv("FETCH_EXHIBIT_MAX_CHARS", "3000000"))
+FETCH_TOTAL_MAX_CHARS: int = int(os.getenv("FETCH_TOTAL_MAX_CHARS", "4000000"))
+
+# When True (default), refuse to upsert a document that has unresolved
+# high-severity findings. When False, the document is saved regardless.
+STRICT_ACCURACY: bool = os.getenv("STRICT_ACCURACY", "1").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+# Dev LLM response cache — opt-in, never enabled in production.
+# Set LLM_CACHE=1 (or true/yes) in .env to cache LLM responses to disk.
+# Responses are keyed by sha256(provider:model + prompt) and persist across
+# runs until the cache directory is deleted manually.
+LLM_CACHE_ENABLED: bool = os.getenv("LLM_CACHE", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+LLM_CACHE_DIR: str = os.getenv("LLM_CACHE_DIR", ".llm_cache")
+
+# ── Agentic long-term memory ──────────────────────────────────────────────
+# The extraction agent records label aliases + layout hints via the
+# remember_alias / remember_layout tools during its run (fast Mongo write, no
+# extra LLM pass).  GOAL: make future extraction FASTER and MORE ACCURATE.
+# Learnings are advisory only — injected as hints, never authoritative, never
+# skip.
+#
+# MEMORY_ENABLED has NO default — it must be set explicitly in the
+# environment (true/1/yes/on or false/0/no/off).  A missing or unrecognised
+# value raises an error at import time (fail fast).
+_MEMORY_ENABLED_RAW = (os.getenv("MEMORY_ENABLED") or "0").strip().lower()
+_MEMORY_ENABLED_VALID = {"0", "1", "true", "false", "yes", "no", "on", "off"}
+if _MEMORY_ENABLED_RAW not in _MEMORY_ENABLED_VALID:
+    raise ValueError(
+        "MEMORY_ENABLED must be one of "
+        f"{sorted(_MEMORY_ENABLED_VALID)!r}; got {os.getenv('MEMORY_ENABLED')!r}"
+    )
+MEMORY_ENABLED: bool = _MEMORY_ENABLED_RAW not in {"0", "false", "no", "off"}
+
+# Window (in stored periods) for the HARD extraction-target filter:
+# a concept is extracted only if it had a value in any of the last N periods
+# (quarterly filings → last N quarterly periods, annual → last N annual
+# periods).  Concepts without a recent value never reach the agent, mapping,
+# derivation, or save.
+PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
+
+# Per-run log files mirroring the admin-panel event stream (Logs/<date-time>.log)
+RUN_LOGS_ENABLED: bool = os.getenv("RUN_LOGS_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+RUN_LOGS_DIR: str = os.getenv("RUN_LOGS_DIR", "Logs")
+
+# ── Post-save Q4 derivation (income statement only) ────────────────────────
+# After an ANNUAL filing is saved to concept_values_annual (Q4 == annual in
+# this pipeline), derive Q4 quarterly values and insert them into
+# concept_values_quarterly: Q4 = Annual - (Q1 + Q2 + Q3) for flow concepts,
+# Q4 = Annual for point-in-time concepts (cash balances, shares outstanding,
+# period markers).  Income statement concepts only — the same scope as the
+# calculations project's `--calculate-q4 --statement is`.  Set to 0 to disable.
+CALCULATE_Q4_AFTER_ANNUAL: bool = os.getenv(
+    "CALCULATE_Q4_AFTER_ANNUAL", "1"
+).strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+# When False (default), Q4 is derived only when the annual value AND all of
+# Q1/Q2/Q3 exist for the concept — a missing quarter is never treated as 0
+# (that would fabricate a Q4 value).  Set to 1 to adopt the calculations
+# project's behavior of treating missing values as 0.
+Q4_ALLOW_INCOMPLETE: bool = os.getenv("Q4_ALLOW_INCOMPLETE", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+# ── Forward-looking guidance extraction (guidance_values) ──────────────────
+# When enabled (default), the extraction agent runs a PHASE 3 step over the
+# filing's Guidance/Outlook section and reports forward-looking numbers in
+# finalize_extraction under "__guidance__".  The pipeline normalizes each
+# record to the `guidance_values` schema (same collection the admin backend
+# reads/writes) and a post-save node persists them keyed on
+# (cik, accession_number, metric, basis, period) with is_current demotion and
+# source=manual protection.  Set to 0 to disable entirely (the agent then
+# ignores guidance sections exactly as before).
+GUIDANCE_ENABLED: bool = os.getenv("GUIDANCE_ENABLED", "1").strip().lower() not in {
+    "0", "false", "no", "off", ""
+}
+
+# Max guidance records a single filing may contribute (cap on the agent's
+# __guidance__ list — protects the finalize JSON and the save loop).
+GUIDANCE_MAX_RECORDS: int = int(os.getenv("GUIDANCE_MAX_RECORDS", "15"))

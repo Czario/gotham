@@ -3,7 +3,7 @@ name = "sec-data-scraper-v9"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "requests>=2.31.0",
     "pymongo>=4.6.0",
@@ -20,11 +20,19 @@ dependencies = [
     "data-normalization-service",
     "xlrd>=2.0.2",
     "redis>=5.0.0",
+    "langchain>=0.3.0",
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
+    "langchain-community>=0.3.0",
+    "langchain-ollama>=0.2.0",
     "langchain-openai>=0.2.0",
+    "google-genai>=1.0.0",
     "google-adk>=1.0.0",
     "litellm>=1.60.0",
+    "pdfplumber>=0.11.0",
+    "playwright>=1.44.0",
+    "pydantic>=2.8.0",
+    "lxml>=5.2.0",
     "rich>=15.0.0",
     "diskcache>=5.6.3",
 ]
@@ -34,6 +42,11 @@ main = "sec_scraper_cli:main"
 load-statement = "sec_scraper_cli:load_statement_cli"
 sec-scraper-worker = "worker_10kq:main"
 filings-agent = "main_filing_agent:main"
+earnings = "earnings_agents.cli.earnings:main"
+earnings-run-once = "earnings_agents.cli.earnings:main"
+earnings-backfill = "earnings_agents.cli.backfill:main"
+earnings-8k-worker = "earnings_agents.cli.worker:main"
+earnings-failures = "earnings_agents.cli.failures:main"
 
 [tool.uv]
 package = true
@@ -42,7 +55,7 @@ package = true
 py-modules = ["sec_scraper_cli", "worker_10kq", "redis_queue", "main_filing_agent"]
 
 [tool.setuptools.packages.find]
-include = ["filings_agent*"]
+include = ["filings_agent*", "earnings_agents*"]
 
 [tool.uv.sources]
 data-normalization-service = { path = "./normalization", editable = true }

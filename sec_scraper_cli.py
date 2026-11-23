@@ -507,6 +507,86 @@ def canonicalize_statement_type(stmt: Optional[str]) -> Optional[str]:
     return canonical
 
 
+DEFAULT_XBRL_FORMS = ['10-K', '10-Q', '20-F', '20-F/A']
+ALL_EARNINGS_FORMS = ['8-K', '6-K']
+
+
+def parse_form_selection(raw_form: Optional[str]) -> Dict[str, Any]:
+    """Parse ``--form`` into XBRL forms and earnings (8-K/6-K) forms.
+
+    Supported examples (case-insensitive):
+      - None            → default XBRL forms (10-K, 10-Q, 20-F, 20-F/A)
+      - ``all``         → auto-detected per company (US: 10-K/10-Q/8-K; Foreign: 20-F/6-K)
+      - ``10-K`` / ``10k`` → 10-K only
+      - ``10-Q`` / ``10q`` → 10-Q only
+      - ``10k-10q`` / ``10-K,10-Q`` → 10-K and 10-Q
+      - ``20-F`` / ``20f`` → 20-F and 20-F/A
+      - ``8-K`` / ``8k``   → 8-K only
+      - ``6-K`` / ``6k``   → 6-K only
+      - ``20f-6k`` / ``10k-10q-8k`` → combined XBRL + earnings
+    """
+    if not raw_form or not str(raw_form).strip():
+        return {
+            'mode': 'default',
+            'xbrl_forms': list(DEFAULT_XBRL_FORMS),
+            'earnings_forms': [],
+        }
+
+    text = str(raw_form).strip().lower()
+    if text == 'all':
+        return {
+            'mode': 'all',
+            'xbrl_forms': list(DEFAULT_XBRL_FORMS),
+            'earnings_forms': list(ALL_EARNINGS_FORMS),
+        }
+
+    tokens = re.findall(r'20-?f/a|20-?f|10-?k|10-?q|8-?k|6-?k|all', text)
+    if not tokens:
+        raise ValueError(
+            f"Unsupported --form value: {raw_form!r}. "
+            "Use 'all', '10-K', '10-Q', '10k-10q', '20-F', '8-K', '6-K', '20f-6k', or '10k-10q-8k'."
+        )
+    if 'all' in tokens:
+        return {
+            'mode': 'all',
+            'xbrl_forms': list(DEFAULT_XBRL_FORMS),
+            'earnings_forms': list(ALL_EARNINGS_FORMS),
+        }
+
+    xbrl_forms: list[str] = []
+    earnings_forms: list[str] = []
+    for tok in tokens:
+        clean = tok.replace('-', '')
+        if clean == '10k':
+            xbrl_forms.append('10-K')
+        elif clean == '10q':
+            xbrl_forms.append('10-Q')
+        elif clean == '20f':
+            xbrl_forms.extend(['20-F', '20-F/A'])
+        elif clean == '20f/a':
+            xbrl_forms.append('20-F/A')
+        elif clean == '8k':
+            earnings_forms.append('8-K')
+        elif clean == '6k':
+            earnings_forms.append('6-K')
+
+    return {
+        'mode': 'explicit',
+        'xbrl_forms': list(dict.fromkeys(xbrl_forms)),
+        'earnings_forms': list(dict.fromkeys(earnings_forms)),
+    }
+
+
+def detect_company_issuer_forms(filings_list: List[Dict]) -> tuple[list[str], list[str]]:
+    """Detect US vs foreign issuer from EDGAR submissions and return (xbrl_forms, earnings_forms)."""
+    forms = {str(f.get('form') or '').upper() for f in (filings_list or [])}
+    has_us = bool(forms & {'10-K', '10-Q'})
+    has_foreign = bool(forms & {'20-F', '20-F/A', '6-K'})
+    if has_foreign and not has_us:
+        return (['20-F', '20-F/A'], ['6-K'])
+    return (['10-K', '10-Q'], ['8-K'])
+
+
 def normalize_quarter(q: Optional[Any]) -> Optional[str]:
     """Convert user-supplied quarter identifier to canonical form ('Q1', 'Q2', 'Q3', 'Q4').
 
@@ -548,6 +628,7 @@ class SECDataScraperApp:
         enable_reconciliation: bool = True,
         no_new_concept: bool = False,
         guidance_only: bool = False,
+        target_forms: Optional[List[str]] = None,
         progress: Optional["ProgressManager"] = None,
     ):
         # Database setup (source DB kept for scraper internal use; normalization writes to target)
@@ -561,6 +642,7 @@ class SECDataScraperApp:
         self.enable_reconciliation = enable_reconciliation
         self.no_new_concept = bool(no_new_concept)
         self.guidance_only = bool(guidance_only)
+        self.target_forms = list(target_forms) if target_forms else list(DEFAULT_XBRL_FORMS)
         self.progress = progress or ProgressManager(verbose=True)  # safe default: verbose (no bars)
         # Per-company state (sequential-only — no threading needed)
         self.current_company_data = None
@@ -1217,7 +1299,7 @@ class SECDataScraperApp:
             filings_processed = 0
             filings_skipped = 0
             filings_failed = 0
-            target_forms = ['10-K', '10-Q', '20-F', '20-F/A']
+            target_forms = list(getattr(self, 'target_forms', None) or DEFAULT_XBRL_FORMS)
             
             # Filter filings to only target forms for progress bar
             target_filings = [f for f in filings_list if f.get('form') in target_forms]
@@ -3393,6 +3475,263 @@ def download_xbrl_file_if_needed(sec_client, cik: str, accession_number: str, ar
 
 
 
+def _collect_company_tokens(args: argparse.Namespace) -> list[str]:
+    """Collect raw ticker/CIK tokens from ``--companies`` and/or ``--file``."""
+    import re as _re
+    from pathlib import Path
+
+    tokens: list[str] = []
+    if args.companies:
+        tokens.extend(t.strip() for t in args.companies if t and t.strip())
+    if args.file:
+        fpath = Path(args.file)
+        if not fpath.exists():
+            print(f"❌ Companies file not found: {args.file}")
+            sys.exit(1)
+        for raw_line in fpath.read_text(encoding='utf-8').splitlines():
+            line = raw_line.split('#', 1)[0].strip()
+            if not line:
+                continue
+            tokens.extend(t for t in _re.split(r'[,\s]+', line) if t)
+    return tokens
+
+
+def _dispatch_earnings_cli(
+    args: argparse.Namespace,
+    raw_argv: Sequence[str],
+    *,
+    earnings_forms: Optional[List[str]] = None,
+    override_tokens: Optional[List[str]] = None,
+    force_latest_single: Optional[bool] = None,
+) -> None:
+    """Dispatch 8-K/6-K earnings runs (live latest or historical backfill)."""
+    import re as _re
+
+    if args.failures:
+        from earnings_agents.cli.failures import main as failures_main
+
+        fail_argv: list[str] = []
+        if args.companies:
+            fail_argv.extend(['--ticker', *args.companies])
+        failures_main(fail_argv)
+        return
+
+    tokens = list(override_tokens) if override_tokens is not None else _collect_company_tokens(args)
+    if not tokens:
+        print("❌ Earnings mode requires --companies TICKER/CIK [...] or --file FILE (or --failures)")
+        sys.exit(1)
+
+    ciks = [t.zfill(10) for t in tokens if _re.fullmatch(r'\d{1,10}', t)]
+    tickers = [t.upper() for t in tokens if not _re.fullmatch(r'\d{1,10}', t)]
+
+    forms = list(earnings_forms) if earnings_forms else ['8-K']
+
+    stmt_arg: Optional[str] = None
+    if args.statement:
+        stmt_parts = []
+        for part in str(args.statement).split(','):
+            part = part.strip()
+            if part:
+                stmt_parts.append(canonicalize_statement_type(part))
+        if stmt_parts:
+            stmt_arg = ','.join(stmt_parts)
+
+    quarter_num: Optional[int] = None
+    if args.fiscal_quarter:
+        q_norm = normalize_quarter(args.fiscal_quarter)  # e.g. 'Q2'
+        quarter_num = int(q_norm[1:])
+
+    year_explicit = any(a == '--year' or a.startswith('--year=') for a in raw_argv)
+    # Decide single-latest live run vs. multi-filing backfill:
+    # - --latest, --url, or --earnings (without period/year filters) → single latest live run
+    # - --form 6-K / --form 8-K (without --latest/--url) → backfill from --year (default 2010) to now
+    if force_latest_single is not None:
+        run_single_live = force_latest_single
+    elif args.url:
+        run_single_live = True
+    elif args.latest:
+        run_single_live = True
+    elif args.earnings and not (
+        year_explicit
+        or args.end_year is not None
+        or args.fiscal_year is not None
+        or quarter_num is not None
+        or args.reload
+        or (args.accession is not None and len(args.accession) > 1)
+    ):
+        run_single_live = True
+    else:
+        run_single_live = False
+
+    if not run_single_live:
+        from earnings_agents.cli.backfill import main as backfill_main
+
+        if ciks and tickers:
+            print("❌ Earnings backfill accepts either tickers or CIKs in one command (not mixed)")
+            sys.exit(1)
+        bf_argv: list[str] = []
+        if tickers:
+            bf_argv.extend(['--ticker', *tickers])
+        else:
+            bf_argv.extend(['--cik', *ciks])
+        for form in forms:
+            bf_argv.extend(['--form', form])
+        # Default --year is 2010 unless --fiscal-year pins a specific year
+        if args.fiscal_year is None:
+            bf_argv.extend(['--from-year', str(args.year)])
+        elif year_explicit:
+            bf_argv.extend(['--from-year', str(args.year)])
+        if args.end_year is not None:
+            bf_argv.extend(['--to-year', str(args.end_year)])
+        if args.fiscal_year is not None:
+            bf_argv.extend(['--fiscal-year', str(args.fiscal_year)])
+        if quarter_num is not None:
+            bf_argv.extend(['--fiscal-quarter', str(quarter_num)])
+        if args.latest:
+            bf_argv.append('--latest')
+        if args.accession:
+            bf_argv.extend(['--accession', *args.accession])
+        if stmt_arg:
+            bf_argv.extend(['--statements', stmt_arg])
+        if args.reload:
+            bf_argv.append('--reload')
+        if args.guidance_only:
+            bf_argv.append('--guidance-only')
+        if args.dry_run:
+            bf_argv.append('--dry-run')
+        if args.verbose or args.debug:
+            bf_argv.append('-v')
+        backfill_main(bf_argv)
+        return
+
+    from earnings_agents.cli.earnings import main as earnings_main
+
+    e_argv: list[str] = []
+    if tickers:
+        e_argv.extend(['--ticker', *tickers])
+    if ciks:
+        e_argv.extend(['--cik', *ciks])
+    if forms:
+        e_argv.extend(['--form', forms[0]])
+    if args.url:
+        e_argv.extend(['--filing-url', args.url])
+    if args.accession:
+        e_argv.extend(['--accession', args.accession[0]])
+    if args.quarterly_only:
+        e_argv.append('--quarterly-only')
+    if args.guidance_only:
+        e_argv.append('--guidance-only')
+    if stmt_arg:
+        e_argv.extend(['--statements', stmt_arg])
+    if args.dry_run:
+        e_argv.append('--dry-run')
+    if args.verbose or args.debug:
+        e_argv.append('-v')
+    earnings_main(e_argv)
+
+
+def _run_mixed_forms_cli(
+    args: argparse.Namespace,
+    raw_argv: Sequence[str],
+    form_spec: Dict[str, Any],
+    companies: List[str],
+    *,
+    fiscal_quarter: Optional[str],
+    target_statement: Optional[str],
+    html_download_path: str,
+    progress: "ProgressManager",
+) -> None:
+    """Process combined XBRL + earnings forms (e.g. ``--form all``, ``--form 10k-10q-8k``, ``--form 20f-6k``)."""
+    sec_client = SECAPIClient()
+
+    for cik in companies:
+        label = progress.cik_labels.get(cik) or sec_client.get_ticker_from_cik(cik) or cik
+        company_data, filings_list = sec_client.get_company_submissions(
+            cik, start_year=args.year, end_year=args.end_year
+        )
+        if not company_data:
+            print(f"❌ Failed to fetch SEC submissions for {label} ({cik})")
+            continue
+
+        if form_spec['mode'] == 'all':
+            xbrl_forms, earnings_forms = detect_company_issuer_forms(filings_list)
+        else:
+            xbrl_forms = list(form_spec['xbrl_forms'])
+            earnings_forms = list(form_spec['earnings_forms'])
+
+        # With --latest, pick the SINGLE newest filing across all selected forms
+        if args.latest:
+            allowed = set(xbrl_forms) | set(earnings_forms)
+            candidates = [f for f in filings_list if f.get('form') in allowed]
+            candidates.sort(key=lambda f: f.get('filingDate', ''), reverse=True)
+            if not candidates:
+                print(f"⚠️  No matching filings found for {label} ({', '.join(sorted(allowed))})")
+                continue
+            newest = candidates[0]
+            newest_form = str(newest.get('form') or '')
+            if newest_form in earnings_forms:
+                _dispatch_earnings_cli(
+                    args,
+                    raw_argv,
+                    earnings_forms=[newest_form],
+                    override_tokens=[cik],
+                    force_latest_single=True,
+                )
+            else:
+                app = SECDataScraperApp(
+                    start_year=args.year,
+                    end_year=args.end_year,
+                    enable_dimensions=not args.no_dimensions,
+                    target_fiscal_year=args.fiscal_year,
+                    target_fiscal_quarter=fiscal_quarter,
+                    target_statement=target_statement,
+                    reload=args.reload or bool(args.fiscal_year and fiscal_quarter),
+                    latest=True,
+                    html_download_path=html_download_path,
+                    enable_reconciliation=not args.no_reconciliation,
+                    no_new_concept=args.no_new_concept,
+                    guidance_only=args.guidance_only,
+                    target_forms=[newest_form],
+                    progress=progress,
+                )
+                if app.setup_database():
+                    app.process_multiple_companies([cik], resume=True)
+                    app.cleanup()
+            continue
+
+        # Full range / period mode: run XBRL first (statements + hierarchy + MD&A guidance),
+        # then earnings releases (8-K / 6-K) for the same period window.
+        if xbrl_forms:
+            app = SECDataScraperApp(
+                start_year=args.year,
+                end_year=args.end_year,
+                enable_dimensions=not args.no_dimensions,
+                target_fiscal_year=args.fiscal_year,
+                target_fiscal_quarter=fiscal_quarter,
+                target_statement=target_statement,
+                reload=args.reload or bool(args.fiscal_year and fiscal_quarter),
+                latest=False,
+                html_download_path=html_download_path,
+                enable_reconciliation=not args.no_reconciliation,
+                no_new_concept=args.no_new_concept,
+                guidance_only=args.guidance_only,
+                target_forms=xbrl_forms,
+                progress=progress,
+            )
+            if app.setup_database():
+                app.process_multiple_companies([cik], resume=True)
+                app.cleanup()
+
+        if earnings_forms:
+            _dispatch_earnings_cli(
+                args,
+                raw_argv,
+                earnings_forms=earnings_forms,
+                override_tokens=[cik],
+                force_latest_single=False,
+            )
+
+
 def main(argv: Optional[Sequence[str]] = None):
     import argparse
     from pathlib import Path
@@ -3502,6 +3841,31 @@ def main(argv: Optional[Sequence[str]] = None):
         help='Download HTML filings only — no XBRL extraction or database writes. '
              'Requires SEC_HTML_DOWNLOAD_PATH to be set.')
 
+    # --- Form / 8-K & 6-K Earnings selection ------------------------------
+    earn = parser.add_argument_group('Form / 8-K & 6-K Earnings selection')
+    earn.add_argument(
+        '--form', '--from', dest='form', type=str, default=None, metavar='FORM',
+        help='SEC form(s) to process: all (US: 10-K/10-Q/8-K; Foreign: 20-F/6-K), '
+             '10-K, 10-Q, 10k-10q, 20-F, 8-K, 6-K, 20f-6k, 10k-10q-8k. '
+             'Omit for default XBRL (10-K, 10-Q, 20-F).')
+    earn.add_argument(
+        '--earnings', action='store_true',
+        help='Shortcut to extract 8-K/6-K earnings press releases (or IR PDFs). '
+             'With --form 8-K or --form 6-K, --earnings is optional.')
+    earn.add_argument(
+        '--accession', nargs='+', default=None, metavar='ACCESSION',
+        help='Pin one or more exact accession numbers for 8-K/6-K earnings.')
+    earn.add_argument(
+        '--quarterly-only', action='store_true',
+        help='With 8-K/6-K earnings: skip annual filings and post-save Q4 derivation.')
+    earn.add_argument(
+        '--dry-run', action='store_true',
+        help='With 8-K/6-K earnings: preview matching filings / test connectivity '
+             'without LLM calls or database writes.')
+    earn.add_argument(
+        '--failures', action='store_true',
+        help='List degraded/failed 8-K/6-K earnings runs from MongoDB.')
+
     # --- Output / logging -------------------------------------------------
     log = parser.add_argument_group('Output / logging')
     log.add_argument(
@@ -3511,7 +3875,31 @@ def main(argv: Optional[Sequence[str]] = None):
         '--debug', action='store_true',
         help='Print DEBUG-level logs (implies --verbose). Use for troubleshooting.')
     
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+
+    try:
+        form_spec = parse_form_selection(args.form)
+    except ValueError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
+
+    # Dispatch pure earnings runs directly (--failures, --earnings without XBRL forms,
+    # or --form 8-K / --form 6-K).
+    if args.failures or (args.earnings and form_spec['mode'] == 'default'):
+        _dispatch_earnings_cli(
+            args,
+            raw_argv,
+            earnings_forms=form_spec['earnings_forms'] or ['8-K'],
+        )
+        return
+    if form_spec['earnings_forms'] and not form_spec['xbrl_forms']:
+        _dispatch_earnings_cli(
+            args,
+            raw_argv,
+            earnings_forms=form_spec['earnings_forms'],
+        )
+        return
     
     # --verbose implies debug-level console; --debug is the highest detail
     is_verbose = args.verbose or args.debug
@@ -3873,6 +4261,20 @@ def main(argv: Optional[Sequence[str]] = None):
             
             sys.exit(0)
         
+        # Handle mixed XBRL + earnings forms (--form all, --form 10k-10q-8k, --form 20f-6k)
+        if form_spec['earnings_forms'] and form_spec['xbrl_forms']:
+            _run_mixed_forms_cli(
+                args,
+                raw_argv,
+                form_spec,
+                companies,
+                fiscal_quarter=fiscal_quarter,
+                target_statement=target_statement,
+                html_download_path=html_download_path,
+                progress=progress,
+            )
+            return
+
         app = SECDataScraperApp(
             start_year=args.year,
             end_year=args.end_year,
@@ -3886,6 +4288,7 @@ def main(argv: Optional[Sequence[str]] = None):
             enable_reconciliation=not args.no_reconciliation,
             no_new_concept=args.no_new_concept,
             guidance_only=args.guidance_only,
+            target_forms=form_spec['xbrl_forms'],
             progress=progress,
         )
 

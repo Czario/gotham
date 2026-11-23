@@ -1,0 +1,620 @@
+"""Agent tool-calling loop (ReAct-style).
+
+Runs the agent loop: system prompt → LLM with bound tools → parse tool calls →
+execute tools → feed results back → repeat until finalize or max steps.
+
+Shared by both the pipeline node and the lightweight extractor.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from itertools import count
+from typing import Any, Callable
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+from earnings_agents.agent.prompts import FINALIZE_DESCRIPTION
+from earnings_agents.config import LLM_PROVIDER
+from earnings_agents.hooks import report_call
+from earnings_agents.llm import build_chat_llm
+
+logger = logging.getLogger(__name__)
+
+# Per-tool result caps.  The uniform 8000-char cap made read_lines return only
+# ~25 lines per call (line number + 300-char line), forcing the agent into six
+# piecemeal reads of one table — the dominant cost of the extraction loop.
+# read_lines gets a large cap so ONE call can return a whole income statement;
+# search gets a modest bump for multi-block hits.
+_TOOL_RESULT_CAPS: dict[str, int] = {
+    "read_lines": 60_000,
+    "search": 16_000,
+}
+
+
+class AgentProviderError(RuntimeError):
+    """A provider/API failure that must remain visible to worker callers."""
+
+
+# ── Response parsing ────────────────────────────────────────────────────────
+
+_PCT_OR_PER_SHARE_PATTERNS = re.compile(
+    r"(%|percent"
+    r"|(?:\bmargin\b|(?-i:(?<=[a-z])Margin(?=[A-Z0-9_|]|$)))(?!\s*(?:deposit|loan|borrowing|receivable|payable|account|call|requirement|collateral|debt|interest|revenue|income|cost|expense))"
+    r"|\byield\b|(?-i:(?<=[a-z])Yield(?=[A-Z0-9_|]|$))"
+    r"|\bgrowth\b|(?-i:(?<=[a-z])Growth(?:Rate|Pct|Percent)?(?=[A-Z0-9_|]|$))"
+    r"|\bratios?\b|(?-i:(?<=[a-z])Ratios?(?=[A-Z0-9_|]|$))"
+    r"|\beps\b|per share|\byoy\b|\bpct\b"
+    r"|(?<!exchange\s)(?<!exchange)(?<!variable\s)(?<!fixed\s)(?<!floating\s)(?:\brate\b|(?-i:(?<=[a-z])Rate(?=[A-Z0-9_|]|$)))(?!\s*(?:changes?\b|impact\b|effect\b|fluctuation|translation|revaluation|swap|contract|derivative|agreement|cap\b|collar|lock|floor|debt|note|loan|borrow|hedg|loss|gain|adjust|regulat|OnCash))"
+    r"|\bemployees?\b(?!\s*(?:benefit|compensat|severanc|stock|share|option|plan|related|liabilit|payable|receivable|loan|advance|cost|expense|payroll|tax|retire|pension|trust|withhold|contrib|award|grant|bonus|salari|wage|insur|health|medical|welfare|defer|accru|leas|terminat))"
+    r"|\bheadcount\b|basis points|percentage points"
+    r"|\bper\s+(?:ordinary\s+|basic\s+|diluted\s+|basic\s+and\s+diluted\s+|common\s+)?(?:share|ads)\b"
+    r"|(?<!o)(?<!su)(?<!pro)(?<!pa)(?<!up)(?<!hy)(?<!develo)per(?:[\s_-]+|(?=[A-Z]))(?:(?:basic|diluted|common|ordinary|ads|class[ab]?|and)(?:[\s_-]+|(?=[A-Z])))*(?:share|ads)(?!holder|based)"
+    r"|\b(?:vehicle\s+|auto(?:motive)?\s+|total\s+)?(?:production|deliveries)\b(?!\s*(?:cost|expense|revenue|sales|income|loss|tax|credit|asset|liabilit))"
+    r"|(?:super)?charger.{0,12}(?:station|connector)s?"
+    r"|\bdays.{0,5}supply\b|\blease count\b"
+    r"|\bactive\b.{0,20}\bsubscriptions?\b|\bfsd subscriptions?\b)",
+    re.IGNORECASE,
+)
+
+_SHARE_COUNT_PATTERN = re.compile(
+    r"\bnumber of shares\b|\bshares used\b|\bweighted.{0,15}average.{0,15}shares\b"
+    r"|WeightedAverageNumberOf(?:Diluted|Basic)?Shares"
+    r"|(?:Common|Preferred|Treasury)StockShares(?:Outstanding|Issued|Authorized)"
+    r"|NumberOfShares(?:Outstanding|Issued|Used)?",
+    re.IGNORECASE,
+)
+
+# Weighted-average share rows sit in the income statement and share its
+# declared table unit; other share counts (balance-sheet captions such as
+# "500,000 shares authorized") are printed in actual units and stay as-is.
+_WA_SHARES_PATTERN = re.compile(
+    r"\bweighted.{0,15}average.{0,15}shares\b"
+    r"|WeightedAverageNumberOf(?:Diluted|Basic)?Shares",
+    re.IGNORECASE,
+)
+
+_SHARE_COUNT_RAW_MAX = 100_000_000
+_TABLE_RAW_MAX = 10_000_000
+_IMPLAUSIBLE_ABS_USD = _TABLE_RAW_MAX * 1_000_000
+
+
+def _coerce_number(v: Any) -> float | None:
+    """Coerce an LLM-emitted value into a signed float, or ``None``.
+
+    Accepts JSON numbers and numeric strings in SEC/IR styles:
+      -1234, -1,234, "1,234", "$1,234", "(1,234)", "($1,234)", "-(1,234)"
+
+    Parenthesized amounts are NEGATIVE (SEC convention) — ``(175,685)``
+    becomes ``-175685.0``.  This is the deterministic sign guardrail behind
+    the agent: whatever sign convention the source used (parentheses, a
+    leading minus, or a currency symbol), the stored value is a correctly
+    signed number.  Booleans and non-numeric text return ``None``.
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    if not s:
+        return None
+    # Drop leading currency symbols + whitespace BEFORE the paren check so
+    # "$ (1,234)" is recognised as parenthesized.
+    s = s.lstrip("$\u20ac\u00a3 \t\n\r")
+    negative = False
+    # SEC/IR parenthesized amount → negative.  Handle "($1,234)", "(1,234)"
+    # and "(-667,172)" (paren already containing a minus — still negative).
+    if s.startswith("(") and s.endswith(")"):
+        negative = True
+        s = s[1:-1].strip()
+    s = (
+        s.replace("$", "")
+        .replace(",", "")
+        .replace("\xa0", "")
+        .replace(" ", "")
+    )
+    if not s:
+        return None
+    try:
+        value = float(s)
+    except ValueError:
+        return None
+    # Parenthesized amounts are negative in magnitude — "(-667,172)" is
+    # -667172, never +667172 (SEC never means double negation).
+    return -abs(value) if negative else value
+
+
+def _parse_llm_response(
+    response: str,
+    shares_multiplier: int = 1,
+    prescan_dollar_multiplier: int = 0,
+    no_scale_keys: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Strip markdown fences, parse JSON, and apply the __scale__ multiplier.
+
+    *no_scale_keys*: bracket/raw keys whose values are as-is (per-share
+    amounts, percentages, ratios, share counts) and must NEVER be scaled —
+    even when the key string itself does not match the per-share regex
+    (e.g. member-tagged keys like ``[custom:Basic|014.001]`` whose label
+    carries the "per share" signal).  The pipeline builds this set from the
+    concept labels.
+    """
+    from earnings_agents.agent.derive import SCALE_MULTIPLIERS
+
+    cleaned = (
+        response.strip()
+        .removeprefix("```json")
+        .removeprefix("```")
+        .removesuffix("```")
+        .strip()
+    )
+    brace = cleaned.find("{")
+    if brace > 0:
+        cleaned = cleaned[brace:]
+    end_brace = cleaned.rfind("}")
+    if end_brace >= 0:
+        cleaned = cleaned[: end_brace + 1]
+    try:
+        parsed: dict[str, Any] = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+
+    # Per-value evidence block: {"metric_key": {"lines": [s, e], "scale": ...,
+    # "currency": ...}}.  Preserved verbatim (never coerced/scaled) so the
+    # pipeline can build value_metadata_by_id and the verifier can spot-check.
+    raw_evidence = parsed.pop("__evidence__", None)
+    evidence: dict[str, Any] = {}
+    if isinstance(raw_evidence, dict):
+        evidence = raw_evidence
+    elif isinstance(raw_evidence, str):
+        try:
+            parsed_ev = json.loads(raw_evidence)
+            if isinstance(parsed_ev, dict):
+                evidence = parsed_ev
+        except json.JSONDecodeError:
+            pass
+
+    # Determine dominant scale across per-value __evidence__ entries so that if
+    # __scale__ is omitted or "as-is" (or a value lacks its own scale entry),
+    # we fall back to the scale followed by the statement / filing.
+    scale_counts: dict[str, int] = {}
+    for ev in evidence.values():
+        if isinstance(ev, dict):
+            s = str(ev.get("scale") or "").strip().lower()
+            if s in SCALE_MULTIPLIERS:
+                scale_counts[s] = scale_counts.get(s, 0) + 1
+    dominant_evidence_scale = (
+        max(scale_counts, key=lambda k: scale_counts[k])
+        if scale_counts
+        else ""
+    )
+    dominant_evidence_multiplier = SCALE_MULTIPLIERS.get(dominant_evidence_scale, 1)
+
+    raw_scale = parsed.pop("__scale__", None)
+    scale_str = str(raw_scale).strip().lower() if raw_scale is not None else ""
+    llm_multiplier = SCALE_MULTIPLIERS.get(scale_str, 1)
+    if llm_multiplier > 1:
+        multiplier = llm_multiplier
+    elif dominant_evidence_multiplier > 1:
+        multiplier = dominant_evidence_multiplier
+    elif prescan_dollar_multiplier > 1:
+        multiplier = prescan_dollar_multiplier
+    else:
+        multiplier = 1
+
+    no_scale = no_scale_keys or set()
+
+    def _nearby_statement_multiplier(ev_entry: Any) -> int:
+        """Infer fallback scale multiplier from nearby lines in __evidence__."""
+        if not isinstance(ev_entry, dict):
+            return 0
+        lines = ev_entry.get("lines")
+        if not (isinstance(lines, list) and len(lines) == 2):
+            return 0
+        try:
+            mid = (int(lines[0]) + int(lines[1])) / 2.0
+        except (TypeError, ValueError):
+            return 0
+        nearby_counts: dict[str, int] = {}
+        for other_ev in evidence.values():
+            if not isinstance(other_ev, dict):
+                continue
+            other_scale = str(other_ev.get("scale") or "").strip().lower()
+            if other_scale not in SCALE_MULTIPLIERS:
+                continue
+            other_lines = other_ev.get("lines")
+            if not (isinstance(other_lines, list) and len(other_lines) == 2):
+                continue
+            try:
+                other_mid = (int(other_lines[0]) + int(other_lines[1])) / 2.0
+            except (TypeError, ValueError):
+                continue
+            if abs(other_mid - mid) <= 120:
+                nearby_counts[other_scale] = nearby_counts.get(other_scale, 0) + 1
+        if not nearby_counts:
+            return 0
+        best_scale = max(nearby_counts, key=lambda k: nearby_counts[k])
+        return SCALE_MULTIPLIERS.get(best_scale, 0)
+
+    # Deterministic sign guardrail — runs UNCONDITIONALLY (even with no
+    # __scale__ multiplier): coerce SEC/IR-style strings ("(175,685)",
+    # "-175,685", "$1,234", ...) to signed floats so signs are never lost,
+    # doubled, or passed downstream as strings.  Non-numeric text is left
+    # untouched.
+    for k, v in list(parsed.items()):
+        if k.startswith("__"):
+            continue
+        if v is None or isinstance(v, (int, float)):
+            continue
+        coerced = _coerce_number(v)
+        if coerced is not None:
+            parsed[k] = coerced
+
+    has_per_value_scale = any(
+        isinstance(ev, dict) and ev.get("scale")
+        for ev in evidence.values()
+    )
+    if multiplier > 1 or shares_multiplier > 1 or has_per_value_scale:
+        for k, v in list(parsed.items()):
+            # Metadata keys (__scale__, __currency__, __company_mismatch__,
+            # __evidence__) must never be scaled or coerced.
+            if k.startswith("__"):
+                continue
+            # Label-derived as-is keys (per-share/percentage/ratio/share
+            # counts) are never scaled — even when the key string itself does
+            # not match the regex below (member-tagged EPS keys).
+            if (k in no_scale or k.strip("[]") in no_scale) and not _WA_SHARES_PATTERN.search(k):
+                continue
+            # Booleans must never be scaled (e.g. "__company_mismatch__": true
+            # would otherwise become 1000 under a thousands multiplier).
+            if v is None or not isinstance(v, (int, float)) or isinstance(v, bool):
+                continue
+
+            ev_entry = evidence.get(k) or evidence.get(k.strip("[]"))
+            ev_scale = (
+                str(ev_entry.get("scale") or "").strip().lower()
+                if isinstance(ev_entry, dict)
+                else ""
+            )
+            nearby_mult = _nearby_statement_multiplier(ev_entry)
+            fallback_mult = nearby_mult if nearby_mult > 1 else multiplier
+
+            if ev_scale in SCALE_MULTIPLIERS:
+                # The agent's per-value scale evidence is authoritative — it
+                # was read from this value's own table/sentence.  Nearby or
+                # filing-level scales are only fallbacks for values with no
+                # valid scale (mixed-unit narratives, e.g. "$12,500 million"
+                # beside a thousands table, must not be re-scaled).
+                key_multiplier = SCALE_MULTIPLIERS[ev_scale]
+            else:
+                # No valid scaling given for this value — always apply the
+                # statement / filing fallback scaling to monetary metrics.
+                key_multiplier = fallback_mult
+
+            key_raw_max = (
+                _IMPLAUSIBLE_ABS_USD // key_multiplier
+                if key_multiplier > 1
+                else _TABLE_RAW_MAX
+            )
+            is_share_count = bool(_SHARE_COUNT_PATTERN.search(k))
+            is_gross_margin_dollars = "gross margin" in k.lower() and abs(v) > 100
+            if is_share_count:
+                # Share counts follow the table's declared unit: per-value
+                # evidence scale, else the prescan "shares in thousands"
+                # hint, else the statement/filing scale ("in millions,
+                # except per share data" covers the share rows too).
+                if ev_scale in SCALE_MULTIPLIERS:
+                    share_mult = SCALE_MULTIPLIERS[ev_scale]
+                elif shares_multiplier > 1:
+                    share_mult = shares_multiplier
+                else:
+                    share_mult = key_multiplier
+                if (
+                    share_mult > 1
+                    and (shares_multiplier > 1 or _WA_SHARES_PATTERN.search(k))
+                    and abs(v) < _SHARE_COUNT_RAW_MAX
+                ):
+                    parsed[k] = v * share_mult
+            elif (
+                not is_share_count
+                and (is_gross_margin_dollars or not _PCT_OR_PER_SHARE_PATTERNS.search(k))
+                and key_multiplier > 1
+                and abs(v) < key_raw_max
+            ):
+                parsed[k] = v * key_multiplier
+
+    if evidence:
+        parsed["__evidence__"] = evidence
+
+    return parsed
+
+
+def _sanitize_tool_messages(messages: list) -> list:
+    """Ensure every tool_call in an AIMessage is followed by a matching ToolMessage.
+
+    Providers like DeepSeek and OpenAI reject requests with a 400 error if any
+    assistant message with tool_calls is not followed by tool messages for every
+    tool_call_id.
+    """
+    sanitized: list = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        sanitized.append(msg)
+        if isinstance(msg, AIMessage):
+            expected_ids: list[str] = []
+            for tc in getattr(msg, "tool_calls", None) or []:
+                tid = tc.get("id")
+                if tid:
+                    expected_ids.append(tid)
+            for itc in getattr(msg, "invalid_tool_calls", None) or []:
+                tid = itc.get("id")
+                if tid:
+                    expected_ids.append(tid)
+
+            if expected_ids:
+                j = i + 1
+                seen_ids: set[str] = set()
+                while j < n and isinstance(messages[j], ToolMessage):
+                    seen_ids.add(getattr(messages[j], "tool_call_id", ""))
+                    sanitized.append(messages[j])
+                    j += 1
+
+                for expected_id in expected_ids:
+                    if expected_id not in seen_ids:
+                        logger.warning(
+                            "Sanitizing: inserting placeholder ToolMessage for missing tool_call_id=%s",
+                            expected_id,
+                        )
+                        sanitized.append(
+                            ToolMessage(
+                                content="Error: Tool call was not executed or response was missing.",
+                                tool_call_id=expected_id,
+                            )
+                        )
+                i = j
+                continue
+        i += 1
+    return sanitized
+
+
+def run_agent_loop(
+    system_prompt: str,
+    initial_message: str,
+    tools: list,
+    *,
+    ticker: str = "?",
+    dollar_multiplier: int = 1,
+    shares_multiplier: int = 1,
+    max_steps: int | None = None,
+    finalize_name: str = "finalize_extraction",
+    finalize_description: str = FINALIZE_DESCRIPTION,
+    parse_final_result: Callable[[str], dict[str, Any] | None] | None = None,
+    recovery_regex: re.Pattern | None = None,
+    no_scale_keys: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Run the tool-calling agent loop — shared by extraction and period detection.
+
+    The loop is OPEN-ENDED by default: it runs until the agent calls the
+    terminal finalize tool (or the LLM call fails).  No step cap.
+
+    Args:
+        system_prompt: Full system prompt.
+        initial_message: First human message to the agent.
+        tools: List of LangChain tools; the terminal finalize tool is appended here.
+        ticker: For logging.
+        dollar_multiplier: Scale multiplier for the default (extraction) parser.
+        max_steps: Optional hard step cap (None = open-ended, the default).
+        finalize_name: Name of the terminal tool (extraction: ``finalize_extraction``,
+            period detection: ``finalize_period``).
+        finalize_description: Docstring for the terminal tool.
+        parse_final_result: Parser for the terminal tool's JSON string.  Defaults
+            to the scale-aware extraction parser bound to *dollar_multiplier*.
+        recovery_regex: Pattern used to recover a final JSON blob from the last AI
+            message when the agent never called the terminal tool.  Defaults to the
+            ``__scale__``-keyed extraction pattern.
+        no_scale_keys: Bracket/raw keys that must never be scaled (per-share/
+            percentage concepts whose labels carry the as-is signal).  Passed to
+            the default extraction parser.
+
+    Returns:
+        The parsed final result dict,
+        or ``None`` if the agent failed to produce a result.
+    """
+    if parse_final_result is None:
+        parse_final_result = lambda s: _parse_llm_response(  # noqa: E731
+            s, shares_multiplier, dollar_multiplier, no_scale_keys
+        )
+    if recovery_regex is None:
+        recovery_regex = re.compile(r'\{[^{}]*"__scale__"[^{}]*\}', re.DOTALL)
+
+    # Add finalize tool
+    from langchain_core.tools import tool as _lc_tool
+
+    @_lc_tool
+    def finalize_tool(result_json: str) -> str:
+        """Call this when done. Pass a JSON string with all results."""
+        return result_json
+    finalize_tool.name = finalize_name
+    finalize_tool.description = finalize_description
+    all_tools = list(tools) + [finalize_tool]
+
+    # Build chat model
+    try:
+        chat_llm = build_chat_llm()
+    except ValueError as exc:
+        logger.warning("Agent loop unavailable for %s: %s", ticker, exc)
+        return None
+
+    llm_with_tools = chat_llm.bind_tools(all_tools)
+    messages: list = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=initial_message),
+    ]
+
+    final_result: dict[str, Any] | None = None
+
+    steps = count(1) if not max_steps else range(1, max_steps + 1)
+    for step in steps:
+        logger.debug("Agent step %d for %s", step, ticker)
+        # Matches the "→ calling llm" convention consumed by the CLI printer
+        # and worker progress publisher (LLM-call counting + highlighting).
+        report_call(
+            f"  [llm]  agent step {step}  → calling llm  "
+            f"({LLM_PROVIDER or 'llm'})"
+        )
+
+        messages = _sanitize_tool_messages(messages)
+        try:
+            _step_t0 = time.perf_counter()
+            response = llm_with_tools.invoke(messages)
+            _step_elapsed = time.perf_counter() - _step_t0
+        except Exception as exc:
+            # Preserve the provider's exact status/body (e.g. DeepSeek 402
+            # Insufficient Balance) so operators and the worker can act on the
+            # real cause instead of seeing only "no result produced".
+            detail = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "Agent LLM call failed at step %d for %s — %s",
+                step, ticker, detail, exc_info=True,
+            )
+            report_call(f"  [llm]  ✗ provider error at step {step}: {detail[:800]}")
+            raise AgentProviderError(
+                f"LLM provider failed at extraction step {step}: {detail}"
+            ) from exc
+
+        report_call(
+            f"  [timing]  llm step {step} took {_step_elapsed:.1f}s  "
+            f"({LLM_PROVIDER or 'llm'})"
+        )
+
+        messages.append(response)
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        invalid_tool_calls = getattr(response, "invalid_tool_calls", None) or []
+        if not tool_calls and not invalid_tool_calls:
+            content = getattr(response, "content", "") or ""
+            if "finalize" in content.lower() or "{" in content:
+                break
+            messages.append(HumanMessage(
+                content="Use your tools to explore the document (search, read_lines, "
+                f"get_document_info). When done, call {finalize_name}."
+            ))
+            continue
+
+        tool_messages: list[ToolMessage] = []
+        for tc in tool_calls:
+            tool_name = tc.get("name", "")
+            tool_args = tc.get("args", {})
+            tool_call_id = tc.get("id", "")
+
+            logger.info(
+                "Agent step %d for %s → tool: %s(%s)",
+                step, ticker, tool_name,
+                str(tool_args)[:120],
+            )
+            # Surface tool calls on the CLI progress display and worker
+            # event stream (both consume report_call).  Finalize args carry
+            # the full metrics JSON — too large for a progress line, and
+            # already logged at INFO above.
+            if tool_name == finalize_name:
+                report_call(f"  [tool]  step {step} → {finalize_name}()")
+            else:
+                args_brief = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
+                if len(args_brief) > 110:
+                    args_brief = args_brief[:110] + "…"
+                report_call(f"  [tool]  step {step} → {tool_name}({args_brief})")
+
+            if tool_name == finalize_name:
+                try:
+                    raw_result = tool_args.get("result_json", "")
+                    result_str = raw_result if isinstance(raw_result, str) else json.dumps(raw_result)
+                except Exception:
+                    result_str = str(tool_args)
+
+                # Log the raw JSON for debugging
+                logger.info("Agent finalize JSON for %s: %s", ticker, result_str[:1000])
+
+                parsed = parse_final_result(result_str)
+                if parsed is None:
+                    report_call(
+                        f"  [tool]  ✗ {finalize_name} — could not parse result JSON"
+                    )
+                if parsed is not None:
+                    final_result = parsed
+                    logger.info(
+                        "Agent finalize for %s: %d keys extracted",
+                        ticker,
+                        len([k for k in final_result if not k.startswith("__")]),
+                    )
+                tool_messages.append(ToolMessage(
+                    content=(
+                        "Finalize received. Extraction complete."
+                        if parsed is not None
+                        else "Failed to parse result JSON. Ensure it's valid JSON "
+                             "and dates use YYYY-MM-DD format."
+                    ),
+                    tool_call_id=tool_call_id,
+                ))
+            else:
+                tool_fn = next((t for t in all_tools if t.name == tool_name), None)
+                if tool_fn is not None:
+                    try:
+                        result = tool_fn.invoke(tool_args)
+                    except Exception as exc:
+                        result = f"Tool error: {exc}"
+                else:
+                    result = f"Unknown tool: {tool_name}"
+
+                if isinstance(result, str) and result.startswith(("Tool error", "Unknown tool")):
+                    report_call(f"  [tool]  ✗ {result[:120]}")
+
+                if isinstance(result, str) and len(result) > _TOOL_RESULT_CAPS.get(
+                    tool_name, 8000
+                ):
+                    cap = _TOOL_RESULT_CAPS.get(tool_name, 8000)
+                    result = result[:cap] + "\n... (truncated)"
+                tool_messages.append(ToolMessage(content=str(result), tool_call_id=tool_call_id))
+
+        for itc in invalid_tool_calls:
+            tool_call_id = itc.get("id") or ""
+            err = itc.get("error") or "Invalid tool call arguments"
+            tool_name = itc.get("name") or "unknown"
+            logger.warning(
+                "Agent step %d for %s → invalid tool call: %s: %s",
+                step, ticker, tool_name, err,
+            )
+            report_call(f"  [tool]  ✗ invalid call to {tool_name}: {str(err)[:100]}")
+            tool_messages.append(ToolMessage(
+                content=f"Error: Invalid arguments for tool {tool_name}: {err}",
+                tool_call_id=tool_call_id,
+            ))
+
+        messages.extend(tool_messages)
+        if final_result is not None:
+            break
+
+    # Fallback: try to recover JSON from last message
+    if final_result is None:
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage):
+                content = getattr(msg, "content", "") or ""
+                json_match = recovery_regex.search(content)
+                if json_match:
+                    parsed = parse_final_result(json_match.group())
+                    if parsed is not None:
+                        final_result = parsed
+                        logger.info("Agent loop: recovered %d keys from final message",
+                                    len([k for k in final_result if not k.startswith("__")]))
+                        break
+
+    if final_result is None:
+        logger.error("Agent for %s: no result produced", ticker)
+        return None
+
+    return final_result
