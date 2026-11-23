@@ -79,7 +79,9 @@ def filter_dimensional_data_by_period_length(dimensional_df: pd.DataFrame, targe
                 filtered_rows.append(row)
     
     if rejected_count > 0:
-        print(f"🚫 DIMENSIONAL STRICT FILTERING: Rejected {rejected_count} non-quarterly dimensional facts")
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"DIMENSIONAL STRICT FILTERING: Rejected {rejected_count} non-quarterly dimensional facts")
     
     # Convert back to DataFrame
     if filtered_rows:
@@ -93,8 +95,11 @@ def get_target_duration_for_form(form_type: str) -> int:
     return PeriodMatcher.get_target_duration_for_form(form_type)
 
 
-def debug_period_filtering(dimensional_df: pd.DataFrame, target_period: str) -> None:
+def debug_period_filtering(dimensional_df: pd.DataFrame, target_period: str, verbose: bool = False) -> None:
     """Debug function to show what periods are available and which would be filtered"""
+    
+    if not verbose:
+        return  # Skip debug output unless in verbose mode
     
     print("\n=== PERIOD FILTERING DEBUG ===")
     print(f"Target period: {target_period}")
@@ -169,4 +174,5 @@ def debug_period_filtering(dimensional_df: pd.DataFrame, target_period: str) -> 
                 if duration_diff > PeriodConfig.DEFAULT_DURATION_TOLERANCE:
                     print(f"       Reason: Duration differs by {duration_diff:.1f} months")
     
-    print("\n=== END DEBUG ===\n")
+    if verbose:  # Only print end debug in verbose mode
+        print("\n=== END DEBUG ===\n")

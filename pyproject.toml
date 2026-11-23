@@ -55,7 +55,7 @@ package = true
 py-modules = ["sec_scraper_cli", "worker_10kq", "redis_queue", "main_filing_agent"]
 
 [tool.setuptools.packages.find]
-include = ["filings_agent*", "earnings_agents*"]
+include = ["shared*", "cli*", "filings_agent*", "earnings_agents*"]
 
 [tool.uv.sources]
 data-normalization-service = { path = "./normalization", editable = true }

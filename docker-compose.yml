@@ -56,7 +56,7 @@ services:
       LLM_PROVIDER:        ${LLM_PROVIDER:-deepseek}
       PYTHONUNBUFFERED:    "1"
       TZ:                  ${TZ:-UTC}
-      RUN_LOGS_DIR:        /app/Logs
+      RUN_LOGS_DIR:        /app/logs
       UV_LINK_MODE:        copy
     volumes:
       - .:/app

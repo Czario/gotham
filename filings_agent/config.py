@@ -154,7 +154,7 @@ PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
 AGENT_AUDIT_ENABLED: bool = os.getenv("AGENT_AUDIT_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off", ""
 }
-AGENT_AUDIT_DIR: str = os.getenv("AGENT_AUDIT_DIR", "Logs/agent_audit")
+AGENT_AUDIT_DIR: str = os.getenv("AGENT_AUDIT_DIR", "logs/agent_audit")
 
 # ── Durable run sessions / batch resume (P7) ───────────────────────────────
 AGENT_SESSION_ENABLED: bool = os.getenv("AGENT_SESSION_ENABLED", "1").strip().lower() not in {

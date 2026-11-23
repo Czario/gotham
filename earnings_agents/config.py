@@ -132,7 +132,7 @@ PROMPT_HISTORY_PERIODS: int = int(os.getenv("PROMPT_HISTORY_PERIODS", "3"))
 RUN_LOGS_ENABLED: bool = os.getenv("RUN_LOGS_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
-RUN_LOGS_DIR: str = os.getenv("RUN_LOGS_DIR", "Logs")
+RUN_LOGS_DIR: str = os.getenv("RUN_LOGS_DIR", "logs")
 
 # ── Post-save Q4 derivation (income statement only) ────────────────────────
 # After an ANNUAL filing is saved to concept_values_annual (Q4 == annual in
