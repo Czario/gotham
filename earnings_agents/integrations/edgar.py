@@ -529,6 +529,58 @@ def fiscal_year_of(filing: dict) -> int | None:
     return None
 
 
+def _resolve_fiscal_year_end_for_manifest(cik_padded: str) -> str | None:
+    """Best-effort lookup of the company's SEC ``fiscalYearEnd`` (MMDD, e.g. '0630')."""
+    try:
+        data = _edgar_get_json(_SUBMISSIONS_URL.format(cik=cik_padded))
+        if isinstance(data, dict):
+            fye = str(data.get("fiscalYearEnd") or "").strip()
+            if len(fye) == 4 and fye.isdigit():
+                return fye
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _resolve_manifest_fiscal_period(
+    filing: dict,
+    fye: str | None,
+) -> tuple[int | None, int | None]:
+    """Return ``(fiscal_year, fiscal_quarter)`` for manifest filtering.
+
+    When *fye* (MMDD, e.g. ``'0630'`` for Microsoft) is known, shifts the 8-K/6-K
+    event/report date back 30 days (earnings are released ~3–5 weeks after
+    quarter-end) and computes the true fiscal year & quarter via
+    ``FiscalYearCalculator``.  Falls back to calendar-based ``fiscal_year_of``
+    when *fye* is unavailable (e.g. unit tests mocking ``get_company_filings``).
+    """
+    report_date = str(filing.get("report_date") or "")
+    filing_date = str(filing.get("filing_date") or "")
+    date_str = report_date if len(report_date) >= 10 else filing_date
+    if fye and len(date_str) >= 10:
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+            from utilities.helpers.period_utils import FiscalYearCalculator
+
+            dt = _dt.strptime(date_str[:10], "%Y-%m-%d")
+            # For 8-K/6-K, reportDate is normally the press-release event date
+            # (same as filingDate, ~25-40 days after period end). Shift back
+            # 30 days only when reportDate is within 7 days of filingDate.
+            approx_end = dt
+            if len(filing_date) >= 10:
+                fdt = _dt.strptime(filing_date[:10], "%Y-%m-%d")
+                if abs((fdt - dt).days) <= 7:
+                    approx_end = dt - _td(days=30)
+            fy, q = FiscalYearCalculator.calculate_fiscal_year_and_quarter(approx_end, fye)
+            return fy, q
+        except Exception:  # noqa: BLE001
+            pass
+
+    fy = fiscal_year_of(filing)
+    q = _quarter_of_month(int(report_date[5:7])) if report_date[5:7].isdigit() else None
+    return fy, q
+
+
 def build_earnings_manifest(
     cik: str,
     *,
@@ -577,13 +629,19 @@ def build_earnings_manifest(
     )
     cik_padded = normalize_cik(cik)
     cik_int = str(int(cik_padded))
+    fye = (
+        _resolve_fiscal_year_end_for_manifest(cik_padded)
+        if (fiscal_year is not None or fiscal_quarter is not None)
+        else None
+    )
     out: list[dict] = []
     exhibit_checks = 0
 
     for filing in filings:
         form = filing["form"]
-        report_date = filing.get("report_date") or ""
-        filing_fiscal_year = fiscal_year_of(filing)
+        filing_fiscal_year, filing_fiscal_quarter = _resolve_manifest_fiscal_period(
+            filing, fye
+        )
         if start_year is not None and (
             filing_fiscal_year is None or filing_fiscal_year < start_year
         ):
@@ -595,9 +653,7 @@ def build_earnings_manifest(
         if fiscal_year is not None and filing_fiscal_year != fiscal_year:
             continue
         if fiscal_quarter is not None:
-            if not report_date[5:7].isdigit():
-                continue
-            if _quarter_of_month(int(report_date[5:7])) != fiscal_quarter:
+            if filing_fiscal_quarter is None or filing_fiscal_quarter != fiscal_quarter:
                 continue
 
         if form == "8-K":

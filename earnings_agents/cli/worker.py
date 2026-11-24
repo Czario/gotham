@@ -2,8 +2,8 @@
 
 Listens to the **dedicated** ``sec:filings:8k`` queue (set via
 ``REDIS_QUEUE_NAME`` env var, default ``sec:filings:8k``).
-admin_backend publishes 8-K messages here and 10-K/10-Q messages to a
-separate queue consumed by the filings-extractor worker.  Each worker
+admin_backend publishes 8-K/6-K messages here and 10-K/10-Q/20-F messages to
+``sec:filings:10kq`` consumed by gotham's ``worker-10kq``.  Each worker
 only ever sees its own messages — no re-queue loops.
 
 Pipeline mirrors ``uv run earnings --ticker X`` exactly:
@@ -47,10 +47,10 @@ logger = logging.getLogger(__name__)
 # Dedicated queue — admin_backend publishes earnings-filing messages here.
 _DEFAULT_QUEUE = "sec:filings:8k"
 
-# Source SEC forms this worker accepts: 8-K (US issuers) and 6-K (foreign
-# private issuers such as ASML / TSM).  Any other form is skipped, never
-# re-queued.
-_SUPPORTED_FORMS: frozenset[str] = frozenset({"8-K", "6-K"})
+# Source SEC forms this worker accepts: 8-K/8-K/A (US issuers) and 6-K/6-K/A
+# (foreign private issuers such as ASML / TSM).  Any other form is skipped,
+# never re-queued.
+_SUPPORTED_FORMS: frozenset[str] = frozenset({"8-K", "8-K/A", "6-K", "6-K/A"})
 
 # Error substrings that make a job non-retryable: deterministic failures that
 # re-running the same filing will reproduce identically (provider billing/auth
@@ -193,20 +193,60 @@ def _process_payload(
         .upper()
     )
 
+    # Optional target fiscal_year / quarter from manual trigger
+    raw_fy = payload.get("fiscal_year")
+    target_fy = int(raw_fy) if raw_fy is not None and str(raw_fy).strip().isdigit() else None
+    raw_q = payload.get("quarter")
+    target_q: int | None = None
+    if raw_q is not None and str(raw_q).strip():
+        q_s = str(raw_q).strip().upper().lstrip("Q")
+        if q_s.isdigit() and int(q_s) in (1, 2, 3, 4):
+            target_q = int(q_s)
+
+    accession = payload.get("accession_number") or None
+    manual_filing_url = payload.get("filing_url") if not temporary_filing_id else None
+    # When fiscal_year (and optional quarter) is specified without a pinned URL
+    # or accession, resolve the matching 8-K/6-K accession from the EDGAR manifest.
+    if target_fy is not None and not accession and not manual_filing_url and not local_filing_path:
+        try:
+            from earnings_agents.integrations.edgar import build_earnings_manifest
+            base_form = source_form_type.replace("/A", "") or "8-K"
+            cands = build_earnings_manifest(
+                cik,
+                forms=(base_form,),
+                fiscal_year=target_fy,
+                fiscal_quarter=target_q,
+                limit=1,
+            )
+            if cands and cands[0].get("accession"):
+                accession = str(cands[0]["accession"])
+                pub.publish(
+                    "progress",
+                    f"resolved {base_form} for FY{target_fy}"
+                    + (f" Q{target_q}" if target_q else "")
+                    + f" → {accession}",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Manifest resolution failed for %s FY%s Q%s: %s", ticker, target_fy, target_q, exc)
+
     state = _build_initial_state(
         {
             "ticker": ticker,
             "company_name": company_name,
             "cik": cik,
         },
-        filing_url=payload.get("filing_url") if not temporary_filing_id else None,
+        filing_url=manual_filing_url,
         local_filing_path=local_filing_path,
-        accession=payload.get("accession_number") or None,
+        accession=accession,
         source_form_type=source_form_type,
         # Optional per-job override: process reported quarterly periods only.
         quarterly_only=bool(payload.get("quarterly_only")),
         target_statements=target_statements,
     )
+    if target_fy is not None:
+        state["target_fiscal_year"] = target_fy
+    if target_q is not None:
+        state["target_fiscal_quarter"] = target_q
 
     # The reporting period is decided by the period agent INSIDE the graph —
     # the pre-graph state carries only URL/accession.
@@ -252,6 +292,22 @@ def _process_payload(
     set_node_callback(make_node_callback(pub, ticker))
     set_call_callback(make_call_callback(pub, ticker, llm_call_count))
     set_detail_callback(None)   # spinner text — not needed in worker
+
+    from datetime import datetime, timezone
+    from shared.run_report import (
+        build_run_report,
+        diff_stage,
+        get_normalize_db,
+        save_run_report,
+        snapshot_company_state,
+    )
+
+    started_utc = datetime.now(timezone.utc)
+    try:
+        report_db = get_normalize_db()
+    except Exception:
+        report_db = None
+    snap_before = snapshot_company_state(report_db, cik)
 
     t0 = perf_counter()
     try:
@@ -331,8 +387,38 @@ def _process_payload(
         )
         year = str(detected_period.fiscal_year) if detected_period else "?"
         summary = f"✓ {ticker}_{year}_latest saved  ({n} concepts){llm_tag}  {elapsed_str}"
+        log_path_str = str(getattr(getattr(pub, "_log_file", None), "path", "") or "")
         # Close the publisher now — the summary is the log file's final line.
         pub.close(summary=summary)
+        # Persist structured run summary into normalize_data.gotham_run_reports
+        try:
+            _fy = detected_period.fiscal_year if detected_period else None
+            _fq = f"Q{detected_period.quarter}" if (detected_period and detected_period.quarter) else None
+            snap_after = snapshot_company_state(report_db, cik)
+            stage = diff_stage(
+                snap_before, snap_after,
+                stage_name=source_form_type or "8-K",
+                stage_forms=[source_form_type or "8-K"],
+                duration_seconds=elapsed_s,
+            )
+            serial_tag = Path(log_path_str).name.split("-")[0] if log_path_str else "0000"
+            rep = build_run_report(
+                serial_number=serial_tag,
+                ticker=ticker,
+                cik=cik,
+                forms_requested=source_form_type or "8-K",
+                mode="replace" if payload.get("replace") else "upsert",
+                log_file=log_path_str,
+                started_at_utc=started_utc,
+                finished_at_utc=datetime.now(timezone.utc),
+                stages=[stage],
+                target_fiscal_year=_fy,
+                target_quarter=_fq,
+                status="success",
+            )
+            save_run_report(report_db, rep)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to record gotham_run_reports for %s: %s", ticker, exc)
         # Use the exact canonical period context produced by the period agent.
         # Do not re-query the latest database row: another job could win that
         # race and relabel this filing with a different period.

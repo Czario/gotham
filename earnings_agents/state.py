@@ -119,6 +119,12 @@ class EarningsAgentState(TypedDict):
     # save_guidance only — skips concept loading, financial statement extraction,
     # mongodb_save, and calculate_q4.
     guidance_only: NotRequired[bool]
+    # Optional requested fiscal period filter (from backfill --fiscal-year / --fiscal-quarter)
+    target_fiscal_year: NotRequired[Optional[int]]
+    target_fiscal_quarter: NotRequired[Optional[int]]
+    # Hard replace mode (--replace): delete ALL existing values for the target
+    # period first, then insert fresh.
+    force_replace: NotRequired[bool]
     # ── Forward-looking guidance (guidance_values) ─────────────────────────
     # Normalized guidance records extracted by the agent's PHASE 3 step from
     # finalize_extraction's "__guidance__" list.  Each record is a

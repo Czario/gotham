@@ -152,6 +152,7 @@ def mongodb_save_node(state: EarningsAgentState) -> EarningsAgentState:
                 value_metadata_by_id=value_metadata_by_id,
                 accession_number=state.get("accession_number"),
                 source_form_type=state.get("source_form_type"),
+                hard_replace=bool(state.get("force_replace")),
             )
             logger.info(
                 "normalize_data: upserted %d concept value(s) for %s", n, ticker

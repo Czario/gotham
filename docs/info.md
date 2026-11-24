@@ -49,7 +49,7 @@ Gotham: Overview of Capabilities, Commands & AI Integration
    2026 --quarter Q3                              │
    uv run main --companies AAPL --latest          │ Process only the single most recent filing on
                                                   │ EDGAR.
-   uv run main --companies AAPL --reload          │ Force re-extraction and in-place upsert of
+   uv run main --companies AAPL --form 10k-10q --upsert │ Force re-extraction and in-place upsert of
                                                   │ existing periods.
    uv run main --companies AAPL --statement       │ Restrict parsing to a specific statement
    income                                         │ (income, balance_sheet, cash_flow).

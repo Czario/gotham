@@ -620,6 +620,9 @@ def _run_company_parallel(args: tuple) -> dict:
     presenter = RunPresenter(
         name, label=label, progress=progress, task=company_task,
     )
+    if info.get("quiet"):
+        presenter.quiet = True
+        presenter.silent_console = True
     presenter.install()
     result = _run_company(graph, info, printer=lambda _: None, target_statements=target_statements)
     RunPresenter.uninstall()
@@ -756,6 +759,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Show full DEBUG-level log output from every pipeline node.",
     )
     parser.add_argument(
+        "--quiet",
+        action="store_true",
+        default=False,
+        help="Suppress verbose per-step console output (detailed logs still go to the run log file).",
+    )
+    parser.add_argument(
         "--allow-inconsistent",
         action="store_true",
         default=False,
@@ -818,6 +827,7 @@ def main(argv: list[str] | None = None) -> None:
         _info["accession"] = args.accession
         _info["quarterly_only"] = args.quarterly_only
         _info["guidance_only"] = args.guidance_only
+        _info["quiet"] = bool(args.quiet or not args.verbose)
 
     _progress = Progress(
         SpinnerColumn(finished_text="[green]\u2713[/]"),
@@ -826,24 +836,36 @@ def main(argv: list[str] | None = None) -> None:
         TimeElapsedColumn(),
     )
 
-    # Route all logging through rich's console so log lines print above the
-    # live progress display instead of writing raw bytes to stderr and
-    # breaking the ANSI cursor control.
+    # Route console logging through rich's console while preserving any
+    # pre-attached FileHandler (e.g. RunLogSession from sec_scraper_cli).
+    existing_file_handlers = [
+        h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)
+    ]
     log_level = logging.DEBUG if args.verbose else logging.WARNING
-    logging.basicConfig(
-        level=log_level,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[
-            RichHandler(
-                console=_progress.console,
-                show_path=args.verbose,
-                rich_tracebacks=args.verbose,
-                log_time_format="[%X]",
-            )
-        ],
-        force=True,
-    )
+    if not existing_file_handlers:
+        logging.basicConfig(
+            level=log_level,
+            format="%(message)s",
+            datefmt="[%X]",
+            handlers=[
+                RichHandler(
+                    console=_progress.console,
+                    show_path=args.verbose,
+                    rich_tracebacks=args.verbose,
+                    log_time_format="[%X]",
+                )
+            ],
+            force=True,
+        )
+    elif args.verbose:
+        rich_h = RichHandler(
+            console=_progress.console,
+            show_path=True,
+            rich_tracebacks=True,
+            log_time_format="[%X]",
+        )
+        rich_h.setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(rich_h)
 
     if LLM_PROVIDER == "openai":
         llm_label = f"openai:{OPENAI_MODEL}"
@@ -855,8 +877,9 @@ def main(argv: list[str] | None = None) -> None:
         llm_label = f"deepseek:{DEEPSEEK_MODEL}"
     else:
         llm_label = f"ollama:{OLLAMA_MODEL}"
-    _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")
-    _progress.console.print(f"[bold cyan]Statements[/] : {', '.join(target_statements)}")
+    if args.verbose and not args.quiet:
+        _progress.console.print(f"[bold cyan]LLM[/]      : {llm_label}")
+        _progress.console.print(f"[bold cyan]Statements[/] : {', '.join(target_statements)}")
 
     if args.dry_run:
         total = len(companies)

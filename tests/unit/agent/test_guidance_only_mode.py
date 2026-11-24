@@ -76,7 +76,7 @@ def test_sec_scraper_cli_accepts_both_guidance_only_spellings():
             app.process_multiple_companies.return_value = {
                 "0000320193": {"ticker": "AAPL", "processed": 1, "skipped": 0, "failed": 0, "success": True}
             }
-            sec_scraper_cli.main(["--companies", "0000320193", flag, "--no-download-html-filings"])
+            sec_scraper_cli.main(["--companies", "0000320193", "--form", "10k-10q", flag, "--no-download-html-filings"])
             _, kwargs = app_cls.call_args
             assert kwargs["guidance_only"] is True
 
@@ -86,11 +86,11 @@ def test_sec_scraper_cli_rejects_conflicting_flags_with_guidance_only():
     import sec_scraper_cli
 
     with pytest.raises(SystemExit) as exc1:
-        sec_scraper_cli.main(["--companies", "0000320193", "--guidence-only", "--only-download-files"])
+        sec_scraper_cli.main(["--companies", "0000320193", "--form", "10k-10q", "--guidence-only", "--only-download-files"])
     assert exc1.value.code == 1
 
     with pytest.raises(SystemExit) as exc2:
-        sec_scraper_cli.main(["--companies", "0000320193", "--guidence-only", "--fix-hierarchy"])
+        sec_scraper_cli.main(["--companies", "0000320193", "--form", "10k-10q", "--guidence-only", "--fix-hierarchy"])
     assert exc2.value.code == 1
 
 

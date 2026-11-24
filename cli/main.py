@@ -20,7 +20,7 @@ def create_parser() -> argparse.ArgumentParser:
     filing_parser.add_argument("--cik", required=True, help="Company CIK (e.g. 0000320193)")
     filing_parser.add_argument("--accession", required=True, help="Filing Accession Number")
     filing_parser.add_argument("--form-type", default="10-K", help="Form type (10-K, 10-Q)")
-    filing_parser.add_argument("--reload", action="store_true", help="Force reload existing records")
+    filing_parser.add_argument("--upsert", action="store_true", help="Upsert existing records")
 
     # Command: company
     company_parser = subparsers.add_parser("company", help="Process filings for a company")
@@ -31,7 +31,7 @@ def create_parser() -> argparse.ArgumentParser:
     company_parser.add_argument("--fiscal-year", type=int, help="Target fiscal year")
     company_parser.add_argument("--quarter", "--fiscal-quarter", help="Target fiscal quarter (Q1, Q2, Q3, Q4)")
     company_parser.add_argument("--statement", "-s", help="Target statement type (income, balance_sheet, cash_flow)")
-    company_parser.add_argument("--reload", action="store_true", help="Reload existing filings")
+    company_parser.add_argument("--upsert", action="store_true", help="Upsert existing filings")
 
     # Command: statement
     stmt_parser = subparsers.add_parser("statement", help="Load a specific financial statement for a specific quarter")
@@ -40,7 +40,7 @@ def create_parser() -> argparse.ArgumentParser:
     stmt_parser.add_argument("--fiscal-year", "--year", "-y", type=int, required=True, dest="fiscal_year", help="Fiscal year")
     stmt_parser.add_argument("--quarter", "--fiscal-quarter", "-q", required=True, dest="quarter", help="Fiscal quarter (Q1, Q2, Q3, Q4)")
     stmt_parser.add_argument("--statement", "-s", required=True, help="Statement type (income, balance_sheet, cash_flow)")
-    stmt_parser.add_argument("--reload", action="store_true", help="Force reload existing records")
+    stmt_parser.add_argument("--upsert", action="store_true", help="Upsert existing records")
     stmt_parser.add_argument("--no-download-html-filings", action="store_true", help="Skip HTML filing downloads")
 
     return parser
@@ -73,8 +73,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--quarter", str(args.quarter),
             "--statement", str(args.statement),
         ]
-        if args.reload:
-            cli_args.append("--reload")
+        if args.upsert:
+            cli_args.append("--upsert")
         if args.no_download_html_filings:
             cli_args.append("--no-download-html-filings")
         return load_statement_cli(cli_args)

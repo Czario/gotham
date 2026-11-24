@@ -278,13 +278,6 @@ class ProgressManager:
         self.console.print(Text(str(msg), style="red"))
 
 
-# ---------------------------------------------------------------------------
-# Merged normalization pipeline
-# ---------------------------------------------------------------------------
-from data_normalization_service.core.config import AppConfig as _NormAppConfig, DatabaseConfig as _NormDBConfig
-from data_normalization_service.services.normalization_service import FinancialNormalizationService as _NormService
-from data_normalization_service.services.quarterly_service import PeriodBasedFinancialCalculationService as _QuarterlyService
-
 class ProcessingSummary:
     """Track processing statistics for companies and filings with real-time streaming"""
     def __init__(self, report_file: Optional[str] = None):

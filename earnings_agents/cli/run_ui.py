@@ -185,6 +185,9 @@ class RunPresenter:
         # When True, the per-call [llm]/[tool]/[db] lines are suppressed (the
         # backfill CLI's --quiet); stage/step summaries still print.
         self.quiet = False
+        # When True, suppress ALL console line printing (stage ▶ / step /
+        # chunk / [llm] / [tool]) so only the progress bar + final summary show.
+        self.silent_console = False
 
     # ── binding ────────────────────────────────────────────────────────
     def bind(self, progress: Any, task: Any, label: Optional[str] = None) -> None:
@@ -212,6 +215,8 @@ class RunPresenter:
             self.progress.update(self.task, description=self._render())
 
     def _print(self, markup: str) -> None:
+        if self.silent_console:
+            return
         self._console.print(markup)
 
     def _render(self) -> str:
@@ -317,15 +322,13 @@ class RunPresenter:
                     )
 
     def call_cb(self, msg: str) -> None:
-        if self.quiet:
+        is_llm = " [llm]" in msg or ("llm" in msg.lower() and "\u2192" in msg)
+        if is_llm and "\u2192 calling llm" in msg:
+            self.llm_calls += 1
+        if self.quiet or self.silent_console:
             return
         esc_msg = _escape(msg)
-        # Highlight LLM-related messages (direct calls and LLM-triggered steps)
-        # distinctly so they stand out from DB/HTTP operational messages.
-        is_llm = " [llm]" in msg or ("llm" in msg.lower() and "\u2192" in msg)
         if is_llm:
-            if "\u2192 calling llm" in msg:
-                self.llm_calls += 1
             self._print(f"[dim]{self.name}[/][bold yellow]{esc_msg}[/]")
         elif "[industry]" in msg:
             # Single industry-context line per extraction pass (SIC injected).

@@ -97,8 +97,11 @@ def run_backfill(
     target_statements: list[str] | None = None,
     resume: bool = True,
     reload: bool = False,
+    replace: bool = False,
     dry_run: bool = False,
     guidance_only: bool = False,
+    target_fiscal_year: int | None = None,
+    target_fiscal_quarter: int | None = None,
     run_id: str | None = None,
     printer: Callable[[str], None] = print,
     state_builder: Callable[..., dict] | None = None,
@@ -135,7 +138,7 @@ def run_backfill(
 
     info = {"ticker": ticker, "company_name": company_name, "cik": cik}
     processed: set[str] = set()
-    if resume and not reload and not dry_run:
+    if resume and not reload and not replace and not dry_run:
         processed = (
             processed_guidance_accessions(cik)
             if guidance_only
@@ -191,6 +194,12 @@ def run_backfill(
                     source_form_type=form or None,
                     target_statements=target_statements,
                 )
+                if target_fiscal_year is not None:
+                    state["target_fiscal_year"] = target_fiscal_year
+                if target_fiscal_quarter is not None:
+                    state["target_fiscal_quarter"] = target_fiscal_quarter
+                if replace:
+                    state["force_replace"] = True
                 if guidance_only:
                     state["guidance_only"] = True
                     state["quarterly_only"] = False

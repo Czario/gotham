@@ -742,6 +742,27 @@ def fiscal_period_exists(cik: str, period: DetectedPeriod) -> bool:
     ) > 0
 
 
+def official_filing_period_exists(cik: str, period: DetectedPeriod) -> bool:
+    """Return True when the period already has official (non-8-K/6-K) XBRL values.
+
+    Official 10-K / 10-Q / 20-F rows do NOT carry ``earning_data: True``.
+    An 8-K / 6-K earnings release must never overwrite official XBRL values.
+    """
+    try:
+        db = _get_client()[_NORMALIZE_DB]
+        filt: dict[str, Any] = {
+            "cik": cik,
+            "statement_type": "income",
+            "reporting_period.fiscal_year": period.fiscal_year,
+            "earning_data": {"$ne": True},
+        }
+        if period.quarter is not None:
+            filt["reporting_period.quarter"] = period.quarter
+        return db[_values_collection(period)].count_documents(filt, limit=1) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def get_recently_valued_concept_ids(
     cik: str,
     period: DetectedPeriod,
@@ -800,6 +821,7 @@ def upsert_concept_values(
     value_metadata_by_id: dict[str, dict] | None = None,
     accession_number: str | None = None,
     source_form_type: str | None = None,
+    hard_replace: bool = False,
 ) -> int:
     """Bulk-upsert concept values into the appropriate collection.
 
@@ -967,27 +989,51 @@ def upsert_concept_values(
     # document of this period that does not carry this save's token (old
     # runs, superseded concept rows, rows removed from the target list).
     from earnings_agents.hooks import report_call
-    collection.bulk_write(ops, ordered=False)
 
-    _stale_filt: dict[str, Any] = {
-        "cik": cik,
-        "reporting_period.fiscal_year": fiscal_year,
-        # Everything this save did NOT touch for this period is stale.
-        "concept_id": {"$nin": written_ids},
-    }
-    if target_statements:
-        _stale_filt["statement_type"] = {"$in": list(target_statements)}
-    elif statement_type:
-        _stale_filt["statement_type"] = statement_type
+    if hard_replace:
+        # --replace mode: delete ALL existing values for the target period first,
+        # then insert fresh.
+        _del_filt: dict[str, Any] = {
+            "cik": cik,
+            "reporting_period.fiscal_year": fiscal_year,
+        }
+        if target_statements:
+            _del_filt["statement_type"] = {"$in": list(target_statements)}
+        elif statement_type:
+            _del_filt["statement_type"] = statement_type
+        if period_type == "quarterly":
+            _del_filt["reporting_period.quarter"] = quarter
+        _deleted = collection.delete_many(_del_filt).deleted_count
+        if _deleted:
+            logger.info(
+                "upsert_concept_values (--replace): deleted %d existing doc(s) for CIK %s %s before fresh insert",
+                _deleted, cik, format_period_label(period),
+            )
+            report_call(f"  [replace]  deleted {_deleted} existing doc(s) for {format_period_label(period)}")
+        collection.bulk_write(ops, ordered=False)
+    else:
+        collection.bulk_write(ops, ordered=False)
 
-    if period_type == "quarterly":
-        _stale_filt["reporting_period.quarter"] = quarter
-    _del_count = collection.delete_many(_stale_filt).deleted_count
-    if _del_count:
-        logger.info(
-            "upsert_concept_values: swept %d stale doc(s) for CIK %s %s",
-            _del_count, cik, format_period_label(period),
-        )
+        _stale_filt: dict[str, Any] = {
+            "cik": cik,
+            "reporting_period.fiscal_year": fiscal_year,
+            # Only sweep stale 8-K/6-K earning_data rows — never delete official 10-K/10-Q/20-F or manual rows.
+            "earning_data": True,
+            "concept_id": {"$nin": written_ids},
+        }
+        if target_statements:
+            _stale_filt["statement_type"] = {"$in": list(target_statements)}
+        elif statement_type:
+            _stale_filt["statement_type"] = statement_type
+
+        if period_type == "quarterly":
+            _stale_filt["reporting_period.quarter"] = quarter
+        _del_count = collection.delete_many(_stale_filt).deleted_count
+        if _del_count:
+            logger.info(
+                "upsert_concept_values: swept %d stale doc(s) for CIK %s %s",
+                _del_count, cik, format_period_label(period),
+            )
 
     period_label = format_period_label(period)
     report_call(

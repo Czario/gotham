@@ -8,7 +8,7 @@ skipped before extraction/save, and post-save Q4 derivation is disabled.
 
     uv run earnings-backfill --ticker ASML --form 6-K --from-year 2023 --to-year 2026
     uv run earnings-backfill --ticker TSM --form 6-K --fiscal-year 2025 --dry-run
-    uv run earnings-backfill --ticker MSFT --from-year 2024 --reload --no-resume
+    uv run earnings-backfill --ticker MSFT --from-year 2024 --upsert --no-resume
 
 Period identity is never inferred here: the year/quarter options only SELECT
 which filings to consider; the period agent decides the reporting period from
@@ -40,7 +40,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  uv run earnings-backfill --ticker ASML --form 6-K --from-year 2023\n"
             "  uv run earnings-backfill --ticker TSM --accession 0001046179-26-000451\n"
             "  uv run earnings-backfill --ticker MSFT --from-year 2024 --dry-run\n"
-            "  uv run earnings-backfill --ticker MSFT --from-year 2024 --reload\n"
+            "  uv run earnings-backfill --ticker MSFT --from-year 2024 --upsert\n"
         ),
     )
     src = parser.add_mutually_exclusive_group(required=True)
@@ -88,8 +88,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Print the manifest and exit — no LLM calls, no writes.")
     parser.add_argument("--json", action="store_true", default=False,
                         help="Emit the manifest as JSON (with --dry-run).")
-    parser.add_argument("--reload", action="store_true", default=False,
-                        help="Re-run filings whose values are already saved (ignore resume).")
+    parser.add_argument("--upsert", action="store_true", dest="upsert", default=False,
+                        help="Re-run filings whose values are already saved and upsert in place (ignore resume).")
+    parser.add_argument("--replace", action="store_true", dest="replace", default=False,
+                        help="Hard replace: delete all existing values for the target period first, then insert fresh.")
     parser.add_argument("--no-resume", action="store_true", default=False,
                         help="Process every candidate, ignoring the resume check.")
     parser.add_argument("--statements", metavar="STATEMENTS", default=None,
@@ -120,10 +122,12 @@ def main(argv: list[str] | None = None) -> None:
         print("error: --accession pins specific filings — pass a single --ticker/--cik")
         sys.exit(2)
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.WARNING,
-        format="%(levelname)s %(name)s: %(message)s",
-    )
+    # Preserve any pre-attached FileHandler (e.g. unified RunLogSession from sec_scraper_cli)
+    if not any(isinstance(h, logging.FileHandler) for h in logging.getLogger().handlers):
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose else logging.WARNING,
+            format="%(levelname)s %(name)s: %(message)s",
+        )
 
     if args.allow_inconsistent:
         import earnings_agents.config as _cfg
@@ -246,7 +250,8 @@ def main(argv: list[str] | None = None) -> None:
         # ONE presenter for the whole company — the same class the single-ticker
         # CLI uses, rebound to a fresh progress row per filing.
         presenter = RunPresenter(name)
-        presenter.quiet = args.quiet
+        presenter.quiet = args.quiet or not args.verbose
+        presenter.silent_console = args.quiet or not args.verbose
         bound: list[tuple[object, str]] = []
 
         def _before_filing(candidate: dict, index: int, total: int) -> None:
@@ -279,8 +284,11 @@ def main(argv: list[str] | None = None) -> None:
             candidates=candidates,
             target_statements=target_statements,
             resume=not args.no_resume,
-            reload=args.reload,
+            reload=args.upsert,
+            replace=args.replace,
             guidance_only=args.guidance_only,
+            target_fiscal_year=args.fiscal_year,
+            target_fiscal_quarter=args.fiscal_quarter,
             run_id=run_id,
             printer=lambda _msg: None,
             presenter=presenter,
@@ -304,10 +312,11 @@ def main(argv: list[str] | None = None) -> None:
             # quarterly-only backfill mode.
             if args.oldest_first and not args.latest:
                 candidates = list(reversed(candidates))
-            progress.console.print(
-                f"\n[bold]=== {info.get('company_name')} ({ticker or info['cik']}) \u2014 "
-                f"{len(candidates)} filing(s), {order_label} ===[/]"
-            )
+            if args.verbose and not args.quiet:
+                progress.console.print(
+                    f"\n[bold]=== {info.get('company_name')} ({ticker or info['cik']}) \u2014 "
+                    f"{len(candidates)} filing(s), {order_label} ===[/]"
+                )
             overall_task = progress.add_task(
                 f"[bold]{ticker or info['cik']}[/]  backfill", total=len(candidates)
             )
@@ -315,11 +324,12 @@ def main(argv: list[str] | None = None) -> None:
             for key in totals:
                 totals[key] += summary.get(key, 0)
 
-    print(
-        f"\nBackfill run {run_id} complete — saved {totals['saved']}, "
-        f"failed {totals['failed']}, skipped {totals['skipped']}, "
-        f"resumed {totals['resumed']}"
-    )
+    if args.verbose and not args.quiet:
+        print(
+            f"\nBackfill run {run_id} complete — saved {totals['saved']}, "
+            f"failed {totals['failed']}, skipped {totals['skipped']}, "
+            f"resumed {totals['resumed']}"
+        )
 
 
 if __name__ == "__main__":

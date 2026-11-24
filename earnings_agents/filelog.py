@@ -38,24 +38,20 @@ class RunLogFile:
         self._handle = None
         self._path: Path | None = None
         try:
-            directory = Path(log_dir or config.RUN_LOGS_DIR)
-            directory.mkdir(parents=True, exist_ok=True)
-            # Machine-local time — the same clock the operator sees (e.g. IST
-            # on this machine; whatever the machine TZ is wherever it runs).
-            now = datetime.now()
-            stamp = now.strftime("%Y-%m-%d_%H-%M-%S")
-            safe_ticker = re.sub(r"[^A-Za-z0-9]+", "_", (ticker or "").upper()).strip("_")
-            # <TICKER>_<date>_<time>.log (falls back to <date>_<time>.log when no ticker)
-            base = f"{safe_ticker}_{stamp}" if safe_ticker else stamp
-            path = directory / f"{base}.log"
-            suffix = 2
-            while path.exists():  # two runs started in the same second
-                path = directory / f"{base}_{suffix}.log"
-                suffix += 1
+            from datetime import timezone
+            from shared.run_logger import build_run_log_path
+
+            now_utc = datetime.now(timezone.utc)
+            _serial, path = build_run_log_path(
+                ticker,
+                log_dir=log_dir or config.RUN_LOGS_DIR,
+                now_utc=now_utc,
+            )
             self._handle = open(path, "a", encoding="utf-8")
             self._path = path
             self.write(
-                f"── run started {now.isoformat(timespec='seconds')}  "
+                f"── run started {now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}  "
+                f"serial={_serial}  "
                 f"ticker={ticker or '?'}  "
                 f"load_request_id={load_request_id or '-'}"
             )

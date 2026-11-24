@@ -234,13 +234,13 @@ def test_load_statement_parser():
         "--fiscal-year", "2023",
         "--quarter", "Q2",
         "--statement", "balance_sheet",
-        "--reload",
+        "--upsert",
     ])
     assert args.companies == ["AAPL"]
     assert args.fiscal_year == 2023
     assert args.quarter == "Q2"
     assert args.statement == "balance_sheet"
-    assert args.reload is True
+    assert args.upsert is True
 
 
 def test_load_statement_cli_delegates_to_main():
@@ -251,15 +251,16 @@ def test_load_statement_cli_delegates_to_main():
             "--year", "2023",
             "--quarter", "Q3",
             "--statement", "income",
-            "--reload",
+            "--upsert",
         ])
         assert ret == 0
         mock_main.assert_called_once_with([
             "--companies", "AAPL",
+            "--form", "10k-10q",
             "--fiscal-year", "2023",
             "--fiscal-quarter", "Q3",
             "--statement", "income",
-            "--reload",
+            "--upsert",
         ])
 
 

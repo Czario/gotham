@@ -70,9 +70,11 @@ from cli.forms import (  # noqa: F401
     parse_sec_filing_url,
     canonicalize_statement_type,
     parse_form_selection,
-    detect_company_issuer_forms,
     normalize_quarter,
 )
+from data_normalization_service.core.config import AppConfig as _NormAppConfig, DatabaseConfig as _NormDBConfig
+from data_normalization_service.services.normalization_service import FinancialNormalizationService as _NormService
+from data_normalization_service.services.quarterly_service import PeriodBasedFinancialCalculationService as _QuarterlyService
 
 
 class SECDataScraperApp:
@@ -87,6 +89,7 @@ class SECDataScraperApp:
         target_fiscal_quarter: Optional[str] = None,
         target_statement: Optional[str] = None,
         reload: bool = False,
+        replace: bool = False,
         latest: bool = False,
         html_download_path: Optional[str] = None,
         enable_reconciliation: bool = True,
@@ -117,7 +120,8 @@ class SECDataScraperApp:
         self.target_fiscal_year = target_fiscal_year
         self.target_fiscal_quarter = normalize_quarter(target_fiscal_quarter)
         self.target_statement = canonicalize_statement_type(target_statement)
-        self.reload = reload
+        self.replace = bool(replace)
+        self.reload = bool(reload) or self.replace
         self.latest = latest
         if html_download_path is not None:
             # An empty string or False explicitly disables HTML downloads
@@ -208,15 +212,25 @@ class SECDataScraperApp:
     def _accumulate_for_quarterly(self, cik: str, statement_doc: dict, filing_doc: dict) -> None:
         """Append a slim copy of the statement to the per-company accumulator, and immediately
         deaccumulate 10-Q cash flow statements into 3-month individual figures.
+        Auto-Q4 calculation runs ONLY for annual filings (10-K / 20-F / 20-F/A).
         """
         stmt_type = statement_doc.get('statement_type', '')
-        if stmt_type.lower() not in ('cashflow', 'cash_flow', 'cashflow',
+        if stmt_type.lower() not in ('cashflow', 'cash_flow',
                                       'income', 'income_statements', 'balancesheet', 'balance_sheet'):
             return
+        form_type = str(
+            (filing_doc or {}).get('form_type')
+            or (filing_doc or {}).get('form')
+            or (statement_doc.get('reporting_period') or {}).get('form_type')
+            or ''
+        ).upper()
+        is_annual = is_annual_form(form_type)
         if stmt_type.lower() in ('balancesheet', 'balance_sheet'):
-            self._auto_calculate_q4_if_ready(cik, {
-                'reporting_period': statement_doc.get('reporting_period', {}),
-            })
+            if is_annual:
+                self._auto_calculate_q4_if_ready(cik, {
+                    'reporting_period': statement_doc.get('reporting_period', {}),
+                    '_filing_doc': filing_doc,
+                })
             return
         entry = {
             '_id': statement_doc.get('_id'),
@@ -227,24 +241,36 @@ class SECDataScraperApp:
             'data': statement_doc.get('data', []),
             '_filing_doc': filing_doc,  # carry filing for accession_number lookup
         }
-        form_type = str(
-            (filing_doc or {}).get('form_type')
-            or (filing_doc or {}).get('form')
-            or (entry['reporting_period'] or {}).get('form_type')
-            or ''
-        ).upper()
         if stmt_type.lower() in ('cashflow', 'cash_flow') and form_type == '10-Q':
             self._deaccumulate_quarterly_cashflow_immediately(cik, entry)
-            self._auto_calculate_q4_if_ready(cik, entry)
             return
         self._quarterly_accumulator.setdefault(cik, []).append(entry)
-        self._auto_calculate_q4_if_ready(cik, entry)
+        if is_annual:
+            self._auto_calculate_q4_if_ready(cik, entry)
 
     def _auto_calculate_q4_if_ready(self, cik: str, entry: dict) -> None:
-        """Auto-calculate Q4 values when annual + required Q1–Q3 periods exist."""
+        """Auto-calculate Q4 values ONLY for annual filings when annual + Q1–Q3 periods exist."""
+        filing_doc = entry.get('_filing_doc') or {}
+        form_type = str(
+            filing_doc.get('form_type')
+            or filing_doc.get('form')
+            or (entry.get('reporting_period') or {}).get('form_type')
+            or ''
+        ).upper()
+        if form_type and not is_annual_form(form_type):
+            return
         rp = entry.get('reporting_period') or {}
         fy = rp.get('fiscal_year')
         if not isinstance(fy, int):
+            return
+        # Run at most once per (cik, fy, accession) so it does not repeat 3x per annual filing
+        acc = str(filing_doc.get('accession_number') or '')
+        q4_key = (str(cik), fy, acc)
+        seen_q4 = getattr(self, '_auto_q4_done', None)
+        if seen_q4 is None:
+            seen_q4 = set()
+            self._auto_q4_done = seen_q4
+        if q4_key in seen_q4:
             return
         norm_svc = getattr(self, '_norm_service', None)
         db_conn = getattr(norm_svc, 'db_connection', None) if norm_svc is not None else None
@@ -254,6 +280,7 @@ class SECDataScraperApp:
         try:
             from core.processors.q4_calculator import auto_calculate_q4_for_fiscal_year
             written = auto_calculate_q4_for_fiscal_year(target_db, cik, fy)
+            seen_q4.add(q4_key)
             if written:
                 from filings_agent.hooks import report_call
                 summary = ", ".join(f"{k}={v}" for k, v in written.items())
@@ -458,8 +485,13 @@ class SECDataScraperApp:
             # the per-filing outcome (plus anomalies) is printed.  Rich's
             # markup=False keeps our literal [tag] prefixes intact.
             verbose = bool(getattr(self.progress, "verbose", False))
+            _trace_log = logging.getLogger("pipeline.trace")
             self._presenter = install_presenter(
-                writer=lambda msg: self.progress.console.print(msg, markup=False),
+                writer=(
+                    (lambda msg: self.progress.console.print(msg, markup=False))
+                    if verbose
+                    else (lambda msg: _trace_log.info("%s", msg))
+                ),
                 stage_writer=self.progress.set_filing_status,
                 # -v (or AGENT_STEPS=1) restores the full per-node trace.
                 detailed=True if verbose else None,
@@ -1219,7 +1251,7 @@ class SECDataScraperApp:
             if found:
                 return found
 
-        period_filter: Dict[str, Any] = {'cik': cik}
+        period_filter: Dict[str, Any] = {'cik': cik, 'earning_data': {'$ne': True}}
         if target_stmt:
             period_filter['statement_type'] = target_stmt
         if form_type:
@@ -1421,13 +1453,13 @@ class SECDataScraperApp:
             self.progress.status("  [reload]  skipped delete: filing identity unavailable")
             return
 
-        if not force:
-            # Force reload performs non-destructive upsert:
+        if not force and not getattr(self, 'replace', False):
+            # Force upsert performs non-destructive upsert:
             # Existing correct documents are preserved and gaps are filled.
             # Only incorrect documents are updated in place, and missing documents are inserted.
-            self.progress.status(f"  [reload]  upserting existing rows ({period_desc})")
+            self.progress.status(f"  [upsert]  upserting existing rows ({period_desc})")
             logger.info(
-                f"🔄 RELOAD (UPSERT): Preserving existing rows for {cik} ({period_desc}); "
+                f"🔄 UPSERT: Preserving existing rows for {cik} ({period_desc}); "
                 "will upsert corrections and fill missing gaps"
             )
             return
@@ -1436,13 +1468,13 @@ class SECDataScraperApp:
         qtr_del = self._cv_quarterly_col.delete_many(reload_filter)
         total_del = ann_del.deleted_count + qtr_del.deleted_count
         if total_del > 0:
-            self.progress.status(f"  [reload]  deleted {total_del} existing rows  ({period_desc})")
+            self.progress.status(f"  [replace]  deleted {total_del} existing rows  ({period_desc})")
             logger.info(
-                f"🔄 RELOAD: Deleted {ann_del.deleted_count} annual + "
+                f"🔄 REPLACE: Deleted {ann_del.deleted_count} annual + "
                 f"{qtr_del.deleted_count} quarterly rows for {cik} ({period_desc})"
             )
         else:
-            self.progress.status(f"  [reload]  no existing rows to delete  ({period_desc})")
+            self.progress.status(f"  [replace]  no existing rows to delete  ({period_desc})")
 
     def _get_authoritative_fiscal_year_end(self, company_data: Optional[Dict] = None) -> Optional[str]:
         """Return the authoritative fiscal year end code (MMDD) for a company.
@@ -2080,7 +2112,7 @@ class SECDataScraperApp:
                             cik=str(cik or ''),
                             form_type=filing_info.get('form') or filing_info.get('formType'),
                             norm_service=getattr(self, '_norm_service', None),
-                            no_new_concept=self.no_new_concept,
+                            no_new_concept=getattr(self, 'no_new_concept', False),
                         )
                         if _agent_stmts:
                             statements_data = {
@@ -2229,7 +2261,7 @@ class SECDataScraperApp:
                     company_doc=company_doc,
                     filing_date=filing_date,
                     sec_client=self.sec_client,
-                    no_new_concept=self.no_new_concept,
+                    no_new_concept=getattr(self, 'no_new_concept', False),
                 )
                 agent_state['reporting_period'] = reporting_period
                 try:
@@ -3020,7 +3052,8 @@ def _dispatch_earnings_cli(
         or args.end_year is not None
         or args.fiscal_year is not None
         or quarter_num is not None
-        or args.reload
+        or args.upsert
+        or args.replace
         or (args.accession is not None and len(args.accession) > 1)
     ):
         run_single_live = True
@@ -3057,8 +3090,10 @@ def _dispatch_earnings_cli(
             bf_argv.extend(['--accession', *args.accession])
         if stmt_arg:
             bf_argv.extend(['--statements', stmt_arg])
-        if args.reload:
-            bf_argv.append('--reload')
+        if args.upsert:
+            bf_argv.append('--upsert')
+        if args.replace:
+            bf_argv.append('--replace')
         if args.guidance_only:
             bf_argv.append('--guidance-only')
         if args.dry_run:
@@ -3094,6 +3129,29 @@ def _dispatch_earnings_cli(
     earnings_main(e_argv)
 
 
+def _run_mode_label(args: argparse.Namespace) -> str:
+    """Return a concise mode string for the persisted run report."""
+    parts: list[str] = []
+    if getattr(args, "guidance_only", False):
+        parts.append("guidance_only")
+    if getattr(args, "replace", False):
+        parts.append("replace")
+    elif getattr(args, "upsert", False):
+        parts.append("upsert")
+    if getattr(args, "latest", False):
+        parts.append("latest")
+    return "+".join(parts) if parts else "default"
+
+
+def _safe_get_report_db() -> Any:
+    """Return ``normalize_data`` DB handle, or None if unavailable."""
+    try:
+        from shared.run_report import get_normalize_db
+        return get_normalize_db()
+    except Exception:
+        return None
+
+
 def _run_mixed_forms_cli(
     args: argparse.Namespace,
     raw_argv: Sequence[str],
@@ -3104,27 +3162,37 @@ def _run_mixed_forms_cli(
     target_statement: Optional[str],
     html_download_path: str,
     progress: "ProgressManager",
+    run_log: Any = None,
 ) -> None:
-    """Process combined XBRL + earnings forms (e.g. ``--form all``, ``--form 10k-10q-8k``, ``--form 20f-6k``)."""
+    """Process combined XBRL + earnings forms (e.g. ``--form 8k-10k-10q``, ``--form 20f-6k``)."""
+    import time as _time
+    from datetime import timezone as _tz
+    from shared.run_report import (
+        build_run_report,
+        diff_stage,
+        print_run_report,
+        save_run_report,
+        snapshot_company_state,
+    )
+
     sec_client = SECAPIClient()
+    report_db = _safe_get_report_db() if not getattr(args, "dry_run", False) else None
 
     for cik in companies:
         label = progress.cik_labels.get(cik) or sec_client.get_ticker_from_cik(cik) or cik
-        company_data, filings_list = sec_client.get_company_submissions(
-            cik, start_year=args.year, end_year=args.end_year
-        )
-        if not company_data:
-            print(f"❌ Failed to fetch SEC submissions for {label} ({cik})")
-            continue
-
-        if form_spec['mode'] == 'all':
-            xbrl_forms, earnings_forms = detect_company_issuer_forms(filings_list)
-        else:
-            xbrl_forms = list(form_spec['xbrl_forms'])
-            earnings_forms = list(form_spec['earnings_forms'])
+        xbrl_forms = list(form_spec['xbrl_forms'])
+        earnings_forms = list(form_spec['earnings_forms'])
+        company_started_utc = datetime.now(_tz.utc)
+        stages: list[dict[str, Any]] = []
 
         # With --latest, pick the SINGLE newest filing across all selected forms
         if args.latest:
+            company_data, filings_list = sec_client.get_company_submissions(
+                cik, start_year=args.year, end_year=args.end_year
+            )
+            if not company_data:
+                print(f"❌ Failed to fetch SEC submissions for {label} ({cik})")
+                continue
             allowed = set(xbrl_forms) | set(earnings_forms)
             candidates = [f for f in filings_list if f.get('form') in allowed]
             candidates.sort(key=lambda f: f.get('filingDate', ''), reverse=True)
@@ -3133,6 +3201,11 @@ def _run_mixed_forms_cli(
                 continue
             newest = candidates[0]
             newest_form = str(newest.get('form') or '')
+            snap_before = snapshot_company_state(
+                report_db, cik,
+                fiscal_year=args.fiscal_year, quarter=fiscal_quarter, statement_type=target_statement,
+            )
+            t0 = _time.perf_counter()
             if newest_form in earnings_forms:
                 _dispatch_earnings_cli(
                     args,
@@ -3149,7 +3222,8 @@ def _run_mixed_forms_cli(
                     target_fiscal_year=args.fiscal_year,
                     target_fiscal_quarter=fiscal_quarter,
                     target_statement=target_statement,
-                    reload=args.reload or bool(args.fiscal_year and fiscal_quarter),
+                    reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                    replace=args.replace,
                     latest=True,
                     html_download_path=html_download_path,
                     enable_reconciliation=not args.no_reconciliation,
@@ -3161,11 +3235,48 @@ def _run_mixed_forms_cli(
                 if app.setup_database():
                     app.process_multiple_companies([cik], resume=True)
                     app.cleanup()
+            snap_after = snapshot_company_state(
+                report_db, cik,
+                fiscal_year=args.fiscal_year, quarter=fiscal_quarter, statement_type=target_statement,
+            )
+            stages.append(
+                diff_stage(
+                    snap_before, snap_after,
+                    stage_name=newest_form,
+                    stage_forms=[newest_form],
+                    duration_seconds=_time.perf_counter() - t0,
+                )
+            )
+            report = build_run_report(
+                serial_number=getattr(run_log, "serial_number", "0000"),
+                ticker=label,
+                cik=cik,
+                forms_requested=str(args.form or ""),
+                mode=_run_mode_label(args),
+                log_file=str(getattr(run_log, "path", "")),
+                started_at_utc=company_started_utc,
+                finished_at_utc=datetime.now(_tz.utc),
+                stages=stages,
+                target_fiscal_year=args.fiscal_year,
+                target_quarter=fiscal_quarter,
+                target_statement=target_statement,
+            )
+            save_run_report(report_db, report)
+            rendered = print_run_report(report, console=progress.console)
+            if run_log is not None:
+                run_log.write_raw(rendered)
             continue
 
-        # Full range / period mode: run XBRL first (statements + hierarchy + MD&A guidance),
-        # then earnings releases (8-K / 6-K) for the same period window.
-        if xbrl_forms:
+        # Determine execution order for combined XBRL + earnings runs:
+        # - Foreign (20-F + 6-K): run annual 20-F FIRST, then 6-K SECOND.
+        # - US (8-K + 10-K/10-Q): run 8-K FIRST, then 10-K/10-Q SECOND so official
+        #   XBRL updates matching concepts in place while retaining any extra
+        #   statement/guidance values that were only reported in the 8-K.
+        is_foreign_combo = bool(set(xbrl_forms) & {'20-F', '20-F/A'})
+
+        def _run_xbrl_pass() -> None:
+            if not xbrl_forms:
+                return
             app = SECDataScraperApp(
                 start_year=args.year,
                 end_year=args.end_year,
@@ -3173,7 +3284,8 @@ def _run_mixed_forms_cli(
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=fiscal_quarter,
                 target_statement=target_statement,
-                reload=args.reload or bool(args.fiscal_year and fiscal_quarter),
+                reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                replace=args.replace,
                 latest=False,
                 html_download_path=html_download_path,
                 enable_reconciliation=not args.no_reconciliation,
@@ -3186,7 +3298,9 @@ def _run_mixed_forms_cli(
                 app.process_multiple_companies([cik], resume=True)
                 app.cleanup()
 
-        if earnings_forms:
+        def _run_earnings_pass() -> None:
+            if not earnings_forms:
+                return
             _dispatch_earnings_cli(
                 args,
                 raw_argv,
@@ -3194,6 +3308,51 @@ def _run_mixed_forms_cli(
                 override_tokens=[cik],
                 force_latest_single=False,
             )
+
+        snap_cur = snapshot_company_state(
+            report_db, cik,
+            fiscal_year=args.fiscal_year, quarter=fiscal_quarter, statement_type=target_statement,
+        )
+        ordered_passes = (
+            [("20-F", xbrl_forms, _run_xbrl_pass), ("/".join(earnings_forms), earnings_forms, _run_earnings_pass)]
+            if is_foreign_combo
+            else [("/".join(earnings_forms), earnings_forms, _run_earnings_pass), ("/".join(xbrl_forms), xbrl_forms, _run_xbrl_pass)]
+        )
+        for stage_name, stage_forms, fn in ordered_passes:
+            t0 = _time.perf_counter()
+            fn()
+            snap_next = snapshot_company_state(
+                report_db, cik,
+                fiscal_year=args.fiscal_year, quarter=fiscal_quarter, statement_type=target_statement,
+            )
+            stages.append(
+                diff_stage(
+                    snap_cur, snap_next,
+                    stage_name=stage_name,
+                    stage_forms=stage_forms,
+                    duration_seconds=_time.perf_counter() - t0,
+                )
+            )
+            snap_cur = snap_next
+
+        report = build_run_report(
+            serial_number=getattr(run_log, "serial_number", "0000"),
+            ticker=label,
+            cik=cik,
+            forms_requested=str(args.form or ""),
+            mode=_run_mode_label(args),
+            log_file=str(getattr(run_log, "path", "")),
+            started_at_utc=company_started_utc,
+            finished_at_utc=datetime.now(_tz.utc),
+            stages=stages,
+            target_fiscal_year=args.fiscal_year,
+            target_quarter=fiscal_quarter,
+            target_statement=target_statement,
+        )
+        save_run_report(report_db, report)
+        rendered = print_run_report(report, console=progress.console)
+        if run_log is not None:
+            run_log.write_raw(rendered)
 
 
 def main(argv: Optional[Sequence[str]] = None):
@@ -3210,7 +3369,7 @@ def main(argv: Optional[Sequence[str]] = None):
             'Quickstart examples:\n'
             '  main --file tickers.txt\n'
             '  main --companies 0000320193 0001065280 --year 2015 --end-year 2026\n'
-            '  main --companies AAPL NFLX --reload --fiscal-year 2023\n'
+            '  main --companies AAPL NFLX --form 10-K --upsert --fiscal-year 2023\n'
             '  main --companies AAPL --fiscal-year 2023 --quarter Q2 --statement balance_sheet\n'
             '  main --url https://www.sec.gov/Archives/edgar/data/1065280/.../nflx-20230930.htm'
         ),
@@ -3260,15 +3419,18 @@ def main(argv: Optional[Sequence[str]] = None):
     # --- Processing behaviour ----------------------------------------------
     proc = parser.add_argument_group('Processing behaviour')
     proc.add_argument(
-        '--reload', action='store_true',
-        help='Force reprocessing of filings that are already in the database. '
-             'Scope with --year / --end-year or --fiscal-year / --fiscal-quarter '
-             'to reload only a specific range. A fiscal year without a quarter '
-             'reloads only its annual 10-K.')
+        '--upsert', action='store_true', dest='upsert',
+        help='Non-destructive upsert: reprocess already-stored filings, preserving '
+             'correct values, updating differing values in place, and filling missing gaps. '
+             'Scope with --year / --end-year or --fiscal-year / --fiscal-quarter.')
+    proc.add_argument(
+        '--replace', action='store_true', dest='replace',
+        help='Hard replace: delete ALL existing values for the target period first, '
+             'then insert fresh extracted values. Cannot be combined with --upsert.')
     proc.add_argument(
         '--latest', action='store_true',
         help='Process only the most recent filing from the SEC for each company. '
-             'With --reload, delete and reload only that selected filing.')
+             'With --upsert, reprocess and upsert only that selected filing.')
     proc.add_argument(
         '--no-dimensions', action='store_true',
         help='Skip dimensional (segment / product / geography) data extraction. '
@@ -3309,9 +3471,9 @@ def main(argv: Optional[Sequence[str]] = None):
     earn = parser.add_argument_group('Form / 8-K & 6-K Earnings selection')
     earn.add_argument(
         '--form', '--from', dest='form', type=str, default=None, metavar='FORM',
-        help='SEC form(s) to process: all (US: 10-K/10-Q/8-K; Foreign: 20-F/6-K), '
-             '10-K, 10-Q, 10k-10q, 20-F, 8-K, 6-K, 20f-6k, 10k-10q-8k. '
-             'Omit for default XBRL (10-K, 10-Q, 20-F).')
+        help='SEC form(s) to process (required): 10-K, 10-Q, 10k-10q, 20-F, '
+             '8-K, 6-K, 8k-10k-10q (US: 8-K first, then 10-K/10-Q), '
+             '20f-6k (Foreign: 20-F first, then 6-K).')
     earn.add_argument(
         '--earnings', action='store_true',
         help='Shortcut to extract 8-K/6-K earnings press releases (or IR PDFs). '
@@ -3342,29 +3504,36 @@ def main(argv: Optional[Sequence[str]] = None):
     raw_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parser.parse_args(raw_argv)
 
+    if args.upsert and args.replace:
+        print("❌ --upsert and --replace cannot be used together (choose one).")
+        sys.exit(1)
+
+    # Read-only failure report doesn't require --form
+    if args.failures:
+        _dispatch_earnings_cli(args, raw_argv, earnings_forms=['8-K'])
+        return
+
+    # Require --form (or --from) for all filing processing so nothing runs accidentally
+    if not args.form and not args.fix_hierarchy:
+        if args.earnings:
+            print("❌ --form is required even with --earnings (e.g. --form 8-K or --form 6-K).")
+        else:
+            print("❌ --form is required (nothing processed).")
+        print("💡 Specify which SEC form(s) to process:")
+        print("   --form 10k-10q      (10-K and 10-Q only)")
+        print("   --form 20-F         (20-F / 20-F/A only)")
+        print("   --form 8-K          (8-K earnings releases)")
+        print("   --form 6-K          (6-K foreign earnings releases)")
+        print("   --form 8k-10k-10q   (US: 8-K first, then 10-K/10-Q; retains 8-K-only values/guidance)")
+        print("   --form 20f-6k       (Foreign: 20-F first, then 6-K)")
+        sys.exit(1)
+
     try:
         form_spec = parse_form_selection(args.form)
     except ValueError as e:
         print(f"❌ {e}")
         sys.exit(1)
 
-    # Dispatch pure earnings runs directly (--failures, --earnings without XBRL forms,
-    # or --form 8-K / --form 6-K).
-    if args.failures or (args.earnings and form_spec['mode'] == 'default'):
-        _dispatch_earnings_cli(
-            args,
-            raw_argv,
-            earnings_forms=form_spec['earnings_forms'] or ['8-K'],
-        )
-        return
-    if form_spec['earnings_forms'] and not form_spec['xbrl_forms']:
-        _dispatch_earnings_cli(
-            args,
-            raw_argv,
-            earnings_forms=form_spec['earnings_forms'],
-        )
-        return
-    
     # --verbose implies debug-level console; --debug is the highest detail
     is_verbose = args.verbose or args.debug
 
@@ -3378,21 +3547,104 @@ def main(argv: Optional[Sequence[str]] = None):
         LoggerConfig.setup_logging(level='INFO', detailed=True, console_output=True)
         logger.info("Verbose logging enabled")
     else:
-        # Clean mode: suppress logger console output; progress bars carry all UI
+        # Clean mode: suppress logger console output; detailed logs go to the run log file
         from utilities.helpers.logger_config import LoggerConfig
         LoggerConfig.setup_logging(level='INFO', console_output=False)
 
-    # Always write full detailed logs for every run into <repo>/logs/
+    # Always write full detailed logs for every run into:
+    #   <repo>/logs/<serialnumber>-<ticker>-<timestamp_utc>.log
+    from shared.run_logger import RunLogSession
+    _log_ticker_tokens: list[str] = []
+    if args.companies:
+        _log_ticker_tokens = list(args.companies)
+    elif args.file:
+        _log_ticker_tokens = [Path(args.file).stem]
+    elif args.url:
+        _url_info = parse_sec_filing_url(args.url)
+        if _url_info and _url_info.get('cik'):
+            _log_ticker_tokens = [_url_info['cik']]
     _run_logs_dir = Path(__file__).resolve().parent / 'logs'
-    _run_logs_dir.mkdir(parents=True, exist_ok=True)
-    _run_log_file = _run_logs_dir / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    _file_handler = logging.FileHandler(_run_log_file, encoding='utf-8')
-    _file_handler.setLevel(logging.DEBUG if args.debug else logging.INFO)
-    _file_handler.setFormatter(logging.Formatter(
-        '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S',
-    ))
-    logging.getLogger().addHandler(_file_handler)
+    run_log = RunLogSession(_log_ticker_tokens or 'RUN', log_dir=_run_logs_dir, debug=args.debug)
+    run_log.attach()
+
+    # Dispatch pure earnings runs (--form 8-K / --form 6-K) with unified log + DB/console report
+    if form_spec['earnings_forms'] and not form_spec['xbrl_forms']:
+        import time as _time
+        from datetime import timezone as _tz
+        from shared.run_report import (
+            build_run_report,
+            diff_stage,
+            print_run_report,
+            save_run_report,
+            snapshot_company_state,
+        )
+        try:
+            _e_started = datetime.now(_tz.utc)
+            _e_db = _safe_get_report_db() if not args.dry_run else None
+            _e_q = normalize_quarter(args.fiscal_quarter) if args.fiscal_quarter else None
+            _e_stmt = canonicalize_statement_type(args.statement) if args.statement else None
+            _e_targets: list[tuple[str, str]] = []
+            if _e_db is not None and args.companies:
+                try:
+                    from utilities.helpers.ticker_resolver import get_ticker_to_cik as _g2c
+                    _tmap = {k.upper(): v for k, v in _g2c().items()}
+                except Exception:
+                    _tmap = {}
+                for tok in args.companies:
+                    tok_s = str(tok).strip()
+                    if not tok_s:
+                        continue
+                    if tok_s.isdigit():
+                        _e_targets.append((tok_s.zfill(10), tok_s.zfill(10)))
+                    elif tok_s.upper() in _tmap:
+                        _e_targets.append((_tmap[tok_s.upper()], tok_s.upper()))
+
+            _snaps_before = {
+                cik: snapshot_company_state(
+                    _e_db, cik, fiscal_year=args.fiscal_year, quarter=_e_q, statement_type=_e_stmt
+                )
+                for cik, _lbl in _e_targets
+            }
+            _t0 = _time.perf_counter()
+            _dispatch_earnings_cli(
+                args,
+                raw_argv,
+                earnings_forms=form_spec['earnings_forms'],
+            )
+            _elapsed = _time.perf_counter() - _t0
+            if _e_db is not None and _e_targets and not args.dry_run:
+                _e_finished = datetime.now(_tz.utc)
+                for cik, lbl in _e_targets:
+                    _snap_after = snapshot_company_state(
+                        _e_db, cik, fiscal_year=args.fiscal_year, quarter=_e_q, statement_type=_e_stmt
+                    )
+                    _stage = diff_stage(
+                        _snaps_before[cik],
+                        _snap_after,
+                        stage_name="/".join(form_spec['earnings_forms']),
+                        stage_forms=form_spec['earnings_forms'],
+                        duration_seconds=_elapsed,
+                    )
+                    _rep = build_run_report(
+                        serial_number=run_log.serial_number,
+                        ticker=lbl,
+                        cik=cik,
+                        forms_requested=str(args.form or ""),
+                        mode=_run_mode_label(args),
+                        log_file=str(run_log.path),
+                        started_at_utc=_e_started,
+                        finished_at_utc=_e_finished,
+                        stages=[_stage],
+                        target_fiscal_year=args.fiscal_year,
+                        target_quarter=_e_q,
+                        target_statement=_e_stmt,
+                    )
+                    save_run_report(_e_db, _rep)
+                    _rendered = print_run_report(_rep)
+                    run_log.write_raw(_rendered)
+            return
+        finally:
+            run_log.close()
 
     # Build the Rich progress manager (verbose=True disables live bars)
     progress = ProgressManager(verbose=is_verbose, parallel=False)
@@ -3514,7 +3766,8 @@ def main(argv: Optional[Sequence[str]] = None):
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=fiscal_quarter,
                 target_statement=target_statement,
-                reload=args.reload or bool(args.fiscal_year and fiscal_quarter),
+                reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                replace=args.replace,
                 latest=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
                 enable_reconciliation=not args.no_reconciliation,
@@ -3692,16 +3945,16 @@ def main(argv: Optional[Sequence[str]] = None):
                     print("⚠️  --only-download-files requires SEC_HTML_DOWNLOAD_PATH to be set (and not --no-download-html-filings)")
                     print("💡 Set SEC_HTML_DOWNLOAD_PATH in your .env file")
                     sys.exit(1)
-            if args.reload:
-                reload_msg = "🔄 RELOAD MODE ENABLED"
+            if args.upsert:
+                upsert_msg = "🔄 UPSERT MODE ENABLED"
                 if args.fiscal_year:
                     if args.fiscal_quarter:
-                        reload_msg += f" - Will refresh FY{args.fiscal_year} {args.fiscal_quarter} data"
+                        upsert_msg += f" - Will upsert FY{args.fiscal_year} {args.fiscal_quarter} data"
                     else:
-                        reload_msg += f" - Will refresh annual FY{args.fiscal_year} data"
+                        upsert_msg += f" - Will upsert annual FY{args.fiscal_year} data"
                 else:
-                    reload_msg += f" - Will refresh all filings from {args.year} onwards"
-                print(reload_msg)
+                    upsert_msg += f" - Will upsert all filings from {args.year} onwards"
+                print(upsert_msg)
             print(f"{'='*50}")
         
         # Handle download-only mode
@@ -3725,7 +3978,7 @@ def main(argv: Optional[Sequence[str]] = None):
             
             sys.exit(0)
         
-        # Handle mixed XBRL + earnings forms (--form all, --form 10k-10q-8k, --form 20f-6k)
+        # Handle mixed XBRL + earnings forms (--form 8k-10k-10q, --form 20f-6k)
         if form_spec['earnings_forms'] and form_spec['xbrl_forms']:
             _run_mixed_forms_cli(
                 args,
@@ -3736,6 +3989,7 @@ def main(argv: Optional[Sequence[str]] = None):
                 target_statement=target_statement,
                 html_download_path=html_download_path,
                 progress=progress,
+                run_log=run_log,
             )
             return
 
@@ -3746,7 +4000,8 @@ def main(argv: Optional[Sequence[str]] = None):
             target_fiscal_year=args.fiscal_year,
             target_fiscal_quarter=fiscal_quarter,
             target_statement=target_statement,
-            reload=args.reload or bool(args.fiscal_year and fiscal_quarter),
+            reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                replace=args.replace,
             latest=args.latest,
             html_download_path=html_download_path,
             enable_reconciliation=not args.no_reconciliation,
@@ -3778,65 +4033,80 @@ def main(argv: Optional[Sequence[str]] = None):
                             print(f"  ✓ {ticker} ({cadence}/{st}): {res.get('updated', 0)} updated, {res.get('merged', 0)} merged")
             sys.exit(0)
         
-        # Process companies
+        # Process companies with before/after DB snapshots for run summary report
+        import time as _time
+        from datetime import timezone as _tz
+        from shared.run_report import (
+            build_run_report,
+            diff_stage,
+            print_run_report,
+            save_run_report,
+            snapshot_company_state,
+        )
+
+        _xbrl_started = datetime.now(_tz.utc)
+        _report_db = _safe_get_report_db()
+        _snaps_before = {
+            cik: snapshot_company_state(
+                _report_db,
+                cik,
+                fiscal_year=args.fiscal_year,
+                quarter=fiscal_quarter,
+                statement_type=target_statement,
+            )
+            for cik in companies
+        }
+        _t0 = _time.perf_counter()
         results = app.process_multiple_companies(companies, resume=True)
-        
-        # Show results. A company counts as successful only when it ran cleanly
-        # AND had no failed filings — reporting "success" for a company whose
-        # filings all failed was actively misleading.
-        def _company_ok(entry: Any) -> bool:
-            if not isinstance(entry, dict):
-                return bool(entry)
-            return bool(entry.get('success', False)) and not entry.get('failed', 0)
+        _xbrl_elapsed = _time.perf_counter() - _t0
+        _xbrl_finished = datetime.now(_tz.utc)
 
-        successful = sum(1 for s in results.values() if _company_ok(s))
-        total = len(results)
-        
-        total_failed = sum(
-            (s.get('failed', 0) if isinstance(s, dict) else 0)
-            for s in results.values()
-        )
-        total_new = sum(
-            (s.get('processed', 0) if isinstance(s, dict) else 0)
-            for s in results.values()
-        )
-
-        # One compact Rich panel: per-company outcome + overall totals.
-        rows: list = []
-        for cik, entry in results.items():
-            if isinstance(entry, dict):
-                ticker = entry.get('ticker', cik)
-                parts = []
-                if entry.get('processed'):
-                    parts.append(f"{entry['processed']} new")
-                if entry.get('skipped'):
-                    parts.append(f"{entry['skipped']} skipped")
-                if entry.get('failed'):
-                    parts.append(f"{entry['failed']} failed")
-                if not parts:
-                    parts.append("no filings")
-                mark = "[green]✓[/green]" if _company_ok(entry) else "[yellow]![/yellow]"
-                rows.append((f"  {mark} {ticker}", ", ".join(parts)))
-            else:
-                mark = "[green]✓[/green]" if entry else "[red]✗[/red]"
-                rows.append((f"  {mark} {cik}", ""))
-        rows.append(("", ""))
-        rows.append(("  Companies", f"{successful}/{total} succeeded"))
-        if total_new:
-            rows.append(("  New filings", str(total_new)))
-        if total_failed:
-            rows.append(("  Failed filings", f"[red]{total_failed}[/red]"))
-
-        subtitle = (
-            "all companies processed successfully"
-            if successful == total
-            else f"{total - successful} company/companies had issues — run with --verbose for details"
-        )
-        progress.summary("PROCESSING COMPLETE", rows, subtitle=subtitle)
-        progress.console.print("")
-        progress.console.print(
-            "[dim]For more options: python sec_scraper_cli.py --help[/dim]"
-        )
+        # Save & print exact per-company run summary report
+        _stage_name = "/".join(form_spec['xbrl_forms'])
+        for cik in companies:
+            entry = results.get(cik) if isinstance(results, dict) else None
+            lbl = (
+                (entry.get('ticker') if isinstance(entry, dict) else None)
+                or progress.cik_labels.get(cik)
+                or cik
+            )
+            _ok = (
+                bool(entry.get('success', False)) and not entry.get('failed', 0)
+                if isinstance(entry, dict)
+                else bool(entry)
+            )
+            _snap_after = snapshot_company_state(
+                _report_db,
+                cik,
+                fiscal_year=args.fiscal_year,
+                quarter=fiscal_quarter,
+                statement_type=target_statement,
+            )
+            _stage = diff_stage(
+                _snaps_before[cik],
+                _snap_after,
+                stage_name=_stage_name,
+                stage_forms=form_spec['xbrl_forms'],
+                duration_seconds=_xbrl_elapsed,
+            )
+            _rep = build_run_report(
+                serial_number=run_log.serial_number,
+                ticker=lbl,
+                cik=cik,
+                forms_requested=str(args.form or ""),
+                mode=_run_mode_label(args),
+                log_file=str(run_log.path),
+                started_at_utc=_xbrl_started,
+                finished_at_utc=_xbrl_finished,
+                stages=[_stage],
+                target_fiscal_year=args.fiscal_year,
+                target_quarter=fiscal_quarter,
+                target_statement=target_statement,
+                status="success" if _ok else "partial_or_failed",
+            )
+            save_run_report(_report_db, _rep)
+            _rendered = print_run_report(_rep, console=progress.console)
+            run_log.write_raw(_rendered)
 
         # Cleanup
         if app is not None:
@@ -3854,6 +4124,11 @@ def main(argv: Optional[Sequence[str]] = None):
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        try:
+            run_log.close()
+        except Exception:
+            pass
 
 
 def create_load_statement_parser() -> argparse.ArgumentParser:
@@ -3868,7 +4143,7 @@ def create_load_statement_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  load-statement --companies AAPL --fiscal-year 2023 --quarter Q2 --statement balance_sheet\n"
-            "  load-statement --company 0000320193 --fiscal-year 2024 --quarter Q1 --statement income --reload\n"
+            "  load-statement --company 0000320193 --fiscal-year 2024 --quarter Q1 --statement income --upsert\n"
             "  load-statement --companies AAPL MSFT --fiscal-year 2023 --quarter Q3 --statement cash_flow\n"
         ),
     )
@@ -3893,8 +4168,11 @@ def create_load_statement_parser() -> argparse.ArgumentParser:
 
     proc = parser.add_argument_group('Processing options')
     proc.add_argument(
-        '--reload', action='store_true',
-        help='Force reload/overwrite existing records for this statement and quarter.')
+        '--upsert', action='store_true', dest='upsert',
+        help='Non-destructive upsert: update differing values and fill missing gaps for this statement and quarter.')
+    proc.add_argument(
+        '--replace', action='store_true', dest='replace',
+        help='Hard replace: delete all existing values for this statement and quarter first, then insert fresh.')
     proc.add_argument(
         '--no-dimensions', action='store_true',
         help='Skip dimensional data extraction.')
@@ -3923,14 +4201,17 @@ def load_statement_cli(argv: Optional[Sequence[str]] = None) -> int:
 
     cli_args = [
         '--companies', *args.companies,
+        '--form', '10k-10q',
         '--fiscal-year', str(args.fiscal_year),
         '--fiscal-quarter', str(args.quarter),
         '--statement', str(args.statement),
     ]
     if args.file:
         cli_args.extend(['--file', args.file])
-    if args.reload:
-        cli_args.append('--reload')
+    if args.upsert:
+        cli_args.append('--upsert')
+    if args.replace:
+        cli_args.append('--replace')
     if args.no_dimensions:
         cli_args.append('--no-dimensions')
     if args.no_reconciliation:

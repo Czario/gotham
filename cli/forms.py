@@ -108,7 +108,6 @@ def parse_form_selection(raw_form: Optional[str]) -> Dict[str, Any]:
 
     Supported examples (case-insensitive):
       - None            → default XBRL forms (10-K, 10-Q, 20-F, 20-F/A)
-      - ``all``         → auto-detected per company (US: 10-K/10-Q/8-K; Foreign: 20-F/6-K)
       - ``10-K`` / ``10k`` → 10-K only
       - ``10-Q`` / ``10q`` → 10-Q only
       - ``10k-10q`` / ``10-K,10-Q`` → 10-K and 10-Q
@@ -125,25 +124,12 @@ def parse_form_selection(raw_form: Optional[str]) -> Dict[str, Any]:
         }
 
     text = str(raw_form).strip().lower()
-    if text == 'all':
-        return {
-            'mode': 'all',
-            'xbrl_forms': list(DEFAULT_XBRL_FORMS),
-            'earnings_forms': list(ALL_EARNINGS_FORMS),
-        }
-
-    tokens = re.findall(r'20-?f/a|20-?f|10-?k|10-?q|8-?k|6-?k|all', text)
+    tokens = re.findall(r'20-?f/a|20-?f|10-?k|10-?q|8-?k|6-?k', text)
     if not tokens:
         raise ValueError(
             f"Unsupported --form value: {raw_form!r}. "
-            "Use 'all', '10-K', '10-Q', '10k-10q', '20-F', '8-K', '6-K', '20f-6k', or '10k-10q-8k'."
+            "Use '10-K', '10-Q', '10k-10q', '20-F', '8-K', '6-K', '20f-6k', or '10k-10q-8k'."
         )
-    if 'all' in tokens:
-        return {
-            'mode': 'all',
-            'xbrl_forms': list(DEFAULT_XBRL_FORMS),
-            'earnings_forms': list(ALL_EARNINGS_FORMS),
-        }
 
     xbrl_forms: list[str] = []
     earnings_forms: list[str] = []
@@ -167,16 +153,6 @@ def parse_form_selection(raw_form: Optional[str]) -> Dict[str, Any]:
         'xbrl_forms': list(dict.fromkeys(xbrl_forms)),
         'earnings_forms': list(dict.fromkeys(earnings_forms)),
     }
-
-
-def detect_company_issuer_forms(filings_list: List[Dict]) -> tuple[list[str], list[str]]:
-    """Detect US vs foreign issuer from EDGAR submissions and return (xbrl_forms, earnings_forms)."""
-    forms = {str(f.get('form') or '').upper() for f in (filings_list or [])}
-    has_us = bool(forms & {'10-K', '10-Q'})
-    has_foreign = bool(forms & {'20-F', '20-F/A', '6-K'})
-    if has_foreign and not has_us:
-        return (['20-F', '20-F/A'], ['6-K'])
-    return (['10-K', '10-Q'], ['8-K'])
 
 
 def normalize_quarter(q: Optional[Any]) -> Optional[str]:

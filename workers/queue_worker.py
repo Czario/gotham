@@ -26,7 +26,45 @@ logger = logging.getLogger(__name__)
 _DEFAULT_QUEUE = "sec:filings:10kq"
 _HANDLED_TYPES = frozenset({
     "10-K", "10-Q", "10-K/A", "10-Q/A", "20-F", "20-F/A",
+    "10-K/10-Q", "10K-10Q",
 })
+
+
+def _target_forms_for_payload(form_type: str) -> list[str]:
+    ft = (form_type or "").strip().upper()
+    if ft in {"10-K/10-Q", "10K-10Q"}:
+        return ["10-K", "10-Q"]
+    if ft in {"20-F", "20-F/A"}:
+        return ["20-F", "20-F/A"]
+    if ft in {"10-K", "10-K/A"}:
+        return ["10-K", "10-K/A"]
+    if ft in {"10-Q", "10-Q/A"}:
+        return ["10-Q", "10-Q/A"]
+    return ["10-K", "10-Q", "20-F", "20-F/A"]
+
+
+def _resolve_cik_for_ticker(ticker: str) -> str | None:
+    if not ticker:
+        return None
+    try:
+        from utilities.helpers.ticker_resolver import get_ticker_to_cik
+        mapped = {k.upper(): v for k, v in get_ticker_to_cik().items()}.get(ticker.upper())
+        if mapped:
+            return str(mapped).zfill(10)
+    except Exception:
+        pass
+    try:
+        uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
+        db_name = os.getenv("DATABASE_NAME", "normalize_data")
+        with MongoClient(uri, serverSelectionTimeoutMS=5000) as mongo:
+            doc = mongo[db_name]["companies"].find_one(
+                {"ticker_symbol": ticker.upper()}, {"cik": 1}
+            )
+            if doc and doc.get("cik"):
+                return str(doc["cik"]).zfill(10)
+    except Exception:
+        pass
+    return None
 
 
 class WorkerProgressManager(ProgressManager):
@@ -100,26 +138,48 @@ def _build_app() -> SECDataScraperApp:
 
 
 def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
-    """Process one 10-K/10-Q filing message."""
+    """Process one XBRL filing message (10-K, 10-Q, 20-F, 10-K/10-Q, amendments)."""
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from shared.run_logger import RunLogSession
+    from shared.run_report import (
+        build_run_report,
+        diff_stage,
+        format_run_report_text,
+        get_normalize_db,
+        save_run_report,
+        snapshot_company_state,
+    )
+
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     load_request_id = payload.get("load_request_id")
     ticker = (payload.get("ticker") or "").upper()
     form_type = (payload.get("filing_type") or payload.get("form_type") or "10-K/10-Q").upper()
 
-    filing_url = payload.get("filing_url")
-    if not filing_url:
-        logger.error("Queue message missing filing_url: %s", payload)
+    # Resolve (cik, accession_number) from filing_url, filing_href, or explicit payload fields
+    cik: str | None = None
+    accession_number: str | None = None
+    raw_url = payload.get("filing_url") or payload.get("filing_href")
+    if raw_url:
+        filing_info = parse_sec_filing_url(str(raw_url))
+        if filing_info:
+            cik = filing_info["cik"]
+            accession_number = filing_info["accession_number"]
+
+    if not cik and payload.get("cik"):
+        digits = "".join(ch for ch in str(payload["cik"]) if ch.isdigit())
+        if digits:
+            cik = digits.zfill(10)
+    if not cik and ticker:
+        cik = _resolve_cik_for_ticker(ticker)
+    if not accession_number and payload.get("accession_number"):
+        accession_number = str(payload["accession_number"]).strip() or None
+
+    if not cik:
+        logger.error("Queue message could not resolve CIK (ticker=%r, url=%r): %s", ticker, raw_url, payload)
         return False
 
-    filing_info = parse_sec_filing_url(str(filing_url))
-    if not filing_info:
-        logger.error("Could not parse SEC filing URL: %s", filing_url)
-        return False
-
-    cik = filing_info["cik"]
-    accession_number = filing_info["accession_number"]
     label = payload.get("company_name") or ticker or cik
-
     pub = WorkerProgressPublisher(redis_url, ticker or cik, load_request_id)
 
     if not load_request_id and ticker:
@@ -137,18 +197,68 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
             return True
 
     original_pm = app.progress
-    app.progress = WorkerProgressManager(pub, ticker or cik)
+    original_reload = getattr(app, "reload", False)
+    original_replace = getattr(app, "replace", False)
+    original_latest = getattr(app, "latest", False)
+    original_target_forms = getattr(app, "target_forms", None)
+    original_fy = getattr(app, "target_fiscal_year", None)
+    original_fq = getattr(app, "target_fiscal_quarter", None)
 
-    pub.publish("start", f"► processing  {form_type}  {label}  ({accession_number})", kind="step_start")
+    app.progress = WorkerProgressManager(pub, ticker or cik)
+    # Default official XBRL worker runs to upsert so 10-K/10-Q/20-F supersedes
+    # preliminary 8-K/6-K values while retaining 8-K-only values/guidance.
+    mode = str(payload.get("mode") or "upsert").strip().lower()
+    app.replace = bool(payload.get("replace")) or mode == "replace"
+    app.reload = bool(payload.get("upsert", True)) or app.replace or mode == "upsert"
+    app.target_forms = _target_forms_for_payload(form_type)
+    raw_fy = payload.get("fiscal_year")
+    app.target_fiscal_year = (
+        int(raw_fy) if raw_fy is not None and str(raw_fy).strip().isdigit() else None
+    )
+    raw_q = payload.get("quarter")
+    if raw_q is not None and str(raw_q).strip():
+        q_clean = str(raw_q).strip().upper()
+        app.target_fiscal_quarter = q_clean if q_clean.startswith("Q") else f"Q{q_clean}"
+    else:
+        app.target_fiscal_quarter = None
+
+    started_utc = datetime.now(timezone.utc)
+    logs_dir = Path(os.getenv("RUN_LOGS_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
+    run_log = RunLogSession(ticker or cik, log_dir=logs_dir)
+    run_log.attach()
+
+    try:
+        report_db = get_normalize_db()
+    except Exception:
+        report_db = None
+    snap_before = snapshot_company_state(
+        report_db, cik,
+        fiscal_year=app.target_fiscal_year,
+        quarter=app.target_fiscal_quarter,
+    )
+
+    acc_desc = accession_number or "latest"
+    pub.publish("start", f"► processing  {form_type}  {label}  ({acc_desc})", kind="step_start")
     logger.info(
-        "Processing %s filing for %s (CIK %s) accession %s",
-        form_type, label, cik, accession_number,
+        "Processing %s filing for %s (CIK %s) accession=%s mode=%s",
+        form_type, label, cik, acc_desc, mode,
     )
 
     t0 = perf_counter()
     try:
         with WorkerHeartbeat(pub, ticker or cik, interval_s=60):
-            success = bool(app.process_single_filing_from_url(cik, accession_number))
+            if accession_number:
+                success = bool(app.process_single_filing_from_url(cik, accession_number))
+            else:
+                # Manual trigger with no accession/URL: fetch latest matching XBRL filing
+                app.latest = not bool(app.target_fiscal_year)
+                res_map = app.process_multiple_companies([cik], resume=True)
+                entry = res_map.get(cik) if isinstance(res_map, dict) else None
+                success = (
+                    bool(entry.get("success", False)) and not entry.get("failed", 0)
+                    if isinstance(entry, dict)
+                    else bool(entry)
+                )
     except BaseException as exc:
         elapsed_s = perf_counter() - t0
         elapsed_str = (
@@ -164,7 +274,14 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
         )
         pub.publish("summary", f"✗ {reason}  {elapsed_str}", kind="summary")
         app.progress = original_pm
+        app.reload = original_reload
+        app.replace = original_replace
+        app.latest = original_latest
+        app.target_forms = original_target_forms
+        app.target_fiscal_year = original_fy
+        app.target_fiscal_quarter = original_fq
         pub.close()
+        run_log.close()
         raise
 
     elapsed_s = perf_counter() - t0
@@ -173,6 +290,38 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
         else f"{int(elapsed_s // 60)}m {elapsed_s % 60:.0f}s"
     )
 
+    # Persist structured run summary into normalize_data.gotham_run_reports
+    try:
+        snap_after = snapshot_company_state(
+            report_db, cik,
+            fiscal_year=app.target_fiscal_year,
+            quarter=app.target_fiscal_quarter,
+        )
+        stage = diff_stage(
+            snap_before, snap_after,
+            stage_name=form_type,
+            stage_forms=app.target_forms or [form_type],
+            duration_seconds=elapsed_s,
+        )
+        rep = build_run_report(
+            serial_number=run_log.serial_number,
+            ticker=ticker or cik,
+            cik=cik,
+            forms_requested=form_type,
+            mode=mode,
+            log_file=str(run_log.path),
+            started_at_utc=started_utc,
+            finished_at_utc=datetime.now(timezone.utc),
+            stages=[stage],
+            target_fiscal_year=app.target_fiscal_year,
+            target_quarter=app.target_fiscal_quarter,
+            status="success" if success else "failed",
+        )
+        save_run_report(report_db, rep)
+        run_log.write_raw(format_run_report_text(rep))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to record gotham_run_reports for %s: %s", label, exc)
+
     if success:
         period_label = (
             getattr(app, "_last_period_label", None)
@@ -180,13 +329,20 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
         )
         summary = f"\u2713 {period_label} saved  ({form_type})  {elapsed_str}"
         pub.publish("summary", summary, kind="summary")
-        logger.info("✅ Saved filing %s for %s  elapsed=%s", accession_number, label, elapsed_str)
+        logger.info("✅ Saved filing %s for %s  elapsed=%s", acc_desc, label, elapsed_str)
     else:
         pub.publish("summary", f"✗ failed  {elapsed_str}", kind="summary")
-        logger.warning("❌ Failed filing %s for %s", accession_number, label)
+        logger.warning("❌ Failed filing %s for %s", acc_desc, label)
 
     app.progress = original_pm
+    app.reload = original_reload
+    app.replace = original_replace
+    app.latest = original_latest
+    app.target_forms = original_target_forms
+    app.target_fiscal_year = original_fy
+    app.target_fiscal_quarter = original_fq
     pub.close()
+    run_log.close()
     return success
 
 

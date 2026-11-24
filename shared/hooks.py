@@ -20,6 +20,7 @@ from functools import wraps
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
+_trace_logger = logging.getLogger("pipeline.trace")
 
 _thread_local = _threading.local()
 
@@ -80,6 +81,8 @@ def get_call_callback():
 
 def report_call(msg: str) -> None:
     """Fire the thread-local call callback — for LLM and tool call visibility."""
+    if msg:
+        _trace_logger.info("%s", str(msg).strip())
     cb = getattr(_thread_local, "call_callback", None)
     if cb:
         cb(msg)
