@@ -3043,7 +3043,7 @@ def _dispatch_earnings_cli(
     # - --form 6-K / --form 8-K (without --latest/--url) → backfill from --year (default 2010) to now
     if force_latest_single is not None:
         run_single_live = force_latest_single
-    elif args.url:
+    elif args.url or getattr(args, 'pdf', None):
         run_single_live = True
     elif args.latest:
         run_single_live = True
@@ -3114,12 +3114,18 @@ def _dispatch_earnings_cli(
         e_argv.extend(['--form', forms[0]])
     if args.url:
         e_argv.extend(['--filing-url', args.url])
+    if getattr(args, 'pdf', None):
+        e_argv.extend(['--pdf', str(Path(args.pdf).expanduser().resolve())])
     if args.accession:
         e_argv.extend(['--accession', args.accession[0]])
     if args.quarterly_only:
         e_argv.append('--quarterly-only')
     if args.guidance_only:
         e_argv.append('--guidance-only')
+    if args.upsert:
+        e_argv.append('--upsert')
+    if args.replace:
+        e_argv.append('--replace')
     if stmt_arg:
         e_argv.extend(['--statements', stmt_arg])
     if args.dry_run:
@@ -3222,7 +3228,7 @@ def _run_mixed_forms_cli(
                     target_fiscal_year=args.fiscal_year,
                     target_fiscal_quarter=fiscal_quarter,
                     target_statement=target_statement,
-                    reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                    reload=args.upsert or args.replace,
                     replace=args.replace,
                     latest=True,
                     html_download_path=html_download_path,
@@ -3284,7 +3290,7 @@ def _run_mixed_forms_cli(
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=fiscal_quarter,
                 target_statement=target_statement,
-                reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                reload=args.upsert or args.replace,
                 replace=args.replace,
                 latest=False,
                 html_download_path=html_download_path,
@@ -3385,9 +3391,12 @@ def main(argv: Optional[Sequence[str]] = None):
         '--file', metavar='FILE',
         help='Path to a plain-text file containing one CIK or ticker per line.')
     src.add_argument(
-        '--url', metavar='URL',
-        help='Process a single SEC filing directly from its URL. '
-             'Accepts EDGAR archives URLs or the viewer URL with cik= and accession_number= params.')
+        '--url', '--filing-url', dest='url', metavar='URL',
+        help='Process a single filing directly from its URL (SEC EDGAR URL for XBRL, '
+             'or press-release HTML / external PDF URL for 8-K/6-K).')
+    src.add_argument(
+        '--pdf', '--pdf-path', dest='pdf', metavar='PATH',
+        help='Extract an 8-K/6-K earnings release directly from a local PDF file on disk.')
 
     # --- Year / period filtering -------------------------------------------
     period = parser.add_argument_group('Year / period filtering')
@@ -3508,6 +3517,14 @@ def main(argv: Optional[Sequence[str]] = None):
         print("❌ --upsert and --replace cannot be used together (choose one).")
         sys.exit(1)
 
+    if args.url and args.pdf:
+        print("❌ Provide either --url/--filing-url or --pdf/--pdf-path, not both.")
+        sys.exit(1)
+
+    if args.pdf and not Path(args.pdf).expanduser().is_file():
+        print(f"❌ PDF file not found: {args.pdf}")
+        sys.exit(1)
+
     # Read-only failure report doesn't require --form
     if args.failures:
         _dispatch_earnings_cli(args, raw_argv, earnings_forms=['8-K'])
@@ -3532,6 +3549,10 @@ def main(argv: Optional[Sequence[str]] = None):
         form_spec = parse_form_selection(args.form)
     except ValueError as e:
         print(f"❌ {e}")
+        sys.exit(1)
+
+    if args.pdf and not form_spec['earnings_forms']:
+        print("❌ --pdf/--pdf-path is only supported with earnings forms (--form 8-K or --form 6-K).")
         sys.exit(1)
 
     # --verbose implies debug-level console; --debug is the highest detail
@@ -3766,7 +3787,7 @@ def main(argv: Optional[Sequence[str]] = None):
                 target_fiscal_year=args.fiscal_year,
                 target_fiscal_quarter=fiscal_quarter,
                 target_statement=target_statement,
-                reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+                reload=args.upsert or args.replace,
                 replace=args.replace,
                 latest=False,  # Not applicable for single filing
                 html_download_path=html_download_path,
@@ -4000,7 +4021,7 @@ def main(argv: Optional[Sequence[str]] = None):
             target_fiscal_year=args.fiscal_year,
             target_fiscal_quarter=fiscal_quarter,
             target_statement=target_statement,
-            reload=args.upsert or args.replace or bool(args.fiscal_year and fiscal_quarter),
+            reload=args.upsert or args.replace,
                 replace=args.replace,
             latest=args.latest,
             html_download_path=html_download_path,

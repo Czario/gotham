@@ -468,3 +468,46 @@ def test_replace_deletes_existing_period_before_fresh_insert_in_xbrl_and_8k():
             hard_replace=True,
         )
     assert events == ["delete_many", "bulk_write"]
+
+
+def test_main_pdf_and_url_flags_dispatch_to_earnings_cli(tmp_path):
+    pdf_file = tmp_path / "q3_release.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4\n")
+
+    with patch("earnings_agents.cli.earnings.main") as mock_earnings:
+        sec_scraper_cli.main([
+            "--companies", "MSFT",
+            "--form", "8-K",
+            "--pdf", str(pdf_file),
+            "--upsert",
+        ])
+    mock_earnings.assert_called_once_with([
+        "--ticker", "MSFT",
+        "--form", "8-K",
+        "--pdf", str(pdf_file.resolve()),
+        "--upsert",
+    ])
+
+    with patch("earnings_agents.cli.earnings.main") as mock_earnings:
+        sec_scraper_cli.main([
+            "--companies", "ASML",
+            "--form", "6-K",
+            "--filing-url", "https://example.com/release.pdf",
+            "--replace",
+        ])
+    mock_earnings.assert_called_once_with([
+        "--ticker", "ASML",
+        "--form", "6-K",
+        "--filing-url", "https://example.com/release.pdf",
+        "--replace",
+    ])
+
+    # --pdf and --url together must be rejected
+    with pytest.raises(SystemExit) as exc:
+        sec_scraper_cli.main([
+            "--companies", "MSFT",
+            "--form", "8-K",
+            "--pdf", str(pdf_file),
+            "--url", "https://example.com/release.pdf",
+        ])
+    assert exc.value.code == 1

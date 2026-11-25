@@ -14,6 +14,13 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 # ── uv (pinned minor — avoids surprise cache invalidation from upstream) ─────
 COPY --from=ghcr.io/astral-sh/uv:0.7 /uv /usr/local/bin/uv
 
+# Tune uv for Docker Desktop NAT: avoid 50-way TLS download stalls on large
+# wheels (playwright 50.7MiB, litellm 38.5MiB) and cross-mount hardlink retries.
+ENV UV_LINK_MODE=copy \
+    UV_HTTP_TIMEOUT=300 \
+    UV_CONCURRENT_DOWNLOADS=4 \
+    UV_NATIVE_TLS=true
+
 WORKDIR /app
 
 # ── Dependency layer (rebuilt only when pyproject.toml / uv.lock change) ─────

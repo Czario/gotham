@@ -26,6 +26,7 @@ services:
       MONGODB_URI:            mongodb://mongo:27017/?directConnection=true
       DATABASE_NAME:          normalize_data
       SEC_HTML_DOWNLOAD_PATH: /app/sec_html_filings
+      PYTHONPATH:             /app
       PYTHONUNBUFFERED:       "1"
       UV_LINK_MODE:           copy
     volumes:
@@ -54,6 +55,7 @@ services:
       DATABASE_NAME:       normalize_data
       NORMALIZE_DB_NAME:   normalize_data
       LLM_PROVIDER:        ${LLM_PROVIDER:-deepseek}
+      PYTHONPATH:          /app
       PYTHONUNBUFFERED:    "1"
       TZ:                  ${TZ:-UTC}
       RUN_LOGS_DIR:        /app/logs

@@ -205,11 +205,13 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
     original_fq = getattr(app, "target_fiscal_quarter", None)
 
     app.progress = WorkerProgressManager(pub, ticker or cik)
-    # Default official XBRL worker runs to upsert so 10-K/10-Q/20-F supersedes
-    # preliminary 8-K/6-K values while retaining 8-K-only values/guidance.
-    mode = str(payload.get("mode") or "upsert").strip().lower()
+    # Respect explicit write mode:
+    # - default: resume mode (skip filings already stored in MongoDB)
+    # - upsert:  reprocess & update differing values / fill gaps non-destructively
+    # - replace: delete all existing values for target period first, then insert fresh
+    mode = str(payload.get("mode") or "default").strip().lower()
     app.replace = bool(payload.get("replace")) or mode == "replace"
-    app.reload = bool(payload.get("upsert", True)) or app.replace or mode == "upsert"
+    app.reload = bool(payload.get("upsert")) or app.replace or mode == "upsert"
     app.target_forms = _target_forms_for_payload(form_type)
     raw_fy = payload.get("fiscal_year")
     app.target_fiscal_year = (
@@ -393,6 +395,8 @@ def main(argv: list[str] | None = None) -> None:
     root.addHandler(_handler)
     root.setLevel(logging.WARNING)
     logging.getLogger("worker_10kq").setLevel(logging.INFO)
+    logging.getLogger("workers.queue_worker").setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
 
     if args.verbose:
         for _noisy in ("sec_scraper_cli", "data_normalization_service"):
@@ -403,7 +407,10 @@ def main(argv: list[str] | None = None) -> None:
     client: Redis = _make_client(args.redis_url, args.poll_timeout)
 
     app = _build_app()
-    logger.info("sec-scraper-worker listening on Redis queue '%s'", queue_name)
+    logger.info(
+        "Gotham XBRL worker (10-K, 10-Q, 20-F, 10-K/10-Q, amendments) listening on Redis queue '%s'",
+        queue_name,
+    )
 
     def _sigterm(_signum, _frame):  # noqa: ANN001
         raise SystemExit(0)

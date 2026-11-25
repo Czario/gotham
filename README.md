@@ -24,10 +24,11 @@ uv run main --companies MSFT --form 8k-10k-10q --year 2024
 uv run main --companies ASML --form 20-F --year 2024
 uv run main --companies ASML --form 20f-6k --year 2024
 
-# Earnings only (8-K / 6-K / IR PDF URL)
+# Earnings only (8-K / 6-K / IR PDF URL / local PDF)
 uv run main --companies MSFT --form 8-K --year 2024
 uv run main --companies ASML --form 6-K --latest
 uv run main --companies MSFT --form 8-K --url https://example.com/release.pdf
+uv run main --companies MSFT --form 8-K --pdf /path/to/earnings_release.pdf --upsert
 uv run main --companies ASML --form 6-K --accession 0001628280-26-048235
 
 # Latest only (works with any form)
@@ -69,7 +70,8 @@ uv run earnings-8k-worker                     # local 8-K/6-K/IR PDF worker
 | --- | --- |
 | `--companies CIK/TICKER [...]` | One or more tickers or CIKs |
 | `--file FILE` | Plain-text file with tickers/CIKs |
-| `--url URL` | Single SEC filing or IR PDF/HTML URL |
+| `--url URL`, `--filing-url URL` | Direct URL (`8-K`/`6-K`: HTML or PDF URL; `10-K`/`10-Q`/`20-F`: SEC EDGAR URL) |
+| `--pdf PATH`, `--pdf-path PATH` | Extract from a local PDF file on disk (`8-K`/`6-K` only) |
 | `--form FORM`, `--from FORM` | **Required.** `10-K`, `10-Q`, `10k-10q`, `20-F`, `8-K`, `6-K`, `8k-10k-10q`, `20f-6k` |
 | `--year YEAR` | Start year (default: `2010`) |
 | `--end-year YEAR` | End year (inclusive) |
@@ -77,7 +79,7 @@ uv run earnings-8k-worker                     # local 8-K/6-K/IR PDF worker
 | `--fiscal-quarter Q`, `--quarter`, `-q` | Specific quarter (`Q1`–`Q4` or `1`–`4`; requires `--fiscal-year`) |
 | `--statement TYPE`, `-s` | Statement filter: `income`/`is`, `balance_sheet`/`bs`, `cash_flow`/`cf` |
 | `--latest` | Process only the newest filing for each company |
-| `--upsert` | Non-destructive re-run: updates differing values, fills gaps, keeps extra rows |
+| `--upsert` | Non-destructive re-run: updates differing values, fills gaps, keeps extra rows (default skips stored filings) |
 | `--replace` | Hard replace: deletes all existing values for the target period first, then inserts fresh |
 | `--guidence-only`, `--guidance-only` | Extract & save guidance only (skips financial statements & company stage) |
 | `--no-new-concept` | Keep stored hierarchy untouched (map to existing concepts only) |

@@ -471,11 +471,17 @@ def _run_company(
         printer=printer,
         target_statements=target_statements,
         filing_url=info.get("filing_url"),
+        local_filing_path=info.get("local_filing_path"),
         accession=info.get("accession"),
         source_form_type=info.get("source_form_type"),
         quarterly_only=bool(info.get("quarterly_only")),
         guidance_only=bool(info.get("guidance_only")),
     )
+    if info.get("replace"):
+        state["replace"] = True
+        state["reload"] = True
+    elif info.get("upsert"):
+        state["reload"] = True
 
     if state["status"] == "failed":
         printer(f"  [SKIP]  {state['error']}")
@@ -712,12 +718,38 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--filing-url",
+        "--url",
+        dest="filing_url",
         metavar="URL",
         default=None,
         help=(
             "Use this exact filing document URL (press-release HTML or PDF) "
             "instead of SEC EDGAR discovery."
         ),
+    )
+    parser.add_argument(
+        "--pdf",
+        "--pdf-path",
+        "--local-filing-path",
+        dest="pdf_path",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Extract directly from a local PDF file on disk instead of "
+            "fetching from SEC EDGAR."
+        ),
+    )
+    parser.add_argument(
+        "--upsert",
+        action="store_true",
+        default=False,
+        help="Non-destructive upsert: reprocess and update/fill missing values in place.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        default=False,
+        help="Hard replace: delete existing values for the target period first, then insert fresh.",
     )
     parser.add_argument(
         "--accession",
@@ -816,6 +848,18 @@ def main(argv: list[str] | None = None) -> None:
         print("No valid companies resolved. Exiting.")
         sys.exit(1)
 
+    if args.filing_url and args.pdf_path:
+        parser.error("Provide either --filing-url/--url or --pdf/--pdf-path, not both.")
+    if args.upsert and args.replace:
+        parser.error("--upsert and --replace cannot be used together.")
+    resolved_pdf: str | None = None
+    if args.pdf_path:
+        from pathlib import Path as _Path
+        p = _Path(args.pdf_path).expanduser().resolve()
+        if not p.is_file():
+            parser.error(f"PDF file not found: {args.pdf_path}")
+        resolved_pdf = str(p)
+
     # Per-company filing-selection options.  A pinned accession or a manual URL
     # takes precedence over EDGAR discovery; the source form only selects which
     # form to look for (it never decides the reporting period).
@@ -824,9 +868,12 @@ def main(argv: list[str] | None = None) -> None:
     for _info in companies:
         _info["source_form_type"] = args.source_form_type
         _info["filing_url"] = args.filing_url
+        _info["local_filing_path"] = resolved_pdf
         _info["accession"] = args.accession
         _info["quarterly_only"] = args.quarterly_only
         _info["guidance_only"] = args.guidance_only
+        _info["upsert"] = bool(args.upsert)
+        _info["replace"] = bool(args.replace)
         _info["quiet"] = bool(args.quiet or not args.verbose)
 
     _progress = Progress(

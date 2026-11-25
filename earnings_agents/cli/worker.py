@@ -247,6 +247,11 @@ def _process_payload(
         state["target_fiscal_year"] = target_fy
     if target_q is not None:
         state["target_fiscal_quarter"] = target_q
+    job_mode = str(payload.get("mode") or "default").strip().lower()
+    job_replace = bool(payload.get("replace")) or job_mode == "replace"
+    job_upsert = bool(payload.get("upsert")) or job_mode == "upsert"
+    state["replace"] = job_replace
+    state["reload"] = job_upsert or job_replace
 
     # The reporting period is decided by the period agent INSIDE the graph —
     # the pre-graph state carries only URL/accession.
@@ -521,7 +526,10 @@ def main(argv: list[str] | None = None) -> None:
 
     client = _make_client(redis_url, args.poll_timeout)
     graph = build_graph()
-    logger.info("8-K worker listening on Redis queue '%s'", queue_name)
+    logger.info(
+        "Gotham earnings worker (8-K, 8-K/A, 6-K, 6-K/A, IR PDFs) listening on Redis queue '%s'",
+        queue_name,
+    )
 
     while True:
         try:
