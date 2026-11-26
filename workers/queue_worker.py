@@ -325,6 +325,13 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
         logger.warning("Failed to record gotham_run_reports for %s: %s", label, exc)
 
     if success:
+        # Best-effort continuous profile update after official XBRL filing saves
+        try:
+            from shared.company_profile import refresh_company_profile
+            refresh_company_profile(cik, mode="default")
+        except Exception as _prof_exc:  # noqa: BLE001
+            logger.debug("Post-save profile refresh skipped for %s: %s", label, _prof_exc)
+
         period_label = (
             getattr(app, "_last_period_label", None)
             or f"FY {(getattr(app, '_last_report_date', None) or payload.get('period_of_report') or '')[:4] or '?'}"

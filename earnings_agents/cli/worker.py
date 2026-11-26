@@ -424,6 +424,12 @@ def _process_payload(
             save_run_report(report_db, rep)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to record gotham_run_reports for %s: %s", ticker, exc)
+        # Best-effort continuous company_profiles sync after 8-K / 6-K saves
+        try:
+            from shared.company_profile import refresh_company_profile
+            refresh_company_profile(cik, db=report_db, mode="default")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Post-save company profile refresh skipped for %s: %s", ticker, exc)
         # Use the exact canonical period context produced by the period agent.
         # Do not re-query the latest database row: another job could win that
         # race and relabel this filing with a different period.

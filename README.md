@@ -44,6 +44,7 @@ uv run main --companies MSFT --form 8k-10k-10q --guidence-only --year 2024
 uv run main --companies ASML --form 20f-6k --guidence-only --year 2024
 
 # Utilities
+uv run main --companies MSFT --profile-only --upsert
 uv run main --companies MSFT --fix-hierarchy
 uv run main --failures --companies MSFT
 uv run load-statement --company AAPL --fiscal-year 2024 --quarter Q1 -s income --upsert
@@ -82,6 +83,7 @@ uv run earnings-8k-worker                     # local 8-K/6-K/IR PDF worker
 | `--upsert` | Non-destructive re-run: updates differing values, fills gaps, keeps extra rows (default skips stored filings) |
 | `--replace` | Hard replace: deletes all existing values for the target period first, then inserts fresh |
 | `--guidence-only`, `--guidance-only` | Extract & save guidance only (skips financial statements & company stage) |
+| `--profile-only` | Create/update `company_profiles` from SEC submissions, DEI shares, and latest `10-K`/`20-F` |
 | `--no-new-concept` | Keep stored hierarchy untouched (map to existing concepts only) |
 | `--no-dimensions` | Skip dimensional (segment/product/geography) extraction |
 | `--no-reconciliation` | Skip SEC `companyfacts` gap-fill reconciliation |

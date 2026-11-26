@@ -3253,6 +3253,16 @@ def _run_mixed_forms_cli(
                     duration_seconds=_time.perf_counter() - t0,
                 )
             )
+            # Best-effort continuous company_profiles sync (0 LLM cost on 10-Q; 1 LLM call on new 10-K/20-F)
+            if report_db is not None and not args.guidance_only and not getattr(args, "dry_run", False):
+                try:
+                    from shared.company_profile import refresh_company_profile
+                    refresh_company_profile(
+                        cik, db=report_db, mode="default", html_dir=html_download_path or None
+                    )
+                except Exception as _prof_exc:  # noqa: BLE001
+                    logger.debug("Post-run company profile refresh skipped for %s: %s", label, _prof_exc)
+
             report = build_run_report(
                 serial_number=getattr(run_log, "serial_number", "0000"),
                 ticker=label,
@@ -3340,6 +3350,16 @@ def _run_mixed_forms_cli(
                 )
             )
             snap_cur = snap_next
+
+        # Best-effort continuous company_profiles sync (0 LLM cost on 10-Q; 1 LLM call on new 10-K/20-F)
+        if report_db is not None and not args.guidance_only and not getattr(args, "dry_run", False):
+            try:
+                from shared.company_profile import refresh_company_profile
+                refresh_company_profile(
+                    cik, db=report_db, mode="default", html_dir=html_download_path or None
+                )
+            except Exception as _prof_exc:  # noqa: BLE001
+                logger.debug("Post-run company profile refresh skipped for %s: %s", label, _prof_exc)
 
         report = build_run_report(
             serial_number=getattr(run_log, "serial_number", "0000"),
@@ -3463,6 +3483,11 @@ def main(argv: Optional[Sequence[str]] = None):
         help='Extract and save forward-looking MD&A guidance only — skips XBRL '
              'extraction, financial statement normalization/persistence, and '
              'post-processing company stages.')
+    proc.add_argument(
+        '--profile-only',
+        action='store_true', dest='profile_only',
+        help='Create/update company_profiles from SEC submissions, DEI share counts, '
+             'and latest 10-K/20-F sections.')
 
     # --- HTML download options --------------------------------------------
     html = parser.add_argument_group('HTML filing downloads')
@@ -3531,7 +3556,7 @@ def main(argv: Optional[Sequence[str]] = None):
         return
 
     # Require --form (or --from) for all filing processing so nothing runs accidentally
-    if not args.form and not args.fix_hierarchy:
+    if not args.form and not args.fix_hierarchy and not args.profile_only:
         if args.earnings:
             print("❌ --form is required even with --earnings (e.g. --form 8-K or --form 6-K).")
         else:
@@ -3636,6 +3661,12 @@ def main(argv: Optional[Sequence[str]] = None):
             if _e_db is not None and _e_targets and not args.dry_run:
                 _e_finished = datetime.now(_tz.utc)
                 for cik, lbl in _e_targets:
+                    if not args.guidance_only:
+                        try:
+                            from shared.company_profile import refresh_company_profile
+                            refresh_company_profile(cik, db=_e_db, mode="default")
+                        except Exception as _prof_exc:  # noqa: BLE001
+                            logger.debug("Post-run company profile refresh skipped for %s: %s", lbl, _prof_exc)
                     _snap_after = snapshot_company_state(
                         _e_db, cik, fiscal_year=args.fiscal_year, quarter=_e_q, statement_type=_e_stmt
                     )
@@ -3999,6 +4030,25 @@ def main(argv: Optional[Sequence[str]] = None):
             
             sys.exit(0)
         
+        # Handle --profile-only mode (create/update company_profiles directly)
+        if args.profile_only:
+            from shared.company_profile import refresh_company_profile
+            _prof_mode = 'replace' if args.replace else ('upsert' if args.upsert else 'default')
+            _prof_db = _safe_get_report_db()
+            for cik in companies:
+                lbl = progress.cik_labels.get(cik) or cik
+                res = refresh_company_profile(
+                    cik,
+                    db=_prof_db,
+                    mode=_prof_mode,
+                    html_dir=html_download_path or None,
+                )
+                print(
+                    f"✓ {res.get('ticker') or lbl} ({res['cik']}): "
+                    f"v{res['profile_version']} — {res['changes_count']} change(s)"
+                )
+            return
+
         # Handle mixed XBRL + earnings forms (--form 8k-10k-10q, --form 20f-6k)
         if form_spec['earnings_forms'] and form_spec['xbrl_forms']:
             _run_mixed_forms_cli(
@@ -4096,6 +4146,15 @@ def main(argv: Optional[Sequence[str]] = None):
                 if isinstance(entry, dict)
                 else bool(entry)
             )
+            # Best-effort continuous company_profiles sync (0 LLM cost on 10-Q; 1 LLM call on new 10-K/20-F)
+            if _ok and _report_db is not None and not args.guidance_only:
+                try:
+                    from shared.company_profile import refresh_company_profile
+                    refresh_company_profile(
+                        cik, db=_report_db, mode="default", html_dir=html_download_path or None
+                    )
+                except Exception as _prof_exc:  # noqa: BLE001
+                    logger.debug("Post-run company profile refresh skipped for %s: %s", lbl, _prof_exc)
             _snap_after = snapshot_company_state(
                 _report_db,
                 cik,

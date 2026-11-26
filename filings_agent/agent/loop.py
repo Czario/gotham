@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _TOOL_RESULT_CAPS: dict[str, int] = {
     "read_lines": 60_000,
     "search": 16_000,
+    "grep": 16_000,
     # Hierarchy tools return the FULL tree; truncating mid-tree corrupts the
     # agent's context, so these get the same generous cap as document reads.
     "query_stored_hierarchy": 60_000,
