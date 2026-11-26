@@ -78,7 +78,7 @@ METRIC_PROFILES: dict[str, tuple[str | None, str, str]] = {
     "free_cash_flow": (None, "cashflow", "up"),
     "cash_flow_from_operations": (None, "cashflow", "up"),
     "tax_rate": (None, "income", "down"),
-    "revenue_growth": (None, "income", "up"),
+    "revenue_growth": ("Revenue Growth", "income", "up"),
     "dividend": (None, "cashflow", "up"),
     "share_count": (None, "income", "up"),
 }
