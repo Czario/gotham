@@ -203,6 +203,8 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
     original_target_forms = getattr(app, "target_forms", None)
     original_fy = getattr(app, "target_fiscal_year", None)
     original_fq = getattr(app, "target_fiscal_quarter", None)
+    original_no_new_concept = getattr(app, "no_new_concept", False)
+    original_target_statement = getattr(app, "target_statement", None)
 
     app.progress = WorkerProgressManager(pub, ticker or cik)
     # Respect explicit write mode:
@@ -212,6 +214,13 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
     mode = str(payload.get("mode") or "default").strip().lower()
     app.replace = bool(payload.get("replace")) or mode == "replace"
     app.reload = bool(payload.get("upsert")) or app.replace or mode == "upsert"
+    app.no_new_concept = bool(payload.get("no_new_concept"))
+    raw_stmt = payload.get("statement") or payload.get("target_statement")
+    if raw_stmt and str(raw_stmt).strip():
+        from shared.cli_flags import canonicalize_statement_type
+        app.target_statement = canonicalize_statement_type(str(raw_stmt).strip())
+    else:
+        app.target_statement = None
     app.target_forms = _target_forms_for_payload(form_type)
     raw_fy = payload.get("fiscal_year")
     app.target_fiscal_year = (
@@ -242,8 +251,8 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
     acc_desc = accession_number or "latest"
     pub.publish("start", f"► processing  {form_type}  {label}  ({acc_desc})", kind="step_start")
     logger.info(
-        "Processing %s filing for %s (CIK %s) accession=%s mode=%s",
-        form_type, label, cik, acc_desc, mode,
+        "Processing %s filing for %s (CIK %s) accession=%s mode=%s no_new_concept=%s statement=%s",
+        form_type, label, cik, acc_desc, mode, app.no_new_concept, app.target_statement,
     )
 
     t0 = perf_counter()
@@ -282,6 +291,8 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
         app.target_forms = original_target_forms
         app.target_fiscal_year = original_fy
         app.target_fiscal_quarter = original_fq
+        app.no_new_concept = original_no_new_concept
+        app.target_statement = original_target_statement
         pub.close()
         run_log.close()
         raise
@@ -350,6 +361,8 @@ def _process_payload(app: SECDataScraperApp, payload: dict[str, Any]) -> bool:
     app.target_forms = original_target_forms
     app.target_fiscal_year = original_fy
     app.target_fiscal_quarter = original_fq
+    app.no_new_concept = original_no_new_concept
+    app.target_statement = original_target_statement
     pub.close()
     run_log.close()
     return success

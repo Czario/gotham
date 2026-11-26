@@ -164,13 +164,33 @@ def _process_payload(
         local_filing_path = str(Path(temp_dir) / str(temporary_filing_id))
 
     # Parse target statements from payload or default fallback
-    raw_statements = payload.get("statements") or payload.get("target_statements")
+    _STMT_ALIASES = {
+        "in": "income",
+        "is": "income",
+        "income": "income",
+        "bs": "balance_sheet",
+        "balance_sheet": "balance_sheet",
+        "balancesheet": "balance_sheet",
+        "cf": "cash_flow",
+        "cash_flow": "cash_flow",
+        "cashflow": "cash_flow",
+    }
+    raw_statements = (
+        payload.get("statement")
+        or payload.get("statements")
+        or payload.get("target_statements")
+    )
     target_statements: list[str] | None = None
     if raw_statements:
         if isinstance(raw_statements, str):
-            target_statements = [s.strip().lower() for s in raw_statements.split(",") if s.strip()]
+            raw_list = [s.strip().lower() for s in raw_statements.split(",") if s.strip()]
         elif isinstance(raw_statements, list):
-            target_statements = [str(s).strip().lower() for s in raw_statements if str(s).strip()]
+            raw_list = [str(s).strip().lower() for s in raw_statements if str(s).strip()]
+        else:
+            raw_list = []
+        mapped = [_STMT_ALIASES.get(s, s) for s in raw_list]
+        if mapped:
+            target_statements = mapped
     if target_statements is None:
         target_statements = default_statements or TARGET_STATEMENTS
 
