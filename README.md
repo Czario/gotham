@@ -55,9 +55,9 @@ uv run load-statement --company AAPL --fiscal-year 2024 --quarter Q1 -s income -
 ## Workers (Docker & Local)
 
 ```bash
-docker compose up -d --build                  # start worker-10kq + worker-8k
-docker compose restart worker-10kq worker-8k  # restart after code edits
-docker compose logs -f worker-10kq worker-8k
+docker compose up -d --build                  # build and start single worker container (10kq + 8k)
+docker compose restart worker                 # restart after code edits
+docker compose logs -f worker
 
 uv run sec-scraper-worker                     # local 10-K/10-Q/20-F worker
 uv run earnings-8k-worker                     # local 8-K/6-K/IR PDF worker

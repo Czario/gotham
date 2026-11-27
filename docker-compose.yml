@@ -1,68 +1,44 @@
-# Distributed SEC extraction workers:
-#   - worker-10kq: 10-K / 10-Q / 20-F XBRL filings  (queue: sec:filings:10kq)
-#   - worker-8k:   8-K / 6-K / IR PDF earnings      (queue: sec:filings:8k)
+# Unified SEC extraction worker (runs both queue consumers in one container):
+#   - sec-scraper-worker: 10-K / 10-Q / 20-F XBRL filings  (queue: sec:filings:10kq)
+#   - earnings-8k-worker: 8-K / 6-K / IR PDF earnings      (queue: sec:filings:8k)
 #
 # Networking:
 #   MongoDB — joins backend_true_grids_backend_network (shared with admin_backend)
 #   Redis   — reaches admin_backend's Redis via host port 6379
 #
 # Usage:
-#   docker compose up -d --build                 # build and start both workers
-#   docker compose restart worker-10kq worker-8k # restart after code edits (no rebuild)
-#   docker compose logs -f worker-10kq worker-8k
+#   docker compose up -d --build   # build and start single worker container
+#   docker compose restart worker  # restart after code edits (no rebuild)
+#   docker compose logs -f worker
 
 services:
-  worker-10kq:
+  worker:
     build:
       context: .
       dockerfile: Dockerfile
-      target: worker-10kq
+      target: worker
     env_file:
       - path: .env
         required: false
     environment:
       REDIS_URL:              redis://host.docker.internal:6379/0
-      REDIS_QUEUE_NAME:       sec:filings:10kq
+      REDIS_QUEUE_10KQ:       sec:filings:10kq
+      REDIS_QUEUE_8K:         sec:filings:8k
+      IR_TEMP_FILINGS_DIR:    /app/uploads/ir-filings
       MONGODB_URI:            mongodb://mongo:27017/?directConnection=true
       DATABASE_NAME:          normalize_data
+      NORMALIZE_DB_NAME:      normalize_data
       SEC_HTML_DOWNLOAD_PATH: /app/sec_html_filings
+      LLM_PROVIDER:           ${LLM_PROVIDER:-deepseek}
       PYTHONPATH:             /app
       PYTHONUNBUFFERED:       "1"
+      TZ:                     ${TZ:-UTC}
+      RUN_LOGS_DIR:           /app/logs
       UV_LINK_MODE:           copy
     volumes:
       - .:/app
       - /app/.venv
       - /Users/aijaz/sec_html_filings:/app/sec_html_filings
-    restart: unless-stopped
-    networks:
-      - backend_true_grids_backend_network
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
-  worker-8k:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: worker-8k
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      REDIS_URL:           redis://host.docker.internal:6379/0
-      REDIS_QUEUE_NAME:    sec:filings:8k
-      IR_TEMP_FILINGS_DIR: /app/uploads/ir-filings
-      MONGODB_URI:         mongodb://mongo:27017/?directConnection=true
-      DATABASE_NAME:       normalize_data
-      NORMALIZE_DB_NAME:   normalize_data
-      LLM_PROVIDER:        ${LLM_PROVIDER:-deepseek}
-      PYTHONPATH:          /app
-      PYTHONUNBUFFERED:    "1"
-      TZ:                  ${TZ:-UTC}
-      RUN_LOGS_DIR:        /app/logs
-      UV_LINK_MODE:        copy
-    volumes:
-      - .:/app
-      - /app/.venv
       - ../admin_backend/uploads/ir-filings:/app/uploads/ir-filings
     restart: unless-stopped
     networks:

@@ -64,3 +64,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
 CMD ["/app/.venv/bin/earnings-8k-worker"]
+
+# ── Combined worker: 10-K/10-Q/20-F + 8-K/6-K/IR PDF in one container ───────
+FROM worker-8k AS worker
+
+CMD ["/app/.venv/bin/python", "-m", "workers.run_all"]
